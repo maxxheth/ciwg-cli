@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -43,6 +44,7 @@ func newDomainsCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would be backed up and removed without making changes")
 	cmd.PersistentFlags().CountVarP(&verboseCount, "verbose", "v", "Set verbosity level (e.g., -v, -vv, -vvv)")
 	cmd.PersistentFlags().StringVar(&domainFlag, "domain", "", "Check a single domain instead of scanning all")
+	cmd.PersistentFlags().Bool("local", false, "Run locally without SSH (assumes this server hosts the sites)")
 
 	// Add SSH connection flags to all subcommands
 	cmd.PersistentFlags().StringP("user", "u", "", "SSH username (default: current user)")
@@ -54,35 +56,63 @@ func newDomainsCmd() *cobra.Command {
 	checkActiveCmd := &cobra.Command{
 		Use:   "check-active [user@]host",
 		Short: "Check for domains that resolve to the server's IP (and backup/remove inactive ones if requested)",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			sshClient, err := createSSHClient(cmd, args[0])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating SSH client: %v\n", err)
-				os.Exit(1)
-			}
-			defer sshClient.Close()
+			localFlag, _ := cmd.Flags().GetBool("local")
+			var serverIP string
+			var domainPath string
+			var domains []string
+			var err error
 
-			serverIP, err := getPublicIP(sshClient)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
-				os.Exit(1)
-			}
-
-			domainPath := "/var/opt"
 			if envPath := os.Getenv("DOMAIN_PATH"); envPath != "" {
 				domainPath = envPath
+			} else {
+				domainPath = "/var/opt"
 			}
 
-			var domains []string
-			if domainFlag != "" {
-				domains = []string{domainFlag}
-				log(1, "Checking single domain: %s", domainFlag)
-			} else {
-				domains, err = findDomains(sshClient, domainPath)
+			if localFlag {
+				serverIP, err = getLocalPublicIP()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
+					fmt.Fprintf(os.Stderr, "Error getting local public IP: %v\n", err)
 					os.Exit(1)
+				}
+				if domainFlag != "" {
+					domains = []string{domainFlag}
+					log(1, "Checking single domain: %s", domainFlag)
+				} else {
+					domains, err = findDomainsLocal(domainPath)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
+						os.Exit(1)
+					}
+				}
+			} else {
+				if len(args) < 1 {
+					fmt.Fprintf(os.Stderr, "Remote mode requires [user@]host argument\n")
+					os.Exit(1)
+				}
+				sshClient, err := createSSHClient(cmd, args[0])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error creating SSH client: %v\n", err)
+					os.Exit(1)
+				}
+				defer sshClient.Close()
+
+				serverIP, err = getPublicIP(sshClient)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
+					os.Exit(1)
+				}
+
+				if domainFlag != "" {
+					domains = []string{domainFlag}
+					log(1, "Checking single domain: %s", domainFlag)
+				} else {
+					domains, err = findDomains(sshClient, domainPath)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
+						os.Exit(1)
+					}
 				}
 			}
 
@@ -98,7 +128,12 @@ func newDomainsCmd() *cobra.Command {
 				} else {
 					results = append(results, fmt.Sprintf("%s,false", domain))
 					if remove || dryRun {
-						backupAndRemove(sshClient, domainPath, domain, dryRun)
+						if localFlag {
+							backupAndRemoveLocal(domainPath, domain, dryRun)
+						} else {
+							sshClient, _ := createSSHClient(cmd, args[0])
+							backupAndRemove(sshClient, domainPath, domain, dryRun)
+						}
 					}
 				}
 			}
@@ -358,8 +393,8 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 	// 3. Create timestamped tarball on remote
 	log(2, "Creating backup tarball for %s", domain)
 	backupDir := filepath.Join(domainPath, "backup-tarballs")
-	timestamp := time.Now().Format("20060102150405")
-	tarballName := fmt.Sprintf("%s_%s.tar.gz", domain, timestamp)
+	timestamp := time.Now().Format("20060102-150405")
+	tarballName := fmt.Sprintf("%s-%s.tgz", domain, timestamp)
 	tarballPath := filepath.Join(backupDir, tarballName)
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "[DRY RUN] Would create backup archive: %s\n", tarballPath)
@@ -411,11 +446,23 @@ func getContainerName(client *auth.SSHClient, composePath string) (string, error
 }
 
 func exportDatabase(client *auth.SSHClient, containerName string) error {
-	cmd := fmt.Sprintf("docker exec %s wp db export /dev/stdout --allow-root", containerName)
+
+	cmd := fmt.Sprintf("docker exec %s sh -c 'cd /var/www/html/wp-content && wp db export /dev/stdout --allow-root'", containerName)
 	_, stderr, err := client.ExecuteCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("docker exec for db export failed: %w, stderr: %s", err, stderr)
 	}
+
+	// Verify that an *.sql file exists in wp-content
+	findCmd := fmt.Sprintf("docker exec %s sh -c 'cd /var/www/html/wp-content && find . -maxdepth 1 -name \"*.sql\"'", containerName)
+	stdout, stderr, err := client.ExecuteCommand(findCmd)
+	if err != nil {
+		return fmt.Errorf("failed to verify .sql file in wp-content: %w, stderr: %s", err, stderr)
+	}
+	if strings.TrimSpace(stdout) == "" {
+		return fmt.Errorf("no .sql file found in wp-content after export")
+	}
+	log(2, "SQL export file(s) found: %s", strings.TrimSpace(stdout))
 	return nil
 }
 
@@ -446,7 +493,7 @@ func removeContainer(client *auth.SSHClient, containerName string) error {
 	return nil
 }
 
-func log(level int, format string, a ...interface{}) {
+func log(level int, format string, a ...any) {
 	if verboseCount >= level {
 		prefix := ""
 		switch level {
@@ -459,4 +506,179 @@ func log(level int, format string, a ...interface{}) {
 		}
 		fmt.Fprintf(os.Stderr, prefix+format+"\n", a...)
 	}
+}
+
+// Local helpers
+func getLocalPublicIP() (string, error) {
+	cmds := []string{
+		"dig +short myip.opendns.com @resolver1.opendns.com",
+		"curl -s https://api.ipify.org",
+	}
+	for _, cmd := range cmds {
+		out, err := runLocalCommand(cmd)
+		if err == nil && strings.TrimSpace(out) != "" {
+			return strings.TrimSpace(out), nil
+		}
+	}
+	return "", fmt.Errorf("could not determine public IP locally")
+}
+
+func findDomainsLocal(domainPath string) ([]string, error) {
+	log(1, "Scanning for domains in %s locally", domainPath)
+	cmd := fmt.Sprintf("find %s -name 'docker-compose.yml'", domainPath)
+	out, err := runLocalCommand(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find domains locally: %w", err)
+	}
+	var domains []string
+	domainRegex := regexp.MustCompile(`(?i)^(www\.)?([a-z0-9-]+(\.[a-z]{2,})+)$`)
+	files := strings.SplitSeq(strings.TrimSpace(out), "\n")
+	for file := range files {
+		if file != "" {
+			domain := filepath.Base(filepath.Dir(file))
+			domain = strings.TrimPrefix(domain, "www.")
+			if !domainRegex.MatchString(domain) {
+				log(1, "Skipping invalid domain: %s", domain)
+				continue
+			}
+			if !slices.Contains(domains, domain) {
+				domains = append(domains, domain)
+			}
+		}
+	}
+	log(1, "Found %d domains to check in %s", len(domains), domainPath)
+	return domains, nil
+}
+
+func runLocalCommand(cmd string) (string, error) {
+	out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	return string(out), err
+}
+
+// Stub for local backup and removal logic
+func backupAndRemoveLocal(domainPath, domain string, dryRun bool) {
+	sitePath := filepath.Join(domainPath, domain)
+	log(1, "[LOCAL] Starting backup and remove process for %s", domain)
+
+	// Check if directory exists locally
+	if _, err := os.Stat(sitePath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Directory not found locally: %s\n", sitePath)
+		return
+	}
+
+	// 1. Find container name from docker-compose.yml locally
+	log(2, "Reading container name from docker-compose.yml for %s", domain)
+	composePath := filepath.Join(sitePath, "docker-compose.yml")
+	containerName, err := getContainerNameLocal(composePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting container name: %v\n", err)
+		return
+	}
+	log(2, "Found container name: %s", containerName)
+
+	// 2. Export database using Docker locally
+	log(2, "Exporting database for %s", containerName)
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would export database from container %s\n", containerName)
+	} else {
+		if err := exportDatabaseLocal(containerName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error exporting database: %v\n", err)
+			// Continue even if DB export fails
+		}
+	}
+
+	// 3. Create timestamped tarball locally
+	log(2, "Creating backup tarball for %s", domain)
+	backupDir := filepath.Join(domainPath, "backup-tarballs")
+	timestamp := time.Now().Format("20060102-150405")
+	tarballName := fmt.Sprintf("%s-%s.tgz", domain, timestamp)
+	tarballPath := filepath.Join(backupDir, tarballName)
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would create backup archive: %s\n", tarballPath)
+	} else {
+		if err := createTarballLocal(tarballPath, sitePath, backupDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating tarball: %v\n", err)
+			return
+		}
+	}
+
+	// 4. Remove container and site directory locally
+	log(2, "Removing container and site directory for %s", domain)
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would remove container %s\n", containerName)
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would remove directory %s\n", sitePath)
+	} else {
+		if err := removeContainerLocal(containerName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error removing container: %v\n", err)
+		}
+		if err := os.RemoveAll(sitePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Error removing site directory: %v\n", err)
+		}
+	}
+
+	if !dryRun {
+		fmt.Fprintf(os.Stderr, "Successfully backed up and removed %s\n", domain)
+	}
+}
+
+// Local helper implementations
+func getContainerNameLocal(composePath string) (string, error) {
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read compose file: %w", err)
+	}
+	var compose struct {
+		Services map[string]interface{} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &compose); err != nil {
+		return "", err
+	}
+	for name := range compose.Services {
+		if strings.HasPrefix(name, "wp_") {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no wp_ service found in %s", composePath)
+}
+
+func exportDatabaseLocal(containerName string) error {
+	cmd := fmt.Sprintf("docker exec %s sh -c 'cd /var/www/html/wp-content && wp db export --allow-root'", containerName)
+	out, err := runLocalCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("docker exec for db export failed: %w, output: %s", err, out)
+	}
+	// Verify that an *.sql file exists in wp-content
+	findCmd := fmt.Sprintf("docker exec %s sh -c 'cd /var/www/html/wp-content && find . -maxdepth 1 -name \"*.sql\"'", containerName)
+	out, err = runLocalCommand(findCmd)
+	if err != nil {
+		return fmt.Errorf("failed to verify .sql file in wp-content: %w, output: %s", err, out)
+	}
+	if strings.TrimSpace(out) == "" {
+		return fmt.Errorf("no .sql file found in wp-content after export")
+	}
+	log(2, "SQL export file(s) found: %s", strings.TrimSpace(out))
+	return nil
+}
+
+func createTarballLocal(tarballPath, sourcePath, backupDir string) error {
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return fmt.Errorf("failed to create backup dir locally: %w", err)
+	}
+	sourceDir := filepath.Dir(sourcePath)
+	sourceBase := filepath.Base(sourcePath)
+	cmd := fmt.Sprintf("tar -czf %s -C %s %s", tarballPath, sourceDir, sourceBase)
+	out, err := runLocalCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to create tarball locally: %w, output: %s", err, out)
+	}
+	return nil
+}
+
+func removeContainerLocal(containerName string) error {
+	cmd := fmt.Sprintf("docker rm -f %s", containerName)
+	out, err := runLocalCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to remove container %s: %w, output: %s", containerName, err, out)
+	}
+	return nil
 }
