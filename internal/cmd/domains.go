@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -140,11 +141,28 @@ func findDomains(client *auth.SSHClient, domainPath string) ([]string, error) {
 	}
 
 	var domains []string
-	files := strings.Split(strings.TrimSpace(stdout), "\n")
-	for _, file := range files {
+	domainRegex := regexp.MustCompile(`(?i)^(www\.)?([a-z0-9-]+(\.[a-z]{2,})+)$`)
+	files := strings.SplitSeq(strings.TrimSpace(stdout), "\n")
+	for file := range files {
 		if file != "" {
 			domain := filepath.Base(filepath.Dir(file))
+			// Remove any subdomains such as "www"
+			domain = strings.TrimPrefix(domain, "www.")
+
+			// Verify that the domain matches the expected format
+			if !domainRegex.MatchString(domain) {
+				log(1, "Skipping invalid domain: %s", domain)
+				continue
+			}
+
 			domains = append(domains, domain)
+
+			// Dedupe domains
+
+			if !slices.Contains(domains, domain) {
+				domains = append(domains, domain)
+			}
+
 		}
 	}
 	log(1, "Found %d domains to check in %s", len(domains), domainPath)
@@ -155,11 +173,6 @@ func domainMatchesServer(domain, serverIP string) (bool, []string, error) {
 	// Try Cloudflare API first
 	cfEmail := os.Getenv("CLOUDFLARE_EMAIL")
 	cfAPIKey := os.Getenv("CLOUDFLARE_API_KEY")
-
-	// Log cfEmail and cfAPIKey
-
-	fmt.Printf("Cloudflare Email: %s\n", cfEmail)
-	fmt.Printf("Cloudflare API Key: %s\n", cfAPIKey)
 
 	if cfEmail != "" && cfAPIKey != "" {
 		log(2, "Cloudflare credentials found, checking via API for domain %s", domain)
