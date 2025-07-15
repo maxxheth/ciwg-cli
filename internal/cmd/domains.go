@@ -50,65 +50,9 @@ func newDomainsCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolP("agent", "a", true, "Use SSH agent")
 	cmd.PersistentFlags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
 
-	checkInactiveCmd := &cobra.Command{
-		Use:   "check-inactive [user@]host",
-		Short: "Check for domains that do not resolve to the server's IP",
-		Args:  cobra.ExactArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
-			sshClient, err := createSSHClient(cmd, args[0])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating SSH client: %v\n", err)
-				os.Exit(1)
-			}
-			defer sshClient.Close()
-
-			serverIP, err := getPublicIP(sshClient)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
-				os.Exit(1)
-			}
-
-			domainPath := "/var/opt"
-			if envPath := os.Getenv("DOMAIN_PATH"); envPath != "" {
-				domainPath = envPath
-			}
-
-			var domains []string
-			if domainFlag != "" {
-				domains = []string{domainFlag}
-				log(1, "Checking single domain: %s", domainFlag)
-			} else {
-				domains, err = findDomains(sshClient, domainPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
-					os.Exit(1)
-				}
-			}
-
-			results := make([]string, 0)
-			for _, domain := range domains {
-				// Domain matching (DNS/Cloudflare) still runs locally
-				match, _, err := domainMatchesServer(domain, serverIP)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error checking domain %s: %v\n", domain, err)
-					continue
-				}
-				if !match {
-					results = append(results, fmt.Sprintf("%s,false", domain))
-					if remove || dryRun {
-						backupAndRemove(sshClient, domainPath, domain, dryRun)
-					}
-				} else {
-					results = append(results, fmt.Sprintf("%s,true", domain))
-				}
-			}
-			writeResults(results)
-		},
-	}
-
 	checkActiveCmd := &cobra.Command{
 		Use:   "check-active [user@]host",
-		Short: "Check for domains that resolve to the server's IP",
+		Short: "Check for domains that resolve to the server's IP (and backup/remove inactive ones if requested)",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			sshClient, err := createSSHClient(cmd, args[0])
@@ -143,7 +87,6 @@ func newDomainsCmd() *cobra.Command {
 
 			results := make([]string, 0)
 			for _, domain := range domains {
-				// Domain matching (DNS/Cloudflare) still runs locally
 				match, _, err := domainMatchesServer(domain, serverIP)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error checking domain %s: %v\n", domain, err)
@@ -153,13 +96,15 @@ func newDomainsCmd() *cobra.Command {
 					results = append(results, fmt.Sprintf("%s,true", domain))
 				} else {
 					results = append(results, fmt.Sprintf("%s,false", domain))
+					if remove || dryRun {
+						backupAndRemove(sshClient, domainPath, domain, dryRun)
+					}
 				}
 			}
 			writeResults(results)
 		},
 	}
 
-	cmd.AddCommand(checkInactiveCmd)
 	cmd.AddCommand(checkActiveCmd)
 	return cmd
 }
