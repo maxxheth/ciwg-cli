@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../wp-hubstack_fork"
+		},
+		{
+			"path": "../wp-hubstack"
+		}
+	],
+	"settings": {}
+}

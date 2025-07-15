@@ -1,0 +1,80 @@
+Create a CLI utility that can do the following:
+
+Given this URL: https://digital-ocean.ciwebgroup.com/domains.json
+
+Send a GET request using a URL param called `token` and pass the token to authenticate the request via the env var CIWG_DOMAIN_TOKEN
+
+The response should return a JSON response like so:
+
+[
+	  {
+    "domain": "countryac.com",
+    "website": "https://www.countryac.com",
+    "server": "wp15.ciwgserver.com",
+    "ip": "146.190.122.92"
+  },
+  {
+    "domain": "coolbr.com",
+    "website": "https://www.coolbr.com",
+    "server": "wp15.ciwgserver.com",
+    "ip": "146.190.122.92"
+  },
+  {...more data}
+]
+
+Once you receive the response in full, save it a table via the SQL driver #file:database  called "current_database_records". All values MUST NOT BE NULL, but they don't have to be unique.
+
+2. Verify every record by using the domain to query the Cloudflare API to check if it matches the IP address under the A record for that domain. Using the attached get_a_records.sh script as a reference, implement the same requests in Go to retrieve the zone ID and then the A record. This is what the shape of the A record response looks like:
+
+{
+  "errors": [
+    {
+      "code": 1000,
+      "message": "message",
+      "documentation_url": "documentation_url",
+      "source": {
+        "pointer": "pointer"
+      }
+    }
+  ],
+  "messages": [
+    {
+      "code": 1000,
+      "message": "message",
+      "documentation_url": "documentation_url",
+      "source": {
+        "pointer": "pointer"
+      }
+    }
+  ],
+  "success": true,
+  "result": [
+    {
+      "name": "example.com",
+      "ttl": 3600,
+      "type": "A",
+      "comment": "Domain verification record",
+      "content": "198.51.100.4",
+      "proxied": true,
+      "settings": {
+        "ipv4_only": true,
+        "ipv6_only": true
+      },
+      "tags": [
+        "owner:dns-team"
+      ],
+      "id": "023e105f4ecef8ad9ca31a8372d0c353",
+      "proxiable": true
+    }
+  ],
+  "result_info": {
+    "count": 1,
+    "page": 1,
+    "per_page": 20,
+    "total_count": 2000
+  }
+}
+
+3. Pull all records that match the queried domain under the `DOMAIN` column. If the accompanying IP address does not match, then run an interactive session to do the following:
+
+a. Archive & delete the website on the indicated server.
