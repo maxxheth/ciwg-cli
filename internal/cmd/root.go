@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -30,6 +31,13 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.ciwg.yaml)")
 	rootCmd.PersistentFlags().Bool("verbose", false, "verbose output")
 	viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
+
+	// Load environment variables from a .env file in the current directory.
+	// godotenv.Load() will not return an error if the .env file doesn't exist,
+	// allowing you to still set variables in the shell.
+	if err := godotenv.Load(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading .env file: %v\n", err)
+	}
 }
 
 // initConfig reads in config file and ENV variables if set.
