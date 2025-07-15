@@ -1,9 +1,6 @@
 package cmd
 
 import (
-	"archive/tar"
-	"compress/gzip"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,19 +12,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	"ciwg-cli/internal/auth"
+
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
 
 var (
-	outputFile string
-	overwrite  bool
-	appendFlag bool
-	remove     bool
-	dryRun     bool
-	debug      bool
+	outputFile   string
+	overwrite    bool
+	appendFlag   bool
+	remove       bool
+	dryRun       bool
+	verboseCount int
+	domainFlag   string
 )
 
 func newDomainsCmd() *cobra.Command {
@@ -42,13 +40,29 @@ func newDomainsCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&appendFlag, "append", false, "Append to FILE without prompting")
 	cmd.PersistentFlags().BoolVar(&remove, "remove", false, "Backup and delete sites that are not on this server (inactive only)")
 	cmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would be backed up and removed without making changes")
-	cmd.PersistentFlags().BoolVar(&debug, "debug", false, "Verbose output")
+	cmd.PersistentFlags().CountVarP(&verboseCount, "verbose", "v", "Set verbosity level (e.g., -v, -vv, -vvv)")
+	cmd.PersistentFlags().StringVar(&domainFlag, "domain", "", "Check a single domain instead of scanning all")
+
+	// Add SSH connection flags to all subcommands
+	cmd.PersistentFlags().StringP("user", "u", "", "SSH username (default: current user)")
+	cmd.PersistentFlags().StringP("port", "p", "22", "SSH port")
+	cmd.PersistentFlags().StringP("key", "k", "", "Path to SSH private key")
+	cmd.PersistentFlags().BoolP("agent", "a", true, "Use SSH agent")
+	cmd.PersistentFlags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
 
 	checkInactiveCmd := &cobra.Command{
-		Use:   "check-inactive",
+		Use:   "check-inactive [user@]host",
 		Short: "Check for domains that do not resolve to the server's IP",
+		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			serverIP, err := getPublicIP()
+			sshClient, err := createSSHClient(cmd, args[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating SSH client: %v\n", err)
+				os.Exit(1)
+			}
+			defer sshClient.Close()
+
+			serverIP, err := getPublicIP(sshClient)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
 				os.Exit(1)
@@ -59,14 +73,21 @@ func newDomainsCmd() *cobra.Command {
 				domainPath = envPath
 			}
 
-			domains, err := findDomains(domainPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
-				os.Exit(1)
+			var domains []string
+			if domainFlag != "" {
+				domains = []string{domainFlag}
+				log(1, "Checking single domain: %s", domainFlag)
+			} else {
+				domains, err = findDomains(sshClient, domainPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
+					os.Exit(1)
+				}
 			}
 
 			results := make([]string, 0)
 			for _, domain := range domains {
+				// Domain matching (DNS/Cloudflare) still runs locally
 				match, _, err := domainMatchesServer(domain, serverIP)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error checking domain %s: %v\n", domain, err)
@@ -75,10 +96,7 @@ func newDomainsCmd() *cobra.Command {
 				if !match {
 					results = append(results, fmt.Sprintf("%s,false", domain))
 					if remove || dryRun {
-						fmt.Fprintf(os.Stderr, "Would backup and remove %s (DRY_RUN=%v)\n", domain, dryRun)
-						if remove && !dryRun {
-							backupAndRemove(domainPath, domain)
-						}
+						backupAndRemove(sshClient, domainPath, domain, dryRun)
 					}
 				} else {
 					results = append(results, fmt.Sprintf("%s,true", domain))
@@ -89,10 +107,18 @@ func newDomainsCmd() *cobra.Command {
 	}
 
 	checkActiveCmd := &cobra.Command{
-		Use:   "check-active",
+		Use:   "check-active [user@]host",
 		Short: "Check for domains that resolve to the server's IP",
+		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			serverIP, err := getPublicIP()
+			sshClient, err := createSSHClient(cmd, args[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating SSH client: %v\n", err)
+				os.Exit(1)
+			}
+			defer sshClient.Close()
+
+			serverIP, err := getPublicIP(sshClient)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
 				os.Exit(1)
@@ -103,14 +129,21 @@ func newDomainsCmd() *cobra.Command {
 				domainPath = envPath
 			}
 
-			domains, err := findDomains(domainPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
-				os.Exit(1)
+			var domains []string
+			if domainFlag != "" {
+				domains = []string{domainFlag}
+				log(1, "Checking single domain: %s", domainFlag)
+			} else {
+				domains, err = findDomains(sshClient, domainPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error scanning domains: %v\n", err)
+					os.Exit(1)
+				}
 			}
 
 			results := make([]string, 0)
 			for _, domain := range domains {
+				// Domain matching (DNS/Cloudflare) still runs locally
 				match, _, err := domainMatchesServer(domain, serverIP)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error checking domain %s: %v\n", domain, err)
@@ -135,28 +168,41 @@ func init() {
 	rootCmd.AddCommand(newDomainsCmd())
 }
 
-func getPublicIP() (string, error) {
-	resp, err := http.Get("https://api.ipify.org")
+func getPublicIP(client *auth.SSHClient) (string, error) {
+	log(2, "Fetching public IP from remote server")
+	cmd := "dig +short myip.opendns.com @resolver1.opendns.com"
+	stdout, stderr, err := client.ExecuteCommand(cmd)
 	if err != nil {
-		return "", err
+		log(1, "dig command failed: %v. Stderr: %s", err, stderr)
+		log(2, "Falling back to curl to get public IP")
+		cmd = "curl -s https://api.ipify.org"
+		stdout, stderr, err = client.ExecuteCommand(cmd)
+		if err != nil {
+			return "", fmt.Errorf("failed to get public IP via curl: %w, stderr: %s", err, stderr)
+		}
 	}
-	defer resp.Body.Close()
-	ip, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(ip)), nil
+	ipStr := strings.TrimSpace(stdout)
+	log(1, "Server public IP: %s", ipStr)
+	return ipStr, nil
 }
 
-func findDomains(domainPath string) ([]string, error) {
-	var domains []string
-	files, err := filepath.Glob(filepath.Join(domainPath, "*", "docker-compose.yml"))
+func findDomains(client *auth.SSHClient, domainPath string) ([]string, error) {
+	log(1, "Scanning for domains in %s on remote server", domainPath)
+	cmd := fmt.Sprintf("find %s -name 'docker-compose.yml'", domainPath)
+	stdout, stderr, err := client.ExecuteCommand(cmd)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to find domains: %w, stderr: %s", err, stderr)
 	}
+
+	var domains []string
+	files := strings.Split(strings.TrimSpace(stdout), "\n")
 	for _, file := range files {
-		domains = append(domains, filepath.Base(filepath.Dir(file)))
+		if file != "" {
+			domain := filepath.Base(filepath.Dir(file))
+			domains = append(domains, domain)
+		}
 	}
+	log(1, "Found %d domains to check in %s", len(domains), domainPath)
 	return domains, nil
 }
 
@@ -164,7 +210,14 @@ func domainMatchesServer(domain, serverIP string) (bool, []string, error) {
 	// Try Cloudflare API first
 	cfEmail := os.Getenv("CLOUDFLARE_EMAIL")
 	cfAPIKey := os.Getenv("CLOUDFLARE_API_KEY")
+
+	// Log cfEmail and cfAPIKey
+
+	fmt.Printf("Cloudflare Email: %s\n", cfEmail)
+	fmt.Printf("Cloudflare API Key: %s\n", cfAPIKey)
+
 	if cfEmail != "" && cfAPIKey != "" {
+		log(2, "Cloudflare credentials found, checking via API for domain %s", domain)
 		_, cfRecords, err := checkCloudflare(domain, serverIP, cfEmail, cfAPIKey)
 		if err == nil {
 			if slices.Contains(cfRecords, serverIP) {
@@ -172,9 +225,10 @@ func domainMatchesServer(domain, serverIP string) (bool, []string, error) {
 			}
 			return false, cfRecords, nil
 		}
-		// If Cloudflare API fails, fallback to DNS
+		log(1, "Cloudflare API check failed for %s: %v. Falling back to DNS.", domain, err)
 	}
 	// Fallback: direct DNS lookup
+	log(2, "Checking DNS A records for %s", domain)
 	aRecords, err := net.LookupHost(domain)
 	if err != nil {
 		return false, nil, err
@@ -196,15 +250,14 @@ func checkCloudflare(domain, serverIP, email, apiKey string) (bool, []string, er
 	if err != nil {
 		return false, nil, err
 	}
-	for _, ip := range records {
-		if ip == serverIP {
-			return true, records, nil
-		}
+	if slices.Contains(records, serverIP) {
+		return true, records, nil
 	}
 	return false, records, nil
 }
 
 func getCloudflareZoneID(domain, email, apiKey string) (string, error) {
+	log(3, "Fetching Cloudflare Zone ID for %s", domain)
 	apiURL := "https://api.cloudflare.com/client/v4/zones?name=" + domain
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
@@ -232,6 +285,7 @@ func getCloudflareZoneID(domain, email, apiKey string) (string, error) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", err
 	}
+	log(4, "Cloudflare ZoneID API response for %s: %s", domain, string(body))
 	if !result.Success || len(result.Result) == 0 {
 		return "", fmt.Errorf("error: Cloudflare API error or no zone found")
 	}
@@ -239,6 +293,7 @@ func getCloudflareZoneID(domain, email, apiKey string) (string, error) {
 }
 
 func getCloudflareARecords(zoneID, domain, email, apiKey string) ([]string, error) {
+	log(3, "Fetching Cloudflare A records for zone %s, domain %s", zoneID, domain)
 	apiURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=A&name=%s", zoneID, domain)
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
@@ -266,6 +321,8 @@ func getCloudflareARecords(zoneID, domain, email, apiKey string) ([]string, erro
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, err
 	}
+
+	log(4, "Cloudflare A-Record API response for %s: %s", domain, string(body))
 	if !result.Success {
 		return nil, fmt.Errorf("error: Cloudflare API error getting A records")
 	}
@@ -308,61 +365,83 @@ func writeResults(results []string) {
 }
 
 // Stub for backup and removal logic
-func backupAndRemove(domainPath, domain string) {
+func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun bool) {
 	sitePath := filepath.Join(domainPath, domain)
-	if _, err := os.Stat(sitePath); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Directory not found: %s\n", sitePath)
+	log(1, "Starting backup and remove process for %s", domain)
+
+	// Check if directory exists on remote
+	_, _, err := client.ExecuteCommand(fmt.Sprintf("test -d %s", sitePath))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Directory not found on remote: %s\n", sitePath)
 		return
 	}
 
-	// 1. Find container name from docker-compose.yml
+	// 1. Find container name from docker-compose.yml on remote
+	log(2, "Reading container name from docker-compose.yml for %s", domain)
 	composePath := filepath.Join(sitePath, "docker-compose.yml")
-	containerName, err := getContainerName(composePath)
+	containerName, err := getContainerName(client, composePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting container name: %v\n", err)
 		return
 	}
+	log(2, "Found container name: %s", containerName)
 
-	// 2. Export database using Docker SDK
-	if err := exportDatabase(containerName); err != nil {
-		fmt.Fprintf(os.Stderr, "Error exporting database: %v\n", err)
-		// Continue even if DB export fails
+	// 2. Export database using Docker on remote
+	log(2, "Exporting database for %s", containerName)
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would export database from container %s\n", containerName)
+	} else {
+		if err := exportDatabase(client, containerName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error exporting database: %v\n", err)
+			// Continue even if DB export fails
+		}
 	}
 
-	// 3. Create timestamped tarball
+	// 3. Create timestamped tarball on remote
+	log(2, "Creating backup tarball for %s", domain)
 	backupDir := filepath.Join(domainPath, "backup-tarballs")
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating backup directory: %v\n", err)
-		return
-	}
 	timestamp := time.Now().Format("20060102150405")
 	tarballName := fmt.Sprintf("%s_%s.tar.gz", domain, timestamp)
 	tarballPath := filepath.Join(backupDir, tarballName)
-	if err := createTarball(tarballPath, sitePath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating tarball: %v\n", err)
-		return
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would create backup archive: %s\n", tarballPath)
+	} else {
+		if err := createTarball(client, tarballPath, sitePath, backupDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating tarball: %v\n", err)
+			return
+		}
 	}
 
-	// 4. Remove container and site directory
-	if err := removeContainer(containerName); err != nil {
-		fmt.Fprintf(os.Stderr, "Error removing container: %v\n", err)
-	}
-	if err := os.RemoveAll(sitePath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error removing site directory: %v\n", err)
+	// 4. Remove container and site directory on remote
+	log(2, "Removing container and site directory for %s", domain)
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would remove container %s\n", containerName)
+		fmt.Fprintf(os.Stderr, "[DRY RUN] Would remove directory %s\n", sitePath)
+	} else {
+		if err := removeContainer(client, containerName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error removing container: %v\n", err)
+		}
+		if _, _, err := client.ExecuteCommand(fmt.Sprintf("rm -rf %s", sitePath)); err != nil {
+			fmt.Fprintf(os.Stderr, "Error removing site directory: %v\n", err)
+		}
 	}
 
-	fmt.Fprintf(os.Stderr, "Successfully backed up and removed %s\n", domain)
+	if !dryRun {
+		fmt.Fprintf(os.Stderr, "Successfully backed up and removed %s\n", domain)
+	}
 }
 
-func getContainerName(composePath string) (string, error) {
-	data, err := os.ReadFile(composePath)
+func getContainerName(client *auth.SSHClient, composePath string) (string, error) {
+	cmd := fmt.Sprintf("cat %s", composePath)
+	stdout, stderr, err := client.ExecuteCommand(cmd)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read remote compose file: %w, stderr: %s", err, stderr)
 	}
+
 	var compose struct {
 		Services map[string]interface{} `yaml:"services"`
 	}
-	if err := yaml.Unmarshal(data, &compose); err != nil {
+	if err := yaml.Unmarshal([]byte(stdout), &compose); err != nil {
 		return "", err
 	}
 	for name := range compose.Services {
@@ -373,74 +452,53 @@ func getContainerName(composePath string) (string, error) {
 	return "", fmt.Errorf("no wp_ service found in %s", composePath)
 }
 
-func exportDatabase(containerName string) error {
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+func exportDatabase(client *auth.SSHClient, containerName string) error {
+	cmd := fmt.Sprintf("docker exec %s wp db export /dev/stdout --allow-root", containerName)
+	_, stderr, err := client.ExecuteCommand(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("docker exec for db export failed: %w, stderr: %s", err, stderr)
 	}
-	ctx := context.Background()
-	cmd := []string{"wp", "db", "export", "/dev/stdout", "--allow-root"}
-	execConfig := container.ExecOptions{
-		Cmd:          cmd,
-		AttachStdout: true,
-		AttachStderr: true,
-	}
-	execID, err := cli.ContainerExecCreate(ctx, containerName, execConfig)
-	if err != nil {
-		return err
-	}
-	resp, err := cli.ContainerExecAttach(ctx, execID.ID, container.ExecStartOptions{})
-	if err != nil {
-		return err
-	}
-	defer resp.Close()
-	// We are exporting to stdout, but not saving it to a file in this implementation.
-	// The original script saved it inside the container, then the container was archived.
-	// This implementation archives the directory from the host.
 	return nil
 }
 
-func createTarball(tarballPath, sourcePath string) error {
-	file, err := os.Create(tarballPath)
-	if err != nil {
-		return err
+func createTarball(client *auth.SSHClient, tarballPath, sourcePath, backupDir string) error {
+	// Ensure backup directory exists
+	mkdirCmd := fmt.Sprintf("mkdir -p %s", backupDir)
+	if _, stderr, err := client.ExecuteCommand(mkdirCmd); err != nil {
+		return fmt.Errorf("failed to create backup dir on remote: %w, stderr: %s", err, stderr)
 	}
-	defer file.Close()
-	gzipWriter := gzip.NewWriter(file)
-	defer gzipWriter.Close()
-	tarWriter := tar.NewWriter(gzipWriter)
-	defer tarWriter.Close()
-	return filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		header, err := tar.FileInfoHeader(info, info.Name())
-		if err != nil {
-			return err
-		}
-		header.Name, _ = filepath.Rel(sourcePath, path)
-		if err := tarWriter.WriteHeader(header); err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			data, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer data.Close()
-			if _, err := io.Copy(tarWriter, data); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+
+	// Create tarball
+	sourceDir := filepath.Dir(sourcePath)
+	sourceBase := filepath.Base(sourcePath)
+	tarCmd := fmt.Sprintf("tar -czf %s -C %s %s", tarballPath, sourceDir, sourceBase)
+	_, stderr, err := client.ExecuteCommand(tarCmd)
+	if err != nil {
+		return fmt.Errorf("failed to create tarball on remote: %w, stderr: %s", err, stderr)
+	}
+	return nil
 }
 
-func removeContainer(containerName string) error {
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+func removeContainer(client *auth.SSHClient, containerName string) error {
+	cmd := fmt.Sprintf("docker rm -f %s", containerName)
+	_, stderr, err := client.ExecuteCommand(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to remove container %s: %w, stderr: %s", containerName, err, stderr)
 	}
-	ctx := context.Background()
-	return cli.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
+	return nil
+}
+
+func log(level int, format string, a ...interface{}) {
+	if verboseCount >= level {
+		prefix := ""
+		switch level {
+		case 1:
+			prefix = "[INFO] "
+		case 2:
+			prefix = "[DEBUG] "
+		case 3, 4:
+			prefix = "[TRACE] "
+		}
+		fmt.Fprintf(os.Stderr, prefix+format+"\n", a...)
+	}
 }
