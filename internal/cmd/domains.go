@@ -28,6 +28,7 @@ var (
 	dryRun       bool
 	verboseCount int
 	domainFlag   string
+	excludeList  string // Add exclude flag
 )
 
 func newDomainsCmd() *cobra.Command {
@@ -45,6 +46,7 @@ func newDomainsCmd() *cobra.Command {
 	cmd.PersistentFlags().CountVarP(&verboseCount, "verbose", "v", "Set verbosity level (e.g., -v, -vv, -vvv)")
 	cmd.PersistentFlags().StringVar(&domainFlag, "domain", "", "Check a single domain instead of scanning all")
 	cmd.PersistentFlags().Bool("local", false, "Run locally without SSH (assumes this server hosts the sites)")
+	cmd.PersistentFlags().StringVar(&excludeList, "exclude", "", "Pipebar-delimited list or file of domains to exclude from verification")
 
 	// Add SSH connection flags to all subcommands
 	cmd.PersistentFlags().StringP("user", "u", "", "SSH username (default: current user)")
@@ -116,8 +118,33 @@ func newDomainsCmd() *cobra.Command {
 				}
 			}
 
+			// Parse exclude list
+			excluded := make(map[string]struct{})
+			if excludeList != "" {
+				if strings.Contains(excludeList, "|") {
+					for _, d := range strings.Split(excludeList, "|") {
+						excluded[strings.TrimSpace(d)] = struct{}{}
+					}
+				} else {
+					// Assume it's a file
+					data, err := os.ReadFile(excludeList)
+					if err == nil {
+						for _, d := range strings.Split(string(data), "\n") {
+							d = strings.TrimSpace(d)
+							if d != "" {
+								excluded[d] = struct{}{}
+							}
+						}
+					}
+				}
+			}
+
 			results := make([]string, 0)
 			for _, domain := range domains {
+				if _, skip := excluded[domain]; skip {
+					log(1, "Skipping excluded domain: %s", domain)
+					continue
+				}
 				match, _, err := domainMatchesServer(domain, serverIP)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error checking domain %s: %v\n", domain, err)
