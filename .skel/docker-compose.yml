@@ -1,0 +1,52 @@
+services:
+  %DB_NAME%:
+    image: ghcr.io/ciwebgroup/advanced-wordpress:latest
+    container_name: %DB_NAME%
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./robots.txt:/var/www/html/robots.txt:ro
+      - ./www:/var/www/html
+      - ./www/wp-content/mysql.sql:/data/mysql.sql:ro
+      - ./www/wp-content:/var/www/html/wp-content
+      - /var/opt/shared/mu-plugins:/var/www/html/wp-content/mu-plugins:ro
+      - ./log:/var/www/log
+    restart: always
+    environment:
+      - PAGER=more
+      - MEMORY_LIMIT=1G
+      - WORDPRESS_DB_HOST=mysql
+      - WORDPRESS_DB_USER=%DB_USER%
+      - WORDPRESS_DB_PASSWORD=%DB_PASS%
+      - WORDPRESS_DB_NAME=%DB_NAME%
+      - WP_HOME=%URL%
+      - WP_DEBUG=true
+      - WP_CACHE=true
+      - WP_DEBUG_LOG=true
+      - WP_DEBUG_DISPLAY=false
+      - DOMAISCRIPT_DEBUG=true
+    networks:
+      - cache
+      - web
+      - mysql
+    labels:
+      - "ci.groups=website,wordpress"
+      - "traefik.http.routers.%DB_NAME%.middlewares=block-sql-files"
+      - "traefik.http.routers.%DB_NAME%.rule=Host(`%DOMAIN%`) || Host(`www.%DOMAIN%`)"
+      - "traefik.http.routers.%DB_NAME%.tls=true"
+      - "traefik.http.routers.%DB_NAME%.tls.certresolver=lets-encrypt"
+      - "traefik.port=80"
+
+networks:
+  cache:
+    name: cache
+    external: true
+  mysql:
+    name: mysql
+    external: true
+  web:
+    name: web
+    external: true

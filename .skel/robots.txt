@@ -1,0 +1,32 @@
+User-agent: *
+Disallow: /wp-admin/
+Allow: /wp-admin/admin-ajax.php
+Disallow: /wp-includes/
+Disallow: /wp-content/plugins/
+Disallow: /wp-content/cache/
+Disallow: /wp-json/
+Disallow: /trackback/
+Disallow: /?s=
+Disallow: /author/
+Disallow: /*/feed/
+Disallow: /*/embed/
+Disallow: /*.php$
+Disallow: /hvac-terminology/
+Disallow: /hvac-faqs/
+Disallow: /hvac-troubleshooter/
+Crawl-delay: 10
+
+# Prevent indexing of unwanted query parameters (e.g., session IDs or tracking)
+Disallow: /*?*
+
+# Sitemap references
+Sitemap: %URL%/sitemap_index.xml
+Sitemap: %URL%/post-sitemap.xml
+Sitemap: %URL%/page-sitemap.xml
+
+# Rules for specific bots
+User-agent: AhrefsBot
+Crawl-delay: 5
+
+User-agent: SemrushBot
+Crawl-delay: 5
