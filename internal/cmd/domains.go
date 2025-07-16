@@ -226,6 +226,34 @@ func domainMatchesServer(domain, serverIP string) (bool, []string, error) {
 	if err != nil {
 		return false, nil, err
 	}
+	nsMatch, nsRecords, err := checkCFNSRecords(domain)
+
+	hasCloudflareNS := false
+	for _, ns := range nsRecords {
+		if strings.HasSuffix(ns, "ns.cloudflare.com") {
+			hasCloudflareNS = true
+			break
+		}
+	}
+
+	// fmt.Printf("NS records for %s: %v | Cloudflare NS: %v\n | Has Cloudflare NS subdomain: %v\n", domain, nsRecords, hasCloudflareNS, nsMatch)
+
+	if err != nil {
+		return false, nil, fmt.Errorf("error checking NS records for %s: %v", domain, err)
+	}
+
+	if !nsMatch && hasCloudflareNS {
+		log(1, "NS records for %s do not match expected values: %v", domain, nsRecords)
+
+		fmt.Printf("Domain %s managed under different Cloudflare account. DNS A records: %v", domain, aRecords)
+
+		// Print a line break
+		fmt.Println()
+
+		return true, aRecords, nil // Return true because we don't know for sure whether the DNS records on that Cloudflare account actually point to our servers or not.
+	}
+
+	log(3, "DNS A records for %s: %v", domain, aRecords)
 	if slices.Contains(aRecords, serverIP) {
 		return true, aRecords, nil
 	}
@@ -238,11 +266,14 @@ func checkCloudflare(domain, serverIP, email, apiKey string) (bool, []string, er
 	if err != nil || zoneID == "" {
 		return false, nil, err
 	}
+	log(3, "Cloudflare Zone ID for %s: %s", domain, zoneID)
 	// Get A records
 	records, err := getCloudflareARecords(zoneID, domain, email, apiKey)
 	if err != nil {
 		return false, nil, err
 	}
+	log(3, "Cloudflare A records for %s: %v | Server IP: %s", domain, records, serverIP)
+	// Check if server IP is in A record
 	if slices.Contains(records, serverIP) {
 		return true, records, nil
 	}
@@ -681,4 +712,36 @@ func removeContainerLocal(containerName string) error {
 		return fmt.Errorf("failed to remove container %s: %w, output: %s", containerName, err, out)
 	}
 	return nil
+}
+
+// checkCFNSRecords checks if the domain's NS records match either NS1 or NS2 environment variables.
+func checkCFNSRecords(domain string) (bool, []string, error) {
+	ns1 := os.Getenv("NS1")
+	ns2 := os.Getenv("NS2")
+	if ns1 == "" && ns2 == "" {
+		return false, nil, fmt.Errorf("NS1 and NS2 environment variables are not set")
+	}
+
+	cmd := fmt.Sprintf("dig ns +short %s", domain)
+	out, err := runLocalCommand(cmd)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to run dig for NS records: %w", err)
+	}
+
+	nsRecords := []string{}
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		if line != "" {
+			nsRecords = append(nsRecords, strings.TrimSuffix(line, "."))
+		}
+	}
+
+	match := false
+	for _, ns := range nsRecords {
+		if ns == ns1 || ns == ns2 {
+			match = true
+			break
+		}
+	}
+
+	return match, nsRecords, nil
 }
