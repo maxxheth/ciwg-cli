@@ -129,14 +129,9 @@ func SpinUpSite(domain, url, dbName, zipPath, wpContentPath, sqlFilePath, projec
 	// Import SQL
 	containerName := dbName
 	// container.Exe
-	// execConfig := types.ExecConfig{
-	// 	Cmd:          []string{"wp", "db", "import", sqlFilePath},
-	// 	AttachStdout: true,
-	// 	AttachStderr: true,
-	// }
 
 	execConfig := container.ExecOptions{
-		Cmd:          []string{"wp", "db", "import", sqlFilePath},
+		Cmd:          []string{"wp", "--allow-root", "db", "import", sqlFilePath},
 		AttachStdout: true,
 		AttachStderr: true,
 	}
