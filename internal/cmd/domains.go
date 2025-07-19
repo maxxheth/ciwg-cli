@@ -122,7 +122,7 @@ func newDomainsCmd() *cobra.Command {
 			excluded := make(map[string]struct{})
 			if excludeList != "" {
 				if strings.Contains(excludeList, "|") {
-					for _, d := range strings.Split(excludeList, "|") {
+					for d := range strings.SplitSeq(excludeList, "|") {
 						excluded[strings.TrimSpace(d)] = struct{}{}
 					}
 				} else {
