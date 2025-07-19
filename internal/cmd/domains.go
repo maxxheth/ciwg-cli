@@ -437,6 +437,16 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 	}
 	log(2, "Found container name: %s", containerName)
 
+	// Get database name
+	log(2, "Reading database name from docker-compose.yml for %s", domain)
+	dbName, err := getDatabaseName(client, composePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting database name: %v\n", err)
+		// Continue even if DB name isn't found, as we can still remove files.
+	} else {
+		log(2, "Found database name: %s", dbName)
+	}
+
 	// 2. Export database using Docker on remote
 	log(2, "Exporting database for %s", containerName)
 	if dryRun {
@@ -463,7 +473,20 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 		}
 	}
 
-	// 4. Remove container and site directory on remote
+	// 4. Drop the database
+	if dbName != "" {
+		log(2, "Dropping database %s", dbName)
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "[DRY RUN] Would drop database %s\n", dbName)
+		} else {
+			if err := dropDatabase(client, dbName); err != nil {
+				// Log error but continue with removal process
+				fmt.Fprintf(os.Stderr, "Error dropping database: %v\n", err)
+			}
+		}
+	}
+
+	// 5. Remove container and site directory on remote
 	log(2, "Removing container and site directory for %s", domain)
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "[DRY RUN] Would remove container %s\n", containerName)
@@ -503,6 +526,33 @@ func getContainerName(client *auth.SSHClient, composePath string) (string, error
 	return "", fmt.Errorf("no wp_ service found in %s", composePath)
 }
 
+func getDatabaseName(client *auth.SSHClient, composePath string) (string, error) {
+	cmd := fmt.Sprintf("cat %s", composePath)
+	stdout, stderr, err := client.ExecuteCommand(cmd)
+	if err != nil {
+		return "", fmt.Errorf("failed to read remote compose file: %w, stderr: %s", err, stderr)
+	}
+
+	var compose struct {
+		Services map[string]struct {
+			Environment []string `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(stdout), &compose); err != nil {
+		return "", fmt.Errorf("failed to unmarshal compose file: %w", err)
+	}
+
+	for _, service := range compose.Services {
+		for _, env := range service.Environment {
+			if strings.HasPrefix(env, "WORDPRESS_DB_NAME=") {
+				return strings.TrimPrefix(env, "WORDPRESS_DB_NAME="), nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no WORDPRESS_DB_NAME found in %s", composePath)
+}
+
 func exportDatabase(client *auth.SSHClient, containerName string) error {
 
 	cmd := fmt.Sprintf("docker exec %s sh -c 'cd /var/www/html/wp-content && wp db export /dev/stdout --allow-root'", containerName)
@@ -539,6 +589,36 @@ func createTarball(client *auth.SSHClient, tarballPath, sourcePath, backupDir st
 	if err != nil {
 		return fmt.Errorf("failed to create tarball on remote: %w, stderr: %s", err, stderr)
 	}
+	return nil
+}
+
+func dropDatabase(client *auth.SSHClient, dbName string) error {
+	rootUser := os.Getenv("MYSQL_ROOT_USER")
+	rootPass := os.Getenv("MYSQL_ROOT_PASSWD")
+
+	if rootUser == "" {
+		rootUser = "root"
+	}
+	if rootPass == "" {
+		return fmt.Errorf("MYSQL_ROOT_PASSWD environment variable is not set, cannot drop database")
+	}
+	if dbName == "" {
+		return fmt.Errorf("database name is empty, cannot drop")
+	}
+
+	// Pass the password via MYSQL_PWD to avoid issues with special characters in the password.
+	dropCmd := fmt.Sprintf("mysql -u%s -e 'DROP DATABASE IF EXISTS `%s`'", rootUser, dbName)
+	fullCmd := fmt.Sprintf("export MYSQL_PWD='%s'; docker exec mysql sh -c \"%s\"", rootPass, dropCmd)
+
+	_, stderr, err := client.ExecuteCommand(fullCmd)
+	if err != nil {
+		if strings.Contains(stderr, "database doesn't exist") {
+			log(1, "Database %s does not exist, nothing to drop.", dbName)
+			return nil
+		}
+		return fmt.Errorf("failed to drop database %s: %w, stderr: %s", dbName, err, stderr)
+	}
+	log(1, "Successfully dropped database %s", dbName)
 	return nil
 }
 
@@ -634,6 +714,15 @@ func backupAndRemoveLocal(domainPath, domain string, dryRun bool) {
 	}
 	log(2, "Found container name: %s", containerName)
 
+	// Get database name
+	log(2, "[LOCAL] Reading database name from docker-compose.yml for %s", domain)
+	dbName, err := getDatabaseNameLocal(composePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting database name: %v\n", err)
+	} else {
+		log(2, "[LOCAL] Found database name: %s", dbName)
+	}
+
 	// 2. Export database using Docker locally
 	log(2, "Exporting database for %s", containerName)
 	if dryRun {
@@ -660,7 +749,19 @@ func backupAndRemoveLocal(domainPath, domain string, dryRun bool) {
 		}
 	}
 
-	// 4. Remove container and site directory locally
+	// 4. Drop the database
+	if dbName != "" {
+		log(2, "[LOCAL] Dropping database %s", dbName)
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "[DRY RUN] Would drop database %s\n", dbName)
+		} else {
+			if err := dropDatabaseLocal(dbName); err != nil {
+				fmt.Fprintf(os.Stderr, "Error dropping database: %v\n", err)
+			}
+		}
+	}
+
+	// 5. Remove container and site directory locally
 	log(2, "Removing container and site directory for %s", domain)
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "[DRY RUN] Would remove container %s\n", containerName)
@@ -699,6 +800,29 @@ func getContainerNameLocal(composePath string) (string, error) {
 	return "", fmt.Errorf("no wp_ service found in %s", composePath)
 }
 
+func getDatabaseNameLocal(composePath string) (string, error) {
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read compose file: %w", err)
+	}
+	var compose struct {
+		Services map[string]struct {
+			Environment []string `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &compose); err != nil {
+		return "", err
+	}
+	for _, service := range compose.Services {
+		for _, env := range service.Environment {
+			if strings.HasPrefix(env, "WORDPRESS_DB_NAME=") {
+				return strings.TrimPrefix(env, "WORDPRESS_DB_NAME="), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no WORDPRESS_DB_NAME found in %s", composePath)
+}
+
 func exportDatabaseLocal(containerName string) error {
 	cmd := fmt.Sprintf("docker exec %s sh -c 'cd /var/www/html/wp-content && wp db export --allow-root'", containerName)
 	out, err := runLocalCommand(cmd)
@@ -729,6 +853,34 @@ func createTarballLocal(tarballPath, sourcePath, backupDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create tarball locally: %w, output: %s", err, out)
 	}
+	return nil
+}
+
+func dropDatabaseLocal(dbName string) error {
+	rootUser := os.Getenv("MYSQL_ROOT_USER")
+	rootPass := os.Getenv("MYSQL_ROOT_PASSWD")
+
+	if rootUser == "" {
+		rootUser = "root"
+	}
+	if rootPass == "" {
+		return fmt.Errorf("MYSQL_ROOT_PASSWD environment variable is not set, cannot drop database")
+	}
+	if dbName == "" {
+		return fmt.Errorf("database name is empty, cannot drop")
+	}
+
+	// Use sh -c to handle environment variable export and command execution together.
+	cmd := fmt.Sprintf("export MYSQL_PWD='%s'; docker exec mysql mysql -u%s -e 'DROP DATABASE IF EXISTS `%s`'", rootPass, rootUser, dbName)
+	out, err := runLocalCommand(cmd)
+	if err != nil {
+		if strings.Contains(out, "database doesn't exist") {
+			log(1, "[LOCAL] Database %s does not exist, nothing to drop.", dbName)
+			return nil
+		}
+		return fmt.Errorf("failed to drop database %s locally: %w, output: %s", dbName, err, out)
+	}
+	log(1, "[LOCAL] Successfully dropped database %s", dbName)
 	return nil
 }
 
