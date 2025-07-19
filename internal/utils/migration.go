@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,7 +73,7 @@ func InspectZipFile(zipPath string) (wpPath, sqlPath string, err error) {
 }
 
 // SpinUpSite creates and starts a WordPress site using the Docker SDK.
-func SpinUpSite(client *auth.SSHClient, domain, url, dbName, zipPath, wpContentPath, sqlFilePath, projectPath string, dryRun bool) error {
+func SpinUpSite(client *auth.SSHClient, domain, url, dbName, zipPath, wpContentPath, sqlFilePath, projectPath string, createNewSite, dryRun bool) error {
 	if dryRun {
 		fmt.Println("--- Dry Run Mode ---")
 		fmt.Printf("Domain: %s\n", domain)
@@ -82,6 +83,7 @@ func SpinUpSite(client *auth.SSHClient, domain, url, dbName, zipPath, wpContentP
 		fmt.Printf("WordPress Content Path: %s\n", wpContentPath)
 		fmt.Printf("SQL File Path: %s\n", sqlFilePath)
 		fmt.Printf("Project Path: %s\n", projectPath)
+		fmt.Printf("Create New Site: %t\n", createNewSite)
 		fmt.Println("--------------------")
 		return nil
 	}
@@ -105,18 +107,42 @@ func SpinUpSite(client *auth.SSHClient, domain, url, dbName, zipPath, wpContentP
 	fmt.Printf("Database User: %s\n", dbUser)
 	fmt.Printf("Database Password: %s\n", dbPass)
 
-	// Unzip the file
-	if err := unzip(client, zipPath, filepath.Join(projectPath, "www")); err != nil {
-		return fmt.Errorf("error unzipping file: %w", err)
-	}
-
-	// Replace wp-content
 	wwwPath := filepath.Join(projectPath, "www")
-	if _, _, err := client.ExecuteCommand(fmt.Sprintf("rm -rf %s", filepath.Join(wwwPath, "wp-content"))); err != nil {
-		return fmt.Errorf("error removing existing wp-content: %w", err)
-	}
-	if _, _, err := client.ExecuteCommand(fmt.Sprintf("mv %s %s", filepath.Join(wwwPath, wpContentPath), filepath.Join(wwwPath, "wp-content"))); err != nil {
-		return fmt.Errorf("error moving new wp-content: %w", err)
+
+	if createNewSite {
+		// Create a new site from latest.zip
+		fmt.Println("Creating new site from wordpress.org/latest.zip...")
+		latestZipPath := "/tmp/latest.zip"
+		if _, _, err := client.ExecuteCommand(fmt.Sprintf("wget https://wordpress.org/latest.zip -O %s", latestZipPath)); err != nil {
+			return fmt.Errorf("failed to download latest wordpress zip: %w", err)
+		}
+		if err := unzip(client, latestZipPath, wwwPath); err != nil {
+			return fmt.Errorf("error unzipping latest.zip: %w", err)
+		}
+		// Move wordpress/wp-content to www/wp-content
+		if _, _, err := client.ExecuteCommand(fmt.Sprintf("mv %s %s", filepath.Join(wwwPath, "wordpress/wp-content"), filepath.Join(wwwPath, "wp-content"))); err != nil {
+			return fmt.Errorf("error moving new wp-content: %w", err)
+		}
+		// Cleanup
+		if _, _, err := client.ExecuteCommand(fmt.Sprintf("rm -rf %s", filepath.Join(wwwPath, "wordpress"))); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to cleanup wordpress directory: %v\n", err)
+		}
+		if _, _, err := client.ExecuteCommand(fmt.Sprintf("rm %s", latestZipPath)); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to cleanup latest.zip: %v\n", err)
+		}
+	} else {
+		// Unzip the provided file
+		if err := unzip(client, zipPath, wwwPath); err != nil {
+			return fmt.Errorf("error unzipping file: %w", err)
+		}
+
+		// Replace wp-content
+		if _, _, err := client.ExecuteCommand(fmt.Sprintf("rm -rf %s", filepath.Join(wwwPath, "wp-content"))); err != nil {
+			return fmt.Errorf("error removing existing wp-content: %w", err)
+		}
+		if _, _, err := client.ExecuteCommand(fmt.Sprintf("mv %s %s", filepath.Join(wwwPath, wpContentPath), filepath.Join(wwwPath, "wp-content"))); err != nil {
+			return fmt.Errorf("error moving new wp-content: %w", err)
+		}
 	}
 
 	// Run docker-compose up
@@ -126,11 +152,16 @@ func SpinUpSite(client *auth.SSHClient, domain, url, dbName, zipPath, wpContentP
 		return fmt.Errorf("error running `docker compose up`: %w", err)
 	}
 
-	// Import SQL
-	containerName := dbName
-	dockerExecCmd := fmt.Sprintf("docker exec %s wp --allow-root db import %s", containerName, sqlFilePath)
-	if _, _, err := client.ExecuteCommand(dockerExecCmd); err != nil {
-		return fmt.Errorf("error importing database: %w", err)
+	// Import SQL only if not creating a new site
+	if !createNewSite {
+		fmt.Println("Importing database...")
+		containerName := dbName
+		// The SQL file is inside the unzipped www directory, so we need to adjust its path
+		sqlImportPath := filepath.Join(wwwPath, sqlFilePath)
+		dockerExecCmd := fmt.Sprintf("docker exec %s wp db import %s --allow-root", containerName, sqlImportPath)
+		if _, _, err := client.ExecuteCommand(dockerExecCmd); err != nil {
+			return fmt.Errorf("error importing database: %w", err)
+		}
 	}
 
 	return nil
@@ -251,7 +282,7 @@ func runCommand(client *auth.SSHClient, dir, name string, args ...string) error 
 // --- Local versions ---
 
 // SpinUpSiteLocal creates and starts a WordPress site locally.
-func SpinUpSiteLocal(domain, url, dbName, zipPath, wpContentPath, sqlFilePath, projectPath string, dryRun bool) error {
+func SpinUpSiteLocal(domain, url, dbName, zipPath, wpContentPath, sqlFilePath, projectPath string, createNewSite, dryRun bool) error {
 	if dryRun {
 		fmt.Println("--- Dry Run Mode (Local) ---")
 		fmt.Printf("Domain: %s\n", domain)
@@ -261,6 +292,7 @@ func SpinUpSiteLocal(domain, url, dbName, zipPath, wpContentPath, sqlFilePath, p
 		fmt.Printf("WordPress Content Path: %s\n", wpContentPath)
 		fmt.Printf("SQL File Path: %s\n", sqlFilePath)
 		fmt.Printf("Project Path: %s\n", projectPath)
+		fmt.Printf("Create New Site: %t\n", createNewSite)
 		fmt.Println("-----------------------------")
 		return nil
 	}
@@ -283,20 +315,53 @@ func SpinUpSiteLocal(domain, url, dbName, zipPath, wpContentPath, sqlFilePath, p
 	fmt.Printf("Database User: %s\n", dbUser)
 	fmt.Printf("Database Password: %s\n", dbPass)
 
-	// Locate the docker-compose.yml file
-
-	// Unzip the file
-	if err := unzipLocal(zipPath, filepath.Join(projectPath, "www")); err != nil {
-		return fmt.Errorf("error unzipping file: %w", err)
-	}
-
-	// Replace wp-content
 	wwwPath := filepath.Join(projectPath, "www")
-	if err := os.RemoveAll(filepath.Join(wwwPath, "wp-content")); err != nil {
-		return fmt.Errorf("error removing existing wp-content: %w", err)
-	}
-	if err := os.Rename(filepath.Join(wwwPath, wpContentPath), filepath.Join(wwwPath, "wp-content")); err != nil {
-		return fmt.Errorf("error moving new wp-content: %w", err)
+
+	if createNewSite {
+		fmt.Println("Creating new site from wordpress.org/latest.zip...")
+		resp, err := http.Get("https://wordpress.org/latest.zip")
+		if err != nil {
+			return fmt.Errorf("failed to download latest.zip: %w", err)
+		}
+		defer resp.Body.Close()
+
+		latestZipPath := filepath.Join(os.TempDir(), "latest.zip")
+		out, err := os.Create(latestZipPath)
+		if err != nil {
+			return fmt.Errorf("failed to create temp file for latest.zip: %w", err)
+		}
+		defer out.Close()
+		defer os.Remove(latestZipPath)
+
+		if _, err = io.Copy(out, resp.Body); err != nil {
+			return fmt.Errorf("failed to save latest.zip: %w", err)
+		}
+		out.Close() // Close file before unzipping
+
+		if err := unzipLocal(latestZipPath, wwwPath); err != nil {
+			return fmt.Errorf("error unzipping latest.zip: %w", err)
+		}
+		// Move wordpress/wp-content to www/wp-content
+		if err := os.Rename(filepath.Join(wwwPath, "wordpress/wp-content"), filepath.Join(wwwPath, "wp-content")); err != nil {
+			return fmt.Errorf("error moving new wp-content: %w", err)
+		}
+		// Cleanup
+		if err := os.RemoveAll(filepath.Join(wwwPath, "wordpress")); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to cleanup wordpress directory: %v\n", err)
+		}
+	} else {
+		// Unzip the provided file
+		if err := unzipLocal(zipPath, wwwPath); err != nil {
+			return fmt.Errorf("error unzipping file: %w", err)
+		}
+
+		// Replace wp-content
+		if err := os.RemoveAll(filepath.Join(wwwPath, "wp-content")); err != nil {
+			return fmt.Errorf("error removing existing wp-content: %w", err)
+		}
+		if err := os.Rename(filepath.Join(wwwPath, wpContentPath), filepath.Join(wwwPath, "wp-content")); err != nil {
+			return fmt.Errorf("error moving new wp-content: %w", err)
+		}
 	}
 
 	// Run docker-compose up
@@ -306,11 +371,16 @@ func SpinUpSiteLocal(domain, url, dbName, zipPath, wpContentPath, sqlFilePath, p
 		return fmt.Errorf("error running docker-compose up: %w", err)
 	}
 
-	// Import SQL
-	containerName := dbName
-	dockerExecCmd := fmt.Sprintf("docker exec %s wp --allow-root db import %s", containerName, sqlFilePath)
-	if _, err := runLocalCommand(dockerExecCmd); err != nil {
-		return fmt.Errorf("error importing database: %w", err)
+	// Import SQL only if not creating a new site
+	if !createNewSite {
+		fmt.Println("Importing database...")
+		containerName := dbName
+		// The SQL file is inside the unzipped www directory, so we need to adjust its path
+		sqlImportPath := filepath.Join(wwwPath, sqlFilePath)
+		dockerExecCmd := fmt.Sprintf("docker exec %s wp db import %s --allow-root", containerName, sqlImportPath)
+		if _, err := runLocalCommand(dockerExecCmd); err != nil {
+			return fmt.Errorf("error importing database: %w", err)
+		}
 	}
 
 	return nil
