@@ -65,6 +65,7 @@ func newDomainsCmd() *cobra.Command {
 			var domainPath string
 			var domains []string
 			var err error
+			var hostname string
 
 			if envPath := os.Getenv("DOMAIN_PATH"); envPath != "" {
 				domainPath = envPath
@@ -76,6 +77,11 @@ func newDomainsCmd() *cobra.Command {
 				serverIP, err = getLocalPublicIP()
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error getting local public IP: %v\n", err)
+					os.Exit(1)
+				}
+				hostname, err = getLocalHostname()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting local hostname: %v\n", err)
 					os.Exit(1)
 				}
 				if domainFlag != "" {
@@ -93,6 +99,7 @@ func newDomainsCmd() *cobra.Command {
 					fmt.Fprintf(os.Stderr, "Remote mode requires [user@]host argument\n")
 					os.Exit(1)
 				}
+
 				sshClient, err := createSSHClient(cmd, args[0])
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error creating SSH client: %v\n", err)
@@ -103,6 +110,12 @@ func newDomainsCmd() *cobra.Command {
 				serverIP, err = getPublicIP(sshClient)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error getting public IP: %v\n", err)
+					os.Exit(1)
+				}
+
+				hostname, err = getRemoteHostname(sshClient)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting remote hostname: %v\n", err)
 					os.Exit(1)
 				}
 
@@ -150,10 +163,17 @@ func newDomainsCmd() *cobra.Command {
 					fmt.Fprintf(os.Stderr, "Error checking domain %s: %v\n", domain, err)
 					continue
 				}
+
+				// Format: URL,Active,Host
+				hostDisplay := hostname
+				if !strings.HasSuffix(hostname, ".ciwgserver.com") && hostname != "localhost" {
+					hostDisplay = hostname + ".ciwgserver.com"
+				}
+
 				if match {
-					results = append(results, fmt.Sprintf("%s,true", domain))
+					results = append(results, fmt.Sprintf("%s,true,%s", domain, hostDisplay))
 				} else {
-					results = append(results, fmt.Sprintf("%s,false", domain))
+					results = append(results, fmt.Sprintf("%s,false,%s", domain, hostDisplay))
 					if remove || dryRun {
 						if localFlag {
 							backupAndRemoveLocal(domainPath, domain, dryRun)
@@ -386,6 +406,8 @@ func getCloudflareARecords(zoneID, domain, email, apiKey string) ([]string, erro
 
 func writeResults(results []string) {
 	if outputFile == "" {
+		// Print header to stdout
+		fmt.Println("URL,Active,Host")
 		for _, line := range results {
 			fmt.Println(line)
 		}
@@ -409,6 +431,12 @@ func writeResults(results []string) {
 		return
 	}
 	defer f.Close()
+
+	// Write header to file (only if creating new file or overwriting)
+	if !appendFlag {
+		fmt.Fprintln(f, "URL,Active,Host")
+	}
+
 	for _, line := range results {
 		fmt.Fprintln(f, line)
 	}
@@ -644,6 +672,19 @@ func log(level int, format string, a ...any) {
 		}
 		fmt.Fprintf(os.Stderr, prefix+format+"\n", a...)
 	}
+}
+
+func getLocalHostname() (string, error) {
+	return os.Hostname()
+}
+
+// getRemoteHostname retrieves the hostname from a remote server via SSH.
+func getRemoteHostname(client *auth.SSHClient) (string, error) {
+	stdout, stderr, err := client.ExecuteCommand("hostname")
+	if err != nil {
+		return "", fmt.Errorf("failed to get remote hostname: %w, stderr: %s", err, stderr)
+	}
+	return strings.TrimSpace(stdout), nil
 }
 
 // Local helpers
