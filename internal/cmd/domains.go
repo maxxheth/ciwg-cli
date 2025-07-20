@@ -29,6 +29,7 @@ var (
 	verboseCount int
 	domainFlag   string
 	excludeList  string // Add exclude flag
+	report       bool   // Add report flag
 )
 
 func newDomainsCmd() *cobra.Command {
@@ -47,6 +48,7 @@ func newDomainsCmd() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&domainFlag, "domain", "", "Check a single domain instead of scanning all")
 	cmd.PersistentFlags().Bool("local", false, "Run locally without SSH (assumes this server hosts the sites)")
 	cmd.PersistentFlags().StringVar(&excludeList, "exclude", "", "Pipebar-delimited list or file of domains to exclude from verification")
+	cmd.PersistentFlags().BoolVar(&report, "report", false, "Generate a formatted report instead of CSV output")
 
 	// Add SSH connection flags to all subcommands
 	cmd.PersistentFlags().StringP("user", "u", "", "SSH username (default: current user)")
@@ -184,7 +186,12 @@ func newDomainsCmd() *cobra.Command {
 					}
 				}
 			}
-			writeResults(results)
+
+			if report {
+				generateReport(results)
+			} else {
+				writeResults(results)
+			}
 		},
 	}
 
@@ -441,6 +448,216 @@ func writeResults(results []string) {
 		fmt.Fprintln(f, line)
 	}
 	fmt.Fprintf(os.Stderr, "CSV results written to %s\n", outputFile)
+}
+
+type DomainResult struct {
+	Domain string
+	Active bool
+	Host   string
+}
+
+func generateReport(results []string) {
+	// Parse results into structured data
+	hostCounts := make(map[string]int)
+	activeCount := 0
+	inactiveCount := 0
+	var inactiveDomains []string
+
+	for _, line := range results {
+		parts := strings.Split(line, ",")
+		if len(parts) != 3 {
+			continue
+		}
+
+		domain := parts[0]
+		active := parts[1] == "true"
+		host := parts[2]
+
+		if active {
+			activeCount++
+			hostCounts[host]++
+		} else {
+			inactiveCount++
+			inactiveDomains = append(inactiveDomains, domain)
+		}
+	}
+
+	// Generate report
+	fmt.Println("# WordPress Website Domain Analysis Report")
+	fmt.Println()
+
+	// Overall Summary
+	fmt.Println("## Overall Summary")
+	fmt.Println()
+	fmt.Printf("| %d Websites Active | %d Websites Inactive |\n", activeCount, inactiveCount)
+	fmt.Println("| :---: | :---: |")
+	fmt.Println()
+	fmt.Println("---")
+	fmt.Println()
+
+	// Server Inventory Summary
+	if activeCount > 0 {
+		fmt.Println("## Server Inventory Summary")
+		fmt.Println()
+
+		// Create table with server counts
+		var tableRows []string
+		colCount := 0
+		currentRow := ""
+
+		for host, count := range hostCounts {
+			switch colCount {
+			case 0:
+				currentRow = fmt.Sprintf("| %s | %d Domains", host, count)
+			case 1:
+				currentRow += fmt.Sprintf(" | %s | %d Domains |\n", host, count)
+				tableRows = append(tableRows, currentRow)
+				currentRow = ""
+				colCount = -1
+			}
+			colCount++
+		}
+
+		// Handle odd number of servers
+		if currentRow != "" && colCount == 1 {
+			currentRow += " |  |  |\n"
+			tableRows = append(tableRows, currentRow)
+		}
+
+		// Print table header
+		fmt.Println("| Server | Domain Count | Server | Domain Count |")
+		fmt.Println("| :---- | :---- | :---- | :---- |")
+
+		// Print table rows
+		for _, row := range tableRows {
+			fmt.Print(row)
+		}
+
+		fmt.Println()
+		fmt.Println("---")
+		fmt.Println()
+	}
+
+	// Domain Details
+	if len(inactiveDomains) > 0 {
+		fmt.Println("## Inactive Domain Details")
+		fmt.Println()
+		fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
+		fmt.Println("| :---- | :---- |")
+
+		// Format inactive domains in chunks
+		inactiveText := strings.Join(inactiveDomains, " ")
+
+		// Format active domains by server
+		activeText := ""
+		for host, count := range hostCounts {
+			if activeText != "" {
+				activeText += " "
+			}
+			activeText += fmt.Sprintf("%s: %d domains", host, count)
+		}
+
+		fmt.Printf("| %s | %s |\n", inactiveText, activeText)
+		fmt.Println()
+	}
+
+	// Write to file if specified
+	if outputFile != "" {
+		writeReportToFile(activeCount, inactiveCount, hostCounts, inactiveDomains)
+	}
+}
+
+func writeReportToFile(activeCount, inactiveCount int, hostCounts map[string]int, inactiveDomains []string) {
+	var f *os.File
+	var err error
+
+	if overwrite {
+		f, err = os.Create(outputFile)
+	} else if appendFlag {
+		f, err = os.OpenFile(outputFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	} else {
+		if _, err := os.Stat(outputFile); err == nil {
+			fmt.Fprintf(os.Stderr, "File %s exists. Use --overwrite or --append.\n", outputFile)
+			return
+		}
+		f, err = os.Create(outputFile)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening output file: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	// Write report to file
+	fmt.Fprintln(f, "# WordPress Website Domain Analysis Report")
+	fmt.Fprintln(f, "")
+	fmt.Fprintln(f, "## Overall Summary")
+	fmt.Fprintln(f, "")
+	fmt.Fprintf(f, "| %d Websites Active | %d Websites Inactive |\n", activeCount, inactiveCount)
+	fmt.Fprintln(f, "| :---: | :---: |")
+	fmt.Fprintln(f, "")
+	fmt.Fprintln(f, "---")
+	fmt.Fprintln(f, "")
+
+	if activeCount > 0 {
+		fmt.Fprintln(f, "## Server Inventory Summary")
+		fmt.Fprintln(f, "")
+
+		var tableRows []string
+		colCount := 0
+		currentRow := ""
+
+		for host, count := range hostCounts {
+			switch colCount {
+			case 0:
+				currentRow = fmt.Sprintf("| %s | %d Domains", host, count)
+			case 1:
+				currentRow += fmt.Sprintf(" | %s | %d Domains |\n", host, count)
+				tableRows = append(tableRows, currentRow)
+				currentRow = ""
+				colCount = -1
+			}
+			colCount++
+		}
+
+		if currentRow != "" && colCount == 1 {
+			currentRow += " |  |  |\n"
+			tableRows = append(tableRows, currentRow)
+		}
+
+		fmt.Fprintln(f, "| Server | Domain Count | Server | Domain Count |")
+		fmt.Fprintln(f, "| :---- | :---- | :---- | :---- |")
+
+		for _, row := range tableRows {
+			fmt.Fprint(f, row)
+		}
+
+		fmt.Fprintln(f, "")
+		fmt.Fprintln(f, "---")
+		fmt.Fprintln(f, "")
+	}
+
+	if len(inactiveDomains) > 0 {
+		fmt.Fprintln(f, "## Inactive Domain Details")
+		fmt.Fprintln(f, "")
+		fmt.Fprintln(f, "| Domains Removed/Inactive | Active Domains by Server |")
+		fmt.Fprintln(f, "| :---- | :---- |")
+
+		inactiveText := strings.Join(inactiveDomains, " ")
+		activeText := ""
+		for host, count := range hostCounts {
+			if activeText != "" {
+				activeText += " "
+			}
+			activeText += fmt.Sprintf("%s: %d domains", host, count)
+		}
+
+		fmt.Fprintf(f, "| %s | %s |\n", inactiveText, activeText)
+		fmt.Fprintln(f, "")
+	}
+
+	fmt.Fprintf(os.Stderr, "Report written to %s\n", outputFile)
 }
 
 // Stub for backup and removal logic
@@ -943,25 +1160,26 @@ func checkCFNSRecords(domain string) (bool, []string, error) {
 	}
 
 	cmd := fmt.Sprintf("dig ns +short %s", domain)
-	out, err := runLocalCommand(cmd)
+	out := exec.Command("sh", "-c", cmd)
+	nsRecords, err := out.Output()
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to run dig for NS records: %w", err)
 	}
 
-	nsRecords := []string{}
-	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		if line != "" {
-			nsRecords = append(nsRecords, strings.TrimSuffix(line, "."))
-		}
+	nsRecordsStr := strings.TrimSpace(string(nsRecords))
+	if nsRecordsStr == "" {
+		return false, nil, fmt.Errorf("no NS records found for domain %s", domain)
 	}
 
+	nsRecordsSlice := strings.Split(nsRecordsStr, "\n")
 	match := false
-	for _, ns := range nsRecords {
+	for _, ns := range nsRecordsSlice {
+		ns = strings.TrimSuffix(ns, ".")
 		if ns == ns1 || ns == ns2 {
 			match = true
 			break
 		}
 	}
 
-	return match, nsRecords, nil
+	return match, nsRecordsSlice, nil
 }
