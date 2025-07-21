@@ -154,7 +154,10 @@ func newDomainsCmd() *cobra.Command {
 				}
 			}
 
-			results := make([]string, 0)
+			// Cache results for final report generation
+			var results []string
+			var removedDomains []string
+
 			for _, domain := range domains {
 				if _, skip := excluded[domain]; skip {
 					log(1, "Skipping excluded domain: %s", domain)
@@ -175,20 +178,30 @@ func newDomainsCmd() *cobra.Command {
 				if match {
 					results = append(results, fmt.Sprintf("%s,true,%s", domain, hostDisplay))
 				} else {
+					// Initially mark as inactive
 					results = append(results, fmt.Sprintf("%s,false,%s", domain, hostDisplay))
+
+					// Perform removal operations if requested
 					if remove || dryRun {
+						var removalSuccess bool
 						if localFlag {
-							backupAndRemoveLocal(domainPath, domain, dryRun)
+							removalSuccess = backupAndRemoveLocal(domainPath, domain, dryRun)
 						} else {
 							sshClient, _ := createSSHClient(cmd, args[0])
-							backupAndRemove(sshClient, domainPath, domain, dryRun)
+							removalSuccess = backupAndRemove(sshClient, domainPath, domain, dryRun)
+						}
+
+						// Track successfully removed domains
+						if removalSuccess || dryRun {
+							removedDomains = append(removedDomains, domain)
 						}
 					}
 				}
 			}
 
+			// Generate final report with complete data
 			if report {
-				generateReport(results)
+				generateFinalReport(results, removedDomains, remove || dryRun)
 			} else {
 				writeResults(results)
 			}
@@ -456,117 +469,6 @@ type DomainResult struct {
 	Host   string
 }
 
-func generateReport(results []string) {
-	// Parse results into structured data
-	hostCounts := make(map[string]int)
-	activeCount := 0
-	inactiveCount := 0
-	var inactiveDomains []string
-
-	for _, line := range results {
-		parts := strings.Split(line, ",")
-		if len(parts) != 3 {
-			continue
-		}
-
-		domain := parts[0]
-		active := parts[1] == "true"
-		host := parts[2]
-
-		if active {
-			activeCount++
-			hostCounts[host]++
-		} else {
-			inactiveCount++
-			inactiveDomains = append(inactiveDomains, domain)
-		}
-	}
-
-	// Generate report
-	fmt.Println("# WordPress Website Domain Analysis Report")
-	fmt.Println()
-
-	// Overall Summary
-	fmt.Println("## Overall Summary")
-	fmt.Println()
-	fmt.Printf("| %d Websites Active | %d Websites Inactive |\n", activeCount, inactiveCount)
-	fmt.Println("| :---: | :---: |")
-	fmt.Println()
-	fmt.Println("---")
-	fmt.Println()
-
-	// Server Inventory Summary
-	if activeCount > 0 {
-		fmt.Println("## Server Inventory Summary")
-		fmt.Println()
-
-		// Create table with server counts
-		var tableRows []string
-		colCount := 0
-		currentRow := ""
-
-		for host, count := range hostCounts {
-			switch colCount {
-			case 0:
-				currentRow = fmt.Sprintf("| %s | %d Domains", host, count)
-			case 1:
-				currentRow += fmt.Sprintf(" | %s | %d Domains |\n", host, count)
-				tableRows = append(tableRows, currentRow)
-				currentRow = ""
-				colCount = -1
-			}
-			colCount++
-		}
-
-		// Handle odd number of servers
-		if currentRow != "" && colCount == 1 {
-			currentRow += " |  |  |\n"
-			tableRows = append(tableRows, currentRow)
-		}
-
-		// Print table header
-		fmt.Println("| Server | Domain Count | Server | Domain Count |")
-		fmt.Println("| :---- | :---- | :---- | :---- |")
-
-		// Print table rows
-		for _, row := range tableRows {
-			fmt.Print(row)
-		}
-
-		fmt.Println()
-		fmt.Println("---")
-		fmt.Println()
-	}
-
-	// Domain Details
-	if len(inactiveDomains) > 0 {
-		fmt.Println("## Inactive Domain Details")
-		fmt.Println()
-		fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
-		fmt.Println("| :---- | :---- |")
-
-		// Format inactive domains in chunks
-		inactiveText := strings.Join(inactiveDomains, " ")
-
-		// Format active domains by server
-		activeText := ""
-		for host, count := range hostCounts {
-			if activeText != "" {
-				activeText += " "
-			}
-			activeText += fmt.Sprintf("%s: %d domains", host, count)
-		}
-
-		fmt.Printf("| %s | %s |\n", inactiveText, activeText)
-		fmt.Println()
-	}
-
-	// Write to file if specified
-	if outputFile != "" {
-		writeReportToFile(activeCount, inactiveCount, hostCounts, inactiveDomains)
-	}
-}
-
 func writeReportToFile(activeCount, inactiveCount int, hostCounts map[string]int, inactiveDomains []string) {
 	var f *os.File
 	var err error
@@ -661,7 +563,7 @@ func writeReportToFile(activeCount, inactiveCount int, hostCounts map[string]int
 }
 
 // Stub for backup and removal logic
-func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun bool) {
+func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun bool) bool {
 	sitePath := filepath.Join(domainPath, domain)
 	log(1, "Starting backup and remove process for %s", domain)
 
@@ -669,7 +571,7 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 	_, _, err := client.ExecuteCommand(fmt.Sprintf("test -d %s", sitePath))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Directory not found on remote: %s\n", sitePath)
-		return
+		return false
 	}
 
 	// 1. Find container name from docker-compose.yml on remote
@@ -678,7 +580,7 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 	containerName, err := getContainerName(client, composePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting container name: %v\n", err)
-		return
+		return false
 	}
 	log(2, "Found container name: %s", containerName)
 
@@ -714,7 +616,7 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 	} else {
 		if err := createTarball(client, tarballPath, sitePath, backupDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating tarball: %v\n", err)
-			return
+			return false
 		}
 	}
 
@@ -727,6 +629,7 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 			if err := dropDatabase(client, dbName); err != nil {
 				// Log error but continue with removal process
 				fmt.Fprintf(os.Stderr, "Error dropping database: %v\n", err)
+				return false
 			}
 		}
 	}
@@ -739,15 +642,18 @@ func backupAndRemove(client *auth.SSHClient, domainPath, domain string, dryRun b
 	} else {
 		if err := removeContainer(client, containerName); err != nil {
 			fmt.Fprintf(os.Stderr, "Error removing container: %v\n", err)
+			return false
 		}
 		if _, _, err := client.ExecuteCommand(fmt.Sprintf("rm -rf %s", sitePath)); err != nil {
 			fmt.Fprintf(os.Stderr, "Error removing site directory: %v\n", err)
+			return false
 		}
 	}
 
 	if !dryRun {
 		fmt.Fprintf(os.Stderr, "Successfully backed up and removed %s\n", domain)
 	}
+	return true
 }
 
 func getContainerName(client *auth.SSHClient, composePath string) (string, error) {
@@ -952,14 +858,14 @@ func runLocalCommand(cmd string) (string, error) {
 }
 
 // Stub for local backup and removal logic
-func backupAndRemoveLocal(domainPath, domain string, dryRun bool) {
+func backupAndRemoveLocal(domainPath, domain string, dryRun bool) bool {
 	sitePath := filepath.Join(domainPath, domain)
 	log(1, "[LOCAL] Starting backup and remove process for %s", domain)
 
 	// Check if directory exists locally
 	if _, err := os.Stat(sitePath); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Directory not found locally: %s\n", sitePath)
-		return
+		return false
 	}
 
 	// 1. Find container name from docker-compose.yml locally
@@ -968,7 +874,7 @@ func backupAndRemoveLocal(domainPath, domain string, dryRun bool) {
 	containerName, err := getContainerNameLocal(composePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting container name: %v\n", err)
-		return
+		return false
 	}
 	log(2, "Found container name: %s", containerName)
 
@@ -1003,7 +909,7 @@ func backupAndRemoveLocal(domainPath, domain string, dryRun bool) {
 	} else {
 		if err := createTarballLocal(tarballPath, sitePath, backupDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating tarball: %v\n", err)
-			return
+			return false
 		}
 	}
 
@@ -1036,6 +942,7 @@ func backupAndRemoveLocal(domainPath, domain string, dryRun bool) {
 	if !dryRun {
 		fmt.Fprintf(os.Stderr, "Successfully backed up and removed %s\n", domain)
 	}
+	return true
 }
 
 // Local helper implementations
@@ -1182,4 +1089,170 @@ func checkCFNSRecords(domain string) (bool, []string, error) {
 	}
 
 	return match, nsRecordsSlice, nil
+}
+
+// Add this new function after the existing generateReport function:
+
+func generateFinalReport(results []string, removedDomains []string, removalOperationPerformed bool) {
+	// Parse results into structured data
+	hostCounts := make(map[string]int)
+	activeCount := 0
+	inactiveCount := 0
+	var inactiveDomains []string
+
+	for _, line := range results {
+		parts := strings.Split(line, ",")
+		if len(parts) != 3 {
+			continue
+		}
+
+		domain := parts[0]
+		active := parts[1] == "true"
+		host := parts[2]
+
+		if active {
+			activeCount++
+			hostCounts[host]++
+		} else {
+			inactiveCount++
+			inactiveDomains = append(inactiveDomains, domain)
+		}
+	}
+
+	// Calculate final counts after removal operations
+	removedCount := len(removedDomains)
+	finalInactiveCount := inactiveCount
+	if removalOperationPerformed {
+		finalInactiveCount = inactiveCount - removedCount
+	}
+
+	// Generate report
+	fmt.Println("# WordPress Website Domain Analysis Report")
+	fmt.Println()
+
+	// Overall Summary
+	fmt.Println("## Overall Summary")
+	fmt.Println()
+	if removalOperationPerformed && removedCount > 0 {
+		fmt.Printf("| %d Websites Active | %d Websites Removed/Inactive |\n", activeCount, removedCount)
+		fmt.Println("| :---: | :---: |")
+		fmt.Println()
+		if finalInactiveCount > 0 {
+			fmt.Printf("*Note: %d inactive websites remain (removal failed or skipped)*\n", finalInactiveCount)
+			fmt.Println()
+		}
+	} else {
+		fmt.Printf("| %d Websites Active | %d Websites Inactive |\n", activeCount, inactiveCount)
+		fmt.Println("| :---: | :---: |")
+		fmt.Println()
+	}
+	fmt.Println("---")
+	fmt.Println()
+
+	// Server Inventory Summary (same as existing generateReport)
+	if activeCount > 0 {
+		fmt.Println("## Server Inventory Summary")
+		fmt.Println()
+
+		var tableRows []string
+		colCount := 0
+		currentRow := ""
+
+		for host, count := range hostCounts {
+			switch colCount {
+			case 0:
+				currentRow = fmt.Sprintf("| %s | %d Domains", host, count)
+			case 1:
+				currentRow += fmt.Sprintf(" | %s | %d Domains |\n", host, count)
+				tableRows = append(tableRows, currentRow)
+				currentRow = ""
+				colCount = -1
+			}
+			colCount++
+		}
+
+		if currentRow != "" && colCount == 1 {
+			currentRow += " |  |  |\n"
+			tableRows = append(tableRows, currentRow)
+		}
+
+		fmt.Println("| Server | Domain Count | Server | Domain Count |")
+		fmt.Println("| :---- | :---- | :---- | :---- |")
+
+		for _, row := range tableRows {
+			fmt.Print(row)
+		}
+
+		fmt.Println()
+		fmt.Println("---")
+		fmt.Println()
+	}
+
+	// Domain Details
+	if len(removedDomains) > 0 || len(inactiveDomains) > 0 {
+		if removalOperationPerformed && len(removedDomains) > 0 {
+			fmt.Println("## Removed Domain Details")
+			fmt.Println()
+			fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
+			fmt.Println("| :---- | :---- |")
+
+			removedText := strings.Join(removedDomains, " ")
+			activeText := ""
+			for host, count := range hostCounts {
+				if activeText != "" {
+					activeText += " "
+				}
+				activeText += fmt.Sprintf("%s: %d domains", host, count)
+			}
+
+			fmt.Printf("| %s | %s |\n", removedText, activeText)
+			fmt.Println()
+
+			if finalInactiveCount > 0 {
+				remainingInactive := make([]string, 0)
+				for _, domain := range inactiveDomains {
+					found := false
+					for _, removed := range removedDomains {
+						if domain == removed {
+							found = true
+							break
+						}
+					}
+					if !found {
+						remainingInactive = append(remainingInactive, domain)
+					}
+				}
+				if len(remainingInactive) > 0 {
+					fmt.Println("### Remaining Inactive Domains")
+					fmt.Println()
+					fmt.Printf("The following %d domains remain inactive and were not removed:\n", len(remainingInactive))
+					fmt.Printf("%s\n", strings.Join(remainingInactive, " "))
+					fmt.Println()
+				}
+			}
+		} else if len(inactiveDomains) > 0 {
+			fmt.Println("## Inactive Domain Details")
+			fmt.Println()
+			fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
+			fmt.Println("| :---- | :---- |")
+
+			inactiveText := strings.Join(inactiveDomains, " ")
+			activeText := ""
+			for host, count := range hostCounts {
+				if activeText != "" {
+					activeText += " "
+				}
+				activeText += fmt.Sprintf("%s: %d domains", host, count)
+			}
+
+			fmt.Printf("| %s | %s |\n", inactiveText, activeText)
+			fmt.Println()
+		}
+	}
+
+	// Write to file if specified (reuse existing writeReportToFile or create similar)
+	if outputFile != "" {
+		// You can reuse the existing writeReportToFile logic here
+		writeReportToFile(activeCount, finalInactiveCount, hostCounts, inactiveDomains)
+	}
 }
