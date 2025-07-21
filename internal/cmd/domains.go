@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,8 +31,9 @@ var (
 	dryRun       bool
 	verboseCount int
 	domainFlag   string
-	excludeList  string // Add exclude flag
-	report       bool   // Add report flag
+	excludeList  string
+	report       bool
+	serverRange  string // Add server range flag
 )
 
 func newDomainsCmd() *cobra.Command {
@@ -49,6 +53,7 @@ func newDomainsCmd() *cobra.Command {
 	cmd.PersistentFlags().Bool("local", false, "Run locally without SSH (assumes this server hosts the sites)")
 	cmd.PersistentFlags().StringVar(&excludeList, "exclude", "", "Pipebar-delimited list or file of domains to exclude from verification")
 	cmd.PersistentFlags().BoolVar(&report, "report", false, "Generate a formatted report instead of CSV output")
+	cmd.PersistentFlags().StringVar(&serverRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
 
 	// Add SSH connection flags to all subcommands
 	cmd.PersistentFlags().StringP("user", "u", "", "SSH username (default: current user)")
@@ -62,6 +67,12 @@ func newDomainsCmd() *cobra.Command {
 		Short: "Check for domains that resolve to the server's IP (and backup/remove inactive ones if requested)",
 		Args:  cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
+			// Check if server-range is provided
+			if serverRange != "" {
+				processServerRange(cmd, createSSHClient, serverRange, excludeList, remove, dryRun, report)
+				return
+			}
+
 			localFlag, _ := cmd.Flags().GetBool("local")
 			var serverIP string
 			var domainPath string
@@ -357,7 +368,12 @@ func getCloudflareZoneID(domain, email, apiKey string) (string, error) {
 	req.Header.Set("X-Auth-Email", email)
 	req.Header.Set("X-Auth-Key", apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+
+	// Add timeout to prevent hanging
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -393,7 +409,12 @@ func getCloudflareARecords(zoneID, domain, email, apiKey string) ([]string, erro
 	req.Header.Set("X-Auth-Email", email)
 	req.Header.Set("X-Auth-Key", apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+
+	// Add timeout to prevent hanging
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -757,11 +778,10 @@ func dropDatabase(client *auth.SSHClient, dbName string) error {
 		return fmt.Errorf("database name is empty, cannot drop")
 	}
 
-	// Pass the password via MYSQL_PWD to avoid issues with special characters in the password.
-	dropCmd := fmt.Sprintf("mysql -u%s -e 'DROP DATABASE IF EXISTS `%s`'", rootUser, dbName)
-	fullCmd := fmt.Sprintf("export MYSQL_PWD='%s'; docker exec mysql sh -c \"%s\"", rootPass, dropCmd)
+	// Pass password directly via -p flag
+	cmd := fmt.Sprintf("docker exec mysql mysql -u%s -p%s -e 'DROP DATABASE IF EXISTS `%s`'", rootUser, rootPass, dbName)
 
-	_, stderr, err := client.ExecuteCommand(fullCmd)
+	_, stderr, err := client.ExecuteCommand(cmd)
 	if err != nil {
 		if strings.Contains(stderr, "database doesn't exist") {
 			log(1, "Database %s does not exist, nothing to drop.", dbName)
@@ -853,7 +873,10 @@ func findDomainsLocal(domainPath string) ([]string, error) {
 }
 
 func runLocalCommand(cmd string) (string, error) {
-	out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	return string(out), err
 }
 
@@ -1035,8 +1058,8 @@ func dropDatabaseLocal(dbName string) error {
 		return fmt.Errorf("database name is empty, cannot drop")
 	}
 
-	// Use sh -c to handle environment variable export and command execution together.
-	cmd := fmt.Sprintf("export MYSQL_PWD='%s'; docker exec mysql mysql -u%s -e 'DROP DATABASE IF EXISTS `%s`'", rootPass, rootUser, dbName)
+	// Pass password directly via -p flag
+	cmd := fmt.Sprintf("docker exec mysql mysql -u%s -p%s -e 'DROP DATABASE IF EXISTS `%s`'", rootUser, rootPass, dbName)
 	out, err := runLocalCommand(cmd)
 	if err != nil {
 		if strings.Contains(out, "database doesn't exist") {
@@ -1189,65 +1212,63 @@ func generateFinalReport(results []string, removedDomains []string, removalOpera
 	}
 
 	// Domain Details
-	if len(removedDomains) > 0 || len(inactiveDomains) > 0 {
-		if removalOperationPerformed && len(removedDomains) > 0 {
-			fmt.Println("## Removed Domain Details")
-			fmt.Println()
-			fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
-			fmt.Println("| :---- | :---- |")
+	if removalOperationPerformed && len(removedDomains) > 0 {
+		fmt.Println("## Removed Domain Details")
+		fmt.Println()
+		fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
+		fmt.Println("| :---- | :---- |")
 
-			removedText := strings.Join(removedDomains, " ")
-			activeText := ""
-			for host, count := range hostCounts {
-				if activeText != "" {
-					activeText += " "
-				}
-				activeText += fmt.Sprintf("%s: %d domains", host, count)
+		removedText := strings.Join(removedDomains, " ")
+		activeText := ""
+		for host, count := range hostCounts {
+			if activeText != "" {
+				activeText += " "
 			}
-
-			fmt.Printf("| %s | %s |\n", removedText, activeText)
-			fmt.Println()
-
-			if finalInactiveCount > 0 {
-				remainingInactive := make([]string, 0)
-				for _, domain := range inactiveDomains {
-					found := false
-					for _, removed := range removedDomains {
-						if domain == removed {
-							found = true
-							break
-						}
-					}
-					if !found {
-						remainingInactive = append(remainingInactive, domain)
-					}
-				}
-				if len(remainingInactive) > 0 {
-					fmt.Println("### Remaining Inactive Domains")
-					fmt.Println()
-					fmt.Printf("The following %d domains remain inactive and were not removed:\n", len(remainingInactive))
-					fmt.Printf("%s\n", strings.Join(remainingInactive, " "))
-					fmt.Println()
-				}
-			}
-		} else if len(inactiveDomains) > 0 {
-			fmt.Println("## Inactive Domain Details")
-			fmt.Println()
-			fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
-			fmt.Println("| :---- | :---- |")
-
-			inactiveText := strings.Join(inactiveDomains, " ")
-			activeText := ""
-			for host, count := range hostCounts {
-				if activeText != "" {
-					activeText += " "
-				}
-				activeText += fmt.Sprintf("%s: %d domains", host, count)
-			}
-
-			fmt.Printf("| %s | %s |\n", inactiveText, activeText)
-			fmt.Println()
+			activeText += fmt.Sprintf("%s: %d domains", host, count)
 		}
+
+		fmt.Printf("| %s | %s |\n", removedText, activeText)
+		fmt.Println()
+
+		if finalInactiveCount > 0 {
+			remainingInactive := make([]string, 0)
+			for _, domain := range inactiveDomains {
+				found := false
+				for _, removed := range removedDomains {
+					if domain == removed {
+						found = true
+						break
+					}
+				}
+				if !found {
+					remainingInactive = append(remainingInactive, domain)
+				}
+			}
+			if len(remainingInactive) > 0 {
+				fmt.Println("### Remaining Inactive Domains")
+				fmt.Println()
+				fmt.Printf("The following %d domains remain inactive and were not removed:\n", len(remainingInactive))
+				fmt.Printf("%s\n", strings.Join(remainingInactive, " "))
+				fmt.Println()
+			}
+		}
+	} else if len(inactiveDomains) > 0 {
+		fmt.Println("## Inactive Domain Details")
+		fmt.Println()
+		fmt.Println("| Domains Removed/Inactive | Active Domains by Server |")
+		fmt.Println("| :---- | :---- |")
+
+		inactiveText := strings.Join(inactiveDomains, " ")
+		activeText := ""
+		for host, count := range hostCounts {
+			if activeText != "" {
+				activeText += " "
+			}
+			activeText += fmt.Sprintf("%s: %d domains", host, count)
+		}
+
+		fmt.Printf("| %s | %s |\n", inactiveText, activeText)
+		fmt.Println()
 	}
 
 	// Write to file if specified (reuse existing writeReportToFile or create similar)
@@ -1255,4 +1276,282 @@ func generateFinalReport(results []string, removedDomains []string, removalOpera
 		// You can reuse the existing writeReportToFile logic here
 		writeReportToFile(activeCount, finalInactiveCount, hostCounts, inactiveDomains)
 	}
+}
+
+// Add new function to parse server range
+func parseServerRange(pattern string) (string, int, int, error) {
+	// Expected format: "wp%d.ciwgserver.com:0-41"
+	parts := strings.Split(pattern, ":")
+	if len(parts) != 2 {
+		return "", 0, 0, fmt.Errorf("invalid server range format, expected 'pattern:start-end'")
+	}
+
+	rangeParts := strings.Split(parts[1], "-")
+	if len(rangeParts) != 2 {
+		return "", 0, 0, fmt.Errorf("invalid range format, expected 'start-end'")
+	}
+
+	start, err := strconv.Atoi(rangeParts[0])
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("invalid start number: %w", err)
+	}
+
+	end, err := strconv.Atoi(rangeParts[1])
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("invalid end number: %w", err)
+	}
+
+	return parts[0], start, end, nil
+}
+
+// Add new function to process multiple servers
+func processServerRange(cmd *cobra.Command, createSSHClientFunc func(*cobra.Command, string) (*auth.SSHClient, error), serverRange string, excludeList string, remove bool, dryRun bool, report bool) {
+	pattern, start, end, err := parseServerRange(serverRange)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing server range: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Parse exclude list once
+	excluded := make(map[string]struct{})
+	if excludeList != "" {
+		if strings.Contains(excludeList, "|") {
+			for d := range strings.SplitSeq(excludeList, "|") {
+				excluded[strings.TrimSpace(d)] = struct{}{}
+			}
+		} else {
+			// Assume it's a file
+			data, err := os.ReadFile(excludeList)
+			if err == nil {
+				for _, d := range strings.Split(string(data), "\n") {
+					d = strings.TrimSpace(d)
+					if d != "" {
+						excluded[d] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	// Accumulate all results from all servers
+	var allResults []string
+	var allRemovedDomains []string
+	totalActiveCount := 0
+	totalInactiveCount := 0
+	hostCounts := make(map[string]int)
+
+	// Process each server in the range
+	for i := start; i <= end; i++ {
+		serverHost := fmt.Sprintf(pattern, i)
+		log(1, "Processing server: %s", serverHost)
+
+		// Create SSH client for this server
+		sshClient, err := createSSHClientFunc(cmd, serverHost)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error connecting to %s: %v\n", serverHost, err)
+			continue
+		}
+
+		// Get server info
+		serverIP, err := getPublicIP(sshClient)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting public IP for %s: %v\n", serverHost, err)
+			sshClient.Close()
+			continue
+		}
+
+		hostname, err := getRemoteHostname(sshClient)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting hostname for %s: %v\n", serverHost, err)
+			sshClient.Close()
+			continue
+		}
+
+		// Get domain path
+		domainPath := "/var/opt"
+		if envPath := os.Getenv("DOMAIN_PATH"); envPath != "" {
+			domainPath = envPath
+		}
+
+		// Find domains on this server
+		domains, err := findDomains(sshClient, domainPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error scanning domains on %s: %v\n", serverHost, err)
+			sshClient.Close()
+			continue
+		}
+
+		// Process domains for this server
+		serverActiveCount := 0
+		for _, domain := range domains {
+			if _, skip := excluded[domain]; skip {
+				log(1, "Skipping excluded domain: %s", domain)
+				continue
+			}
+
+			match, _, err := domainMatchesServer(domain, serverIP)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error checking domain %s on %s: %v\n", domain, serverHost, err)
+				continue
+			}
+
+			hostDisplay := hostname
+			if !strings.HasSuffix(hostname, ".ciwgserver.com") && hostname != "localhost" {
+				hostDisplay = hostname + ".ciwgserver.com"
+			}
+
+			if match {
+				allResults = append(allResults, fmt.Sprintf("%s,true,%s", domain, hostDisplay))
+				serverActiveCount++
+				totalActiveCount++
+			} else {
+				allResults = append(allResults, fmt.Sprintf("%s,false,%s", domain, hostDisplay))
+				totalInactiveCount++
+
+				// Perform removal if requested
+				if remove || dryRun {
+					if backupAndRemove(sshClient, domainPath, domain, dryRun) {
+						allRemovedDomains = append(allRemovedDomains, domain)
+					}
+				}
+			}
+		}
+
+		// Track host counts
+		if serverActiveCount > 0 {
+			hostDisplay := hostname
+			if !strings.HasSuffix(hostname, ".ciwgserver.com") && hostname != "localhost" {
+				hostDisplay = hostname + ".ciwgserver.com"
+			}
+			hostCounts[hostDisplay] = serverActiveCount
+		}
+
+		sshClient.Close()
+	}
+
+	// Generate consolidated report
+	if report {
+		generateConsolidatedReport(totalActiveCount, totalInactiveCount, hostCounts, allRemovedDomains, remove || dryRun)
+	} else {
+		writeResults(allResults)
+	}
+}
+
+// Add new consolidated report generator
+func generateConsolidatedReport(activeCount, inactiveCount int, hostCounts map[string]int, removedDomains []string, removalPerformed bool) {
+	removedCount := len(removedDomains)
+
+	// Print to stdout
+	fmt.Println("# WordPress Website Pruning Summary")
+	fmt.Println()
+	fmt.Println("# Overall Summary")
+	fmt.Println()
+
+	if removalPerformed && removedCount > 0 {
+		fmt.Printf("| %d Websites Removed | %d Websites Remaining |\n", removedCount, activeCount)
+	} else {
+		fmt.Printf("| %d Websites Active | %d Websites Inactive |\n", activeCount, inactiveCount)
+	}
+	fmt.Println("| :---: | :---: |")
+	fmt.Println()
+	fmt.Println("---")
+	fmt.Println()
+
+	// Server Inventory Summary
+	if len(hostCounts) > 0 {
+		fmt.Println("# Server Inventory Summary")
+		fmt.Println()
+
+		var serverEntries []string
+		// Sort server names for consistent output
+		var servers []string
+		for server := range hostCounts {
+			servers = append(servers, server)
+		}
+		sort.Strings(servers)
+
+		for _, server := range servers {
+			count := hostCounts[server]
+			serverEntries = append(serverEntries, fmt.Sprintf("%s | %d Domains", server, count))
+		}
+
+		fmt.Printf("| %s |\n", strings.Join(serverEntries, " "))
+		fmt.Println("| :---- | :---- |")
+		fmt.Println()
+		fmt.Println("---")
+		fmt.Println()
+	}
+
+	// Domain Details
+	if removalPerformed && len(removedDomains) > 0 {
+		fmt.Println("# Domain Details")
+		fmt.Println()
+		fmt.Printf("| Domains Removed from WP Servers %s |  |\n", strings.Join(removedDomains, " "))
+		fmt.Println("| :---- | :---- |")
+	}
+
+	// Write to file if specified
+	if outputFile != "" {
+		writeConsolidatedReportToFile(activeCount, removedCount, inactiveCount, hostCounts, removedDomains, removalPerformed)
+	}
+}
+
+// Update the file writer to match
+func writeConsolidatedReportToFile(activeCount, removedCount, inactiveCount int, hostCounts map[string]int, removedDomains []string, removalPerformed bool) {
+	var f *os.File
+	var err error
+
+	// For consolidated reports, we should overwrite by default
+	f, err = os.Create(outputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening output file: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	// Write the same format as stdout
+	fmt.Fprintln(f, "# WordPress Website Pruning Summary")
+	fmt.Fprintln(f, "")
+	fmt.Fprintln(f, "# Overall Summary")
+	fmt.Fprintln(f, "")
+
+	if removalPerformed && removedCount > 0 {
+		fmt.Fprintf(f, "| %d Websites Removed | %d Websites Remaining |\n", removedCount, activeCount)
+	} else {
+		fmt.Fprintf(f, "| %d Websites Active | %d Websites Inactive |\n", activeCount, inactiveCount)
+	}
+	fmt.Fprintln(f, "| :---: | :---: |")
+	fmt.Fprintln(f, "")
+
+	if len(hostCounts) > 0 {
+		fmt.Fprintln(f, "# Server Inventory Summary")
+		fmt.Fprintln(f, "")
+
+		var serverEntries []string
+		var servers []string
+		for server := range hostCounts {
+			servers = append(servers, server)
+		}
+		sort.Strings(servers)
+
+		for _, server := range servers {
+			count := hostCounts[server]
+			serverEntries = append(serverEntries, fmt.Sprintf("%s | %d Domains", server, count))
+		}
+
+		fmt.Fprintf(f, "| %s |\n", strings.Join(serverEntries, " "))
+		fmt.Fprintln(f, "| :---- | :---- |")
+		fmt.Fprintln(f, "")
+		fmt.Fprintln(f, "---")
+		fmt.Fprintln(f, "")
+	}
+
+	if removalPerformed && len(removedDomains) > 0 {
+		fmt.Fprintln(f, "# Domain Details")
+		fmt.Fprintln(f, "")
+		fmt.Fprintf(f, "| Domains Removed from WP Servers %s |  |\n", strings.Join(removedDomains, " "))
+		fmt.Fprintln(f, "| :---- | :---- |")
+	}
+
+	fmt.Fprintf(os.Stderr, "Report written to %s\n", outputFile)
 }
