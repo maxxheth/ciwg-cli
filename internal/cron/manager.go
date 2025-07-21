@@ -119,8 +119,16 @@ func (cm *CronManager) getSystemCronJobs() ([]CronJob, error) {
 	return jobs, nil
 }
 
-// AddCronJob adds a new cron job interactively
-func (cm *CronManager) AddCronJob() error {
+// AddCronJob adds a new cron job.
+// If cronJob is not an empty string, it's added non-interactively.
+// Otherwise, it runs in interactive mode.
+func (cm *CronManager) AddCronJob(cronJob string) error {
+	if cronJob != "" {
+		// Non-interactive mode: add the provided cron job string directly.
+		return cm.addToCrontab(cronJob)
+	}
+
+	// Interactive mode
 	fmt.Println("=== Add New Cron Job ===")
 
 	// Get schedule
