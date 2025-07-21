@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"crypto/rand"
+	"flag"
 	"fmt"
 	"io"
 	"math/big"
@@ -15,6 +16,8 @@ import (
 
 	"ciwg-cli/internal/auth"
 )
+
+var SkelDirFlag = flag.String("skel-dir", "", "Path to custom skeleton directory for site creation")
 
 // InspectZipFile inspects a zip file to find a WordPress installation and a MySQL dump file.
 func InspectZipFile(zipPath string) (wpPath, sqlPath string, err error) {
@@ -234,12 +237,20 @@ func copySkeletonAndReplace(client *auth.SSHClient, projectPath, domain, url, db
 		return domain, url, dbName, dbUser, dbPass, nil
 	}
 
-	// Copy the skeleton directory
-	// This needs to be adapted for remote execution.
-	// A possible approach is to have the skeleton on the remote machine,
-	// or to transfer it. For now, let's assume it's on the remote machine.
-	if _, _, err := client.ExecuteCommand(fmt.Sprintf("cp -a ./.skel %s", projectPath)); err != nil {
-		return "", "", "", "", "", fmt.Errorf("failed to copy skeleton directory: %w", err)
+	// Determine which skeleton dir to copy
+	skeletonSource := ".skel"
+	// check default exists remotely
+	testCmd := fmt.Sprintf("test -d %s", skeletonSource)
+	if _, _, err := client.ExecuteCommand(testCmd); err != nil {
+		if *SkelDirFlag != "" {
+			skeletonSource = *SkelDirFlag
+		} else {
+			return "", "", "", "", "", fmt.Errorf("skeleton directory %q not found on remote", skeletonSource)
+		}
+	}
+	// now copy it
+	if _, _, err := client.ExecuteCommand(fmt.Sprintf("cp -a %s %s", skeletonSource, projectPath)); err != nil {
+		return "", "", "", "", "", fmt.Errorf("failed to copy skeleton directory from %q: %w", skeletonSource, err)
 	}
 
 	// Read and update docker-compose.yml
@@ -452,9 +463,16 @@ func copySkeletonAndReplaceLocal(projectPath, domain, url, dbName string, dryRun
 		return domain, url, dbName, dbUser, dbPass, nil
 	}
 
-	// Copy the skeleton directory
-	if err := copyDirectoryLocal("./.skel", projectPath); err != nil {
-		return "", "", "", "", "", fmt.Errorf("failed to copy skeleton directory: %w", err)
+	skeletonSource := "./.skel"
+	if _, err := os.Stat(skeletonSource); os.IsNotExist(err) {
+		if *SkelDirFlag != "" {
+			skeletonSource = *SkelDirFlag
+		} else {
+			return "", "", "", "", "", fmt.Errorf("skeleton directory %q not found", skeletonSource)
+		}
+	}
+	if err := copyDirectoryLocal(skeletonSource, projectPath); err != nil {
+		return "", "", "", "", "", fmt.Errorf("failed to copy skeleton directory from %q: %w", skeletonSource, err)
 	}
 
 	// Read and update docker-compose.yml
