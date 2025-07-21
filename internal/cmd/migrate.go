@@ -23,6 +23,12 @@ var migrateCmd = &cobra.Command{
 	Short: "Migrate a WordPress site from a zip file, or create a new one",
 	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		// pull the cobra flag and shove it into the std-flag pointer
+		skelDir, _ := cmd.Flags().GetString("skel-dir")
+		if skelDir != "" {
+			*utils.SkelDirFlag = skelDir
+		}
+
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		local, _ := cmd.Flags().GetBool("local")
 		createNewSite, _ := cmd.Flags().GetBool("create-new-site")
