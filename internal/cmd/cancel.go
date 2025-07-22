@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/spf13/cobra"
@@ -33,7 +34,7 @@ var tlds = []string{
 	"eco", "asia", "eu", "london", "nyc", "paris", "tokyo",
 }
 
-func init() {
+func cancelCmds() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cancel",
 		Short: "Cancel a site by moving its container to a cancelled directory.",
@@ -42,13 +43,15 @@ You can specify the container path directly or use the interactive mode to selec
 		Run: runCancel,
 	}
 
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be done without making changes.")
-	cmd.Flags().StringVar(&containerPath, "container-path", "", "Direct path to the site container to cancel.")
-	cmd.Flags().StringVar(&sitesDir, "sites-dir", "/var/opt", "The directory where site containers are located.")
+	cmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would be done without making changes.")
+	cmd.PersistentFlags().StringVar(&containerPath, "container-path", "", "Direct path to the site container to cancel.")
+	cmd.PersistentFlags().StringVar(&sitesDir, "sites-dir", "/var/opt", "The directory where site containers are located.")
 
-	if err := cmd.Execute(); err != nil {
-		l.Fatalf("Error: %v", err)
-	}
+	return cmd
+}
+
+func init() {
+	rootCmd.AddCommand(cancelCmds())
 }
 
 func runCancel(cmd *cobra.Command, args []string) {
@@ -130,6 +133,8 @@ func cancelSite(path string) {
 		fmt.Println("\n-- DRY RUN --")
 		fmt.Printf("[DRY RUN] Would check/create directory: %s\n", cancelledSitesDir)
 		fmt.Printf("[DRY RUN] Would move %s to %s\n", path, destinationPath)
+		epochFile := filepath.Join(destinationPath, "cancellation-epoch.txt")
+		fmt.Printf("[DRY RUN] Would create cancellation timestamp file: %s\n", epochFile)
 		fmt.Println("\nDry run complete. No changes were made.")
 		return
 	}
@@ -139,6 +144,14 @@ func cancelSite(path string) {
 	}
 	if err := os.Rename(path, destinationPath); err != nil {
 		l.Fatalf("Error moving directory from %s to %s: %v", path, destinationPath, err)
+	}
+
+	// Create a cancellation timestamp file
+	epochFile := filepath.Join(destinationPath, "cancellation-epoch.txt")
+	epochTime := fmt.Sprintf("%d", time.Now().Unix())
+	if err := os.WriteFile(epochFile, []byte(epochTime), 0644); err != nil {
+		// Use a non-fatal log message here so cancellation itself is not considered a failure.
+		l.Printf("Warning: could not write cancellation timestamp file to %s: %v", epochFile, err)
 	}
 
 	fmt.Printf("\nSuccessfully cancelled site %s.\n", siteName)
