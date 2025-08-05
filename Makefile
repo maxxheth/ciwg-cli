@@ -5,13 +5,16 @@ all: build test
 
 build:
 	@echo "Building..."
-	
-	
-	@go build -o main cmd/api/main.go
+	@mkdir -p ./dist/ciwg-cli-utils
+	@go build -o ./dist/ciwg-cli-utils/ciwg-cli cmd/cli/main.go 
+	@chmod +x ./dist/ciwg-cli-utils/ciwg-cli
+	@cp -r ./.skel ./dist/ciwg-cli-utils/.skel
+	@tar -czf ./dist/ciwg-cli-utils.tgz -C ./dist ciwg-cli-utils
+	@echo "Build completed: ./dist/ciwg-cli-utils.tgz"
 
 # Run the application
 run:
-	@go run cmd/api/main.go
+	@go run cmd/cli/main.go
 # Create DB container
 docker-run:
 	@if docker compose up --build 2>/dev/null; then \
@@ -42,7 +45,7 @@ itest:
 # Clean the binary
 clean:
 	@echo "Cleaning..."
-	@rm -f main
+	@rm -rf ./dist
 
 # Live Reload
 watch:
@@ -60,5 +63,9 @@ watch:
                 exit 1; \
             fi; \
         fi
+
+run-domains:
+	@echo "Running domains..."
+	@go run cmd/cli/main.go domains
 
 .PHONY: all build run test clean watch docker-run docker-down itest
