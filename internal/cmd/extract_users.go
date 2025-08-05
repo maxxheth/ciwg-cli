@@ -68,13 +68,16 @@ func runExtractUsers(cmd *cobra.Command, args []string) error {
 
 	userMap := make(map[string]*User)
 
-	for _, server := range servers {
+	l.Printf("Starting user extraction from %d servers...", len(servers))
+	for i, server := range servers {
+		l.Printf("[%d/%d] Processing server: %s", i+1, len(servers), server)
 		// Pass the cmd object down
 		if err := extractFromServer(cmd, server, userMap); err != nil {
 			l.Printf("error extracting from server %s: %v\n", server, err)
 		}
 	}
 
+	l.Printf("Extraction complete. Found %d unique users. Writing output...", len(userMap))
 	return outputUsers(userMap)
 }
 
@@ -86,6 +89,7 @@ func extractFromServer(cmd *cobra.Command, server string, userMap map[string]*Us
 		return nil // Continue with other servers even if one fails
 	}
 
+	l.Printf("  > Found %d containers. Extracting users...", len(containers))
 	for _, container := range containers {
 		if err := extractUsersFromContainer(cmd, server, container, userMap); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to extract users from %s on %s: %v\n", container, server, err)
