@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -178,6 +179,40 @@ func runSSHTest(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// Helper function to create SSH client (reuse from domains.go pattern)
+func createSSHClient(cmd *cobra.Command, target string) (*auth.SSHClient, error) {
+	// Parse target into user@host format
+	parts := strings.Split(target, "@")
+	var username, hostname string
+
+	if len(parts) == 2 {
+		username = parts[0]
+		hostname = parts[1]
+	} else {
+		username, _ = cmd.Flags().GetString("user")
+		if username == "" {
+			username = getCurrentUser()
+		}
+		hostname = target
+	}
+
+	port, _ := cmd.Flags().GetString("port")
+	keyPath, _ := cmd.Flags().GetString("key")
+	useAgent, _ := cmd.Flags().GetBool("agent")
+	timeout, _ := cmd.Flags().GetDuration("timeout")
+
+	config := auth.SSHConfig{
+		Hostname:  hostname,
+		Username:  username,
+		Port:      port,
+		KeyPath:   keyPath,
+		UseAgent:  useAgent,
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+	}
+
+	return auth.NewSSHClient(config)
+}
 func getCurrentUser() string {
 	// In a real implementation, you'd get the current user
 	// For now, return a default
