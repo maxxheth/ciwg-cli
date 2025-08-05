@@ -2,9 +2,11 @@ package execute
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -204,6 +206,65 @@ func (e *Executor) ExecuteScript(scriptName string, args []string, interactive b
 	}
 
 	return &execution, err
+}
+
+// ExecuteLocalScript executes a single script on the local machine
+func (e *Executor) ExecuteLocalScript(scriptName string, args []string, interactive bool) (*ScriptExecution, error) {
+	execution := ScriptExecution{
+		ID:        generateExecutionID(),
+		Script:    scriptName,
+		Args:      args,
+		Status:    StatusPending,
+		StartTime: time.Now(),
+	}
+
+	scriptPath, exists := e.localScripts[scriptName]
+	if !exists {
+		execution.Status = StatusFailed
+		execution.Error = fmt.Sprintf("script %s not found", scriptName)
+		return &execution, fmt.Errorf("%s", execution.Error)
+	}
+
+	execution.Status = StatusRunning
+
+	cmd := exec.Command(scriptPath, args...)
+
+	var execErr error
+	if interactive {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		execErr = cmd.Run()
+	} else {
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		execErr = cmd.Run()
+		execution.Output = stdout.String()
+		if stderr.Len() > 0 {
+			execution.Error = stderr.String()
+		}
+	}
+
+	endTime := time.Now()
+	execution.EndTime = &endTime
+
+	if execErr != nil {
+		execution.Status = StatusFailed
+		if exitErr, ok := execErr.(*exec.ExitError); ok {
+			execution.ExitCode = exitErr.ExitCode()
+		} else {
+			execution.ExitCode = -1 // Unknown exit code
+		}
+		if execution.Error == "" {
+			execution.Error = execErr.Error()
+		}
+	} else {
+		execution.Status = StatusCompleted
+		execution.ExitCode = 0
+	}
+
+	return &execution, execErr
 }
 
 // QueueScript adds a script to the execution queue
