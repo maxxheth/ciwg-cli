@@ -23,7 +23,6 @@ import (
 )
 
 var (
-	outputFile   string
 	overwrite    bool
 	appendFlag   bool
 	remove       bool
@@ -32,7 +31,6 @@ var (
 	domainFlag   string
 	excludeList  string
 	report       bool
-	serverRange  string // Add server range flag
 )
 
 func newDomainsCmd() *cobra.Command {
@@ -1528,3 +1526,5 @@ func writeConsolidatedReportToFile(activeCount, removedCount, inactiveCount int,
 
 	fmt.Fprintf(os.Stderr, "Report written to %s\n", outputFile)
 }
+
+// Helper function to create SSH client (reuse from domains.go pattern)
