@@ -3,14 +3,12 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"ciwg-cli/internal/auth"
 	"ciwg-cli/internal/cron"
 )
 
@@ -36,7 +34,7 @@ var cronAddCmd = &cobra.Command{
 
 var cronRemoveCmd = &cobra.Command{
 	Use:   "remove [hostname] [job-id]",
-	Short: "Remove a cron job by ID from one or more servers",
+	Short: "Remove cron job(s) by ID or pattern from one or more servers",
 	Args:  cobra.MaximumNArgs(2),
 	RunE:  runCronRemove,
 }
@@ -64,6 +62,8 @@ func init() {
 	cronAddCmd.Flags().String("server-range", "", "Server range pattern (e.g., 'wp%d.example.com:0-41')")
 	cronAddCmd.Flags().String("cron-job", "", "The full cron job string to add non-interactively (e.g., '* * * * * /usr/bin/true')")
 	cronRemoveCmd.Flags().String("server-range", "", "Server range pattern (e.g., 'wp%d.example.com:0-41')")
+	cronRemoveCmd.Flags().String("grep", "", "Filter cron jobs by command pattern")
+	cronRemoveCmd.Flags().String("id", "", "Filter cron jobs by ID")
 
 	// Add SSH connection flags to cron commands
 	for _, cmd := range []*cobra.Command{cronListCmd, cronAddCmd, cronRemoveCmd} {
@@ -261,21 +261,36 @@ func addCronForHost(cmd *cobra.Command, hostname string) error {
 
 func runCronRemove(cmd *cobra.Command, args []string) error {
 	serverRange, _ := cmd.Flags().GetString("server-range")
+	grepPattern, _ := cmd.Flags().GetString("grep")
+	jobIDFilter, _ := cmd.Flags().GetString("id")
+
+	// If using filtering patterns, we don't need a job-id argument
+	hasFilters := grepPattern != "" || jobIDFilter != ""
 
 	if serverRange != "" {
-		if len(args) < 1 {
-			return fmt.Errorf("job-id argument is required when --server-range is used")
+		if !hasFilters && len(args) < 1 {
+			return fmt.Errorf("job-id argument is required when --server-range is used without --grep or --id filters")
 		}
-		jobID := args[0]
+		var jobID string
+		if len(args) > 0 {
+			jobID = args[0]
+		}
 		return processCronRemoveForServerRange(cmd, serverRange, jobID)
 	}
 
-	if len(args) < 2 {
-		return fmt.Errorf("hostname and job-id arguments are required when --server-range is not used")
+	if len(args) < 1 {
+		return fmt.Errorf("hostname argument is required when --server-range is not used")
+	}
+
+	if !hasFilters && len(args) < 2 {
+		return fmt.Errorf("job-id argument is required when --grep and --id filters are not used")
 	}
 
 	hostname := args[0]
-	jobID := args[1]
+	var jobID string
+	if len(args) > 1 {
+		jobID = args[1]
+	}
 	return removeCronForHost(cmd, hostname, jobID)
 }
 
@@ -307,6 +322,52 @@ func removeCronForHost(cmd *cobra.Command, hostname, jobID string) error {
 
 	cronManager := cron.NewCronManager(sshClient)
 
+	grepPattern, _ := cmd.Flags().GetString("grep")
+	jobIDFilter, _ := cmd.Flags().GetString("id")
+
+	// If using filters instead of direct job ID
+	if grepPattern != "" || jobIDFilter != "" {
+		jobs, err := cronManager.ListCronJobs()
+		if err != nil {
+			return fmt.Errorf("failed to list cron jobs: %w", err)
+		}
+
+		var jobsToRemove []cron.CronJob
+		for _, job := range jobs {
+			match := true
+			if jobIDFilter != "" && job.ID != jobIDFilter {
+				match = false
+			}
+			if grepPattern != "" && !strings.Contains(job.Command, grepPattern) {
+				match = false
+			}
+			if match {
+				jobsToRemove = append(jobsToRemove, job)
+			}
+		}
+
+		if len(jobsToRemove) == 0 {
+			fmt.Printf("No cron jobs found matching the criteria on %s.\n", hostname)
+			return nil
+		}
+
+		fmt.Printf("Found %d cron job(s) to remove on %s:\n", len(jobsToRemove), hostname)
+		for _, job := range jobsToRemove {
+			fmt.Printf("  ID: %s, Command: %s\n", job.ID, job.Command)
+		}
+
+		for _, job := range jobsToRemove {
+			fmt.Printf("Removing job ID %s...", job.ID)
+			if err := cronManager.RemoveCronJob(job.ID); err != nil {
+				fmt.Printf(" failed: %v\n", err)
+			} else {
+				fmt.Println(" success.")
+			}
+		}
+		return nil
+	}
+
+	// Direct job ID removal (existing functionality)
 	fmt.Printf("Removing cron job %s from %s...\n", jobID, hostname)
 
 	err = cronManager.RemoveCronJob(jobID)
@@ -341,54 +402,4 @@ func runCronValidate(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-func parseServerRange(pattern string) (string, int, int, error) {
-	// Expected format: "wp%d.ciwgserver.com:0-41"
-	parts := strings.Split(pattern, ":")
-	if len(parts) != 2 {
-		return "", 0, 0, fmt.Errorf("invalid server range format, expected 'pattern:start-end'")
-	}
-
-	rangeParts := strings.Split(parts[1], "-")
-	if len(rangeParts) != 2 {
-		return "", 0, 0, fmt.Errorf("invalid range format, expected 'start-end'")
-	}
-
-	start, err := strconv.Atoi(rangeParts[0])
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("invalid start number: %w", err)
-	}
-
-	end, err := strconv.Atoi(rangeParts[1])
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("invalid end number: %w", err)
-	}
-
-	return parts[0], start, end, nil
-}
-
-func createSSHClient(cmd *cobra.Command, hostname string) (*auth.SSHClient, error) {
-	// Get connection parameters
-	username, _ := cmd.Flags().GetString("user")
-	if username == "" {
-		username = getCurrentUser()
-	}
-
-	port, _ := cmd.Flags().GetString("port")
-	keyPath, _ := cmd.Flags().GetString("key")
-	useAgent, _ := cmd.Flags().GetBool("agent")
-	timeout, _ := cmd.Flags().GetDuration("timeout")
-
-	config := auth.SSHConfig{
-		Hostname:  hostname,
-		Username:  username,
-		Port:      port,
-		KeyPath:   keyPath,
-		UseAgent:  useAgent,
-		Timeout:   timeout,
-		KeepAlive: 30 * time.Second,
-	}
-
-	return auth.NewSSHClient(config)
 }
