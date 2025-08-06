@@ -24,6 +24,7 @@ tmp/
 
 # .env file
 .env
+.env*
 
 # Project build
 main
@@ -32,3 +33,4 @@ main
 # OS X generated file
 .DS_Store
 
+dist/
