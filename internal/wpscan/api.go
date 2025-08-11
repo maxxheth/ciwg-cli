@@ -21,16 +21,28 @@ const (
 )
 
 type APIClient struct {
-	httpClient   *http.Client
-	tokens       []string
-	currentToken int
-	requestsLeft int
-	mu           sync.Mutex
+	httpClient    *http.Client
+	tokens        []string
+	currentToken  int
+	requestsLeft  int
+	mu            sync.Mutex
+	// Add throttling fields
+	throttleDelay time.Duration
+	throttleBatch int
+	throttlePause time.Duration
+	maxConcurrent int
+	requestCount  int
+	lastRequest   time.Time
 }
 
 type APIClientConfig struct {
-	CSVFile   string
-	CSVColumn string
+	CSVFile       string
+	CSVColumn     string
+	// Add throttling configuration
+	ThrottleDelay time.Duration
+	ThrottleBatch int
+	ThrottlePause time.Duration
+	MaxConcurrent int
 }
 
 // Update APIStatus to handle null values properly
@@ -131,13 +143,40 @@ func NewAPIClientWithConfig(config APIClientConfig) (*APIClient, error) {
 
 	log.Printf("Initialized WPScan API client with %d tokens", len(tokens))
 
+	// Set default throttling values if not specified
+	throttleDelay := config.ThrottleDelay
+	if throttleDelay == 0 {
+		throttleDelay = 500 * time.Millisecond
+	}
+
+	throttleBatch := config.ThrottleBatch
+	if throttleBatch == 0 {
+		throttleBatch = 10
+	}
+
+	throttlePause := config.ThrottlePause
+	if throttlePause == 0 {
+		throttlePause = 5 * time.Second
+	}
+
+	maxConcurrent := config.MaxConcurrent
+	if maxConcurrent == 0 {
+		maxConcurrent = 3
+	}
+
 	return &APIClient{
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		tokens:       tokens,
-		currentToken: 0,
-		requestsLeft: -1, // Initialize as unknown
+		tokens:        tokens,
+		currentToken:  0,
+		requestsLeft:  -1,
+		throttleDelay: throttleDelay,
+		throttleBatch: throttleBatch,
+		throttlePause: throttlePause,
+		maxConcurrent: maxConcurrent,
+		requestCount:  0,
+		lastRequest:   time.Now(),
 	}, nil
 }
 
@@ -360,14 +399,137 @@ func (c *APIClient) makeRequest(ctx context.Context, endpoint string) ([]byte, e
 	return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries, lastErr)
 }
 
-func (c *APIClient) GetPluginVulnerabilities(ctx context.Context, slug string) (*PluginVulnInfo, error) {
-	data, err := c.makeRequest(ctx, fmt.Sprintf("/plugins/%s", slug))
+func (c *APIClient) makeThrottledRequest(ctx context.Context, endpoint string) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Implement throttling logic
+	c.requestCount++
+
+	// Check if we need a longer pause after batch completion
+	if c.requestCount > 1 && (c.requestCount-1)%c.throttleBatch == 0 {
+		log.Printf("Completed batch of %d requests, pausing for %v", c.throttleBatch, c.throttlePause)
+		time.Sleep(c.throttlePause)
+	} else {
+		// Regular throttling delay
+		elapsed := time.Since(c.lastRequest)
+		if elapsed < c.throttleDelay {
+			sleepTime := c.throttleDelay - elapsed
+			log.Printf("Throttling: sleeping for %v (request %d)", sleepTime, c.requestCount)
+			time.Sleep(sleepTime)
+		}
+	}
+
+	c.lastRequest = time.Now()
+
+	// Make the actual request (temporarily unlock for the HTTP call)
+	c.mu.Unlock()
+	result, err := c.makeRequest(ctx, endpoint)
+	c.mu.Lock()
+
+	return result, err
+}
+
+func (c *APIClient) ScanPluginsBatch(ctx context.Context, plugins map[string]bool) (map[string]*PluginVulnInfo, []string) {
+	results := make(map[string]*PluginVulnInfo)
+	var errors []string
+	var mu sync.Mutex
+
+	// Convert map to slice for processing
+	pluginList := make([]string, 0, len(plugins))
+	for plugin := range plugins {
+		pluginList = append(pluginList, plugin)
+	}
+
+	// Process with controlled concurrency
+	semaphore := make(chan struct{}, c.maxConcurrent)
+	var wg sync.WaitGroup
+
+	for i, plugin := range pluginList {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire semaphore
+
+		go func(plugin string, index int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release semaphore
+
+			if index%10 == 0 || index == len(pluginList)-1 {
+				log.Printf("Plugin progress: %d/%d (%s)", index+1, len(pluginList), plugin)
+			}
+
+			info, err := c.GetPluginVulnerabilitiesThrottled(ctx, plugin)
+			if err != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("plugin %s: %v", plugin, err))
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			results[plugin] = info
+			mu.Unlock()
+		}(plugin, i)
+	}
+
+	wg.Wait()
+
+	return results, errors
+}
+
+func (c *APIClient) ScanThemesBatch(ctx context.Context, themes map[string]bool) (map[string]*ThemeVulnInfo, []string) {
+	results := make(map[string]*ThemeVulnInfo)
+	var errors []string
+	var mu sync.Mutex
+
+	// Convert map to slice for processing
+	themeList := make([]string, 0, len(themes))
+	for theme := range themes {
+		themeList = append(themeList, theme)
+	}
+
+	// Process with controlled concurrency
+	semaphore := make(chan struct{}, c.maxConcurrent)
+	var wg sync.WaitGroup
+
+	for i, theme := range themeList {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire semaphore
+
+		go func(theme string, index int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release semaphore
+
+			if index%10 == 0 || index == len(themeList)-1 {
+				log.Printf("Theme progress: %d/%d (%s)", index+1, len(themeList), theme)
+			}
+
+			info, err := c.GetThemeVulnerabilitiesThrottled(ctx, theme)
+			if err != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("theme %s: %v", theme, err))
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			results[theme] = info
+			mu.Unlock()
+		}(theme, i)
+	}
+
+	wg.Wait()
+
+	return results, errors
+}
+
+// Add throttled versions of the vulnerability methods
+func (c *APIClient) GetPluginVulnerabilitiesThrottled(ctx context.Context, slug string) (*PluginVulnInfo, error) {
+	data, err := c.makeThrottledRequest(ctx, fmt.Sprintf("/plugins/%s", slug))
 	if err != nil {
 		return nil, err
 	}
 
 	if data == nil {
-		// Plugin not found in database
 		return &PluginVulnInfo{
 			Slug:            slug,
 			Vulnerabilities: []Vulnerability{},
@@ -382,14 +544,13 @@ func (c *APIClient) GetPluginVulnerabilities(ctx context.Context, slug string) (
 	return &info, nil
 }
 
-func (c *APIClient) GetThemeVulnerabilities(ctx context.Context, slug string) (*ThemeVulnInfo, error) {
-	data, err := c.makeRequest(ctx, fmt.Sprintf("/themes/%s", slug))
+func (c *APIClient) GetThemeVulnerabilitiesThrottled(ctx context.Context, slug string) (*ThemeVulnInfo, error) {
+	data, err := c.makeThrottledRequest(ctx, fmt.Sprintf("/themes/%s", slug))
 	if err != nil {
 		return nil, err
 	}
 
 	if data == nil {
-		// Theme not found in database
 		return &ThemeVulnInfo{
 			Slug:            slug,
 			Vulnerabilities: []Vulnerability{},

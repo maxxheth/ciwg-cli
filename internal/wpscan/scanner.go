@@ -40,6 +40,11 @@ type Config struct {
 	Local         bool
 	APIKeysCSV    string
 	APIKeysColumn string
+	// Add throttling configuration
+	ThrottleDelay time.Duration
+	ThrottleBatch int
+	ThrottlePause time.Duration
+	MaxConcurrent int
 }
 
 type SiteInfo struct {
@@ -98,10 +103,14 @@ func NewScanner(config Config) (*Scanner, error) {
 		s.dockerClient = dockerClient
 	}
 
-	// Initialize API client with CSV support
+	// Initialize API client with throttling configuration
 	apiConfig := APIClientConfig{
-		CSVFile:   config.APIKeysCSV,
-		CSVColumn: config.APIKeysColumn,
+		CSVFile:       config.APIKeysCSV,
+		CSVColumn:     config.APIKeysColumn,
+		ThrottleDelay: config.ThrottleDelay,
+		ThrottleBatch: config.ThrottleBatch,
+		ThrottlePause: config.ThrottlePause,
+		MaxConcurrent: config.MaxConcurrent,
 	}
 
 	apiClient, err := NewAPIClientWithConfig(apiConfig)
@@ -629,6 +638,7 @@ func (s *Scanner) ContainersToSites(containers []string) ([]SiteInfo, error) {
 	return sites, nil
 }
 
+// Update ScanAssets to use throttled API calls
 func (s *Scanner) ScanAssets(ctx context.Context, plugins, themes map[string]bool) (*ScanResults, error) {
 	results := &ScanResults{
 		Timestamp: time.Now().Format(time.RFC3339),
@@ -641,46 +651,31 @@ func (s *Scanner) ScanAssets(ctx context.Context, plugins, themes map[string]boo
 		},
 	}
 
-	log.Printf("Starting vulnerability scan for %d plugins and %d themes", len(plugins), len(themes))
+	log.Printf("Starting throttled vulnerability scan for %d plugins and %d themes", len(plugins), len(themes))
 
-	// Scan plugins
-	log.Printf("Scanning %d plugins for vulnerabilities...", len(plugins))
-	pluginCount := 0
-	for plugin := range plugins {
-		pluginCount++
-		if pluginCount%10 == 0 || pluginCount == len(plugins) {
-			log.Printf("Plugin progress: %d/%d", pluginCount, len(plugins))
+	// Use the throttled API methods
+	if len(plugins) > 0 {
+		log.Printf("Scanning %d plugins for vulnerabilities...", len(plugins))
+		pluginResults, errors := s.apiClient.ScanPluginsBatch(ctx, plugins)
+
+		for slug, info := range pluginResults {
+			results.Plugins[slug] = info
+			results.Stats.PluginVulnerabilities += len(info.Vulnerabilities)
 		}
 
-		info, err := s.apiClient.GetPluginVulnerabilities(ctx, plugin)
-		if err != nil {
-			errorMsg := fmt.Sprintf("plugin %s: %v", plugin, err)
-			log.Printf("ERROR: %s", errorMsg)
-			results.Errors = append(results.Errors, errorMsg)
-			continue
-		}
-		results.Plugins[plugin] = info
-		results.Stats.PluginVulnerabilities += len(info.Vulnerabilities)
+		results.Errors = append(results.Errors, errors...)
 	}
 
-	// Scan themes
-	log.Printf("Scanning %d themes for vulnerabilities...", len(themes))
-	themeCount := 0
-	for theme := range themes {
-		themeCount++
-		if themeCount%10 == 0 || themeCount == len(themes) {
-			log.Printf("Theme progress: %d/%d", themeCount, len(themes))
+	if len(themes) > 0 {
+		log.Printf("Scanning %d themes for vulnerabilities...", len(themes))
+		themeResults, errors := s.apiClient.ScanThemesBatch(ctx, themes)
+
+		for slug, info := range themeResults {
+			results.Themes[slug] = info
+			results.Stats.ThemeVulnerabilities += len(info.Vulnerabilities)
 		}
 
-		info, err := s.apiClient.GetThemeVulnerabilities(ctx, theme)
-		if err != nil {
-			errorMsg := fmt.Sprintf("theme %s: %v", theme, err)
-			log.Printf("ERROR: %s", errorMsg)
-			results.Errors = append(results.Errors, errorMsg)
-			continue
-		}
-		results.Themes[theme] = info
-		results.Stats.ThemeVulnerabilities += len(info.Vulnerabilities)
+		results.Errors = append(results.Errors, errors...)
 	}
 
 	log.Printf("Vulnerability scan complete. Found %d plugin vulnerabilities, %d theme vulnerabilities",

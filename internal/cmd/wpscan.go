@@ -23,6 +23,11 @@ var (
 	wpscanCSVFile       string
 	wpscanAPIKeysCSV    string
 	wpscanAPIKeysColumn string
+	// Add throttling configuration
+	wpscanThrottleDelay time.Duration
+	wpscanThrottleBatch int
+	wpscanThrottlePause time.Duration
+	wpscanMaxConcurrent int
 )
 
 var wpscanCmd = &cobra.Command{
@@ -56,6 +61,12 @@ func init() {
 	wpscanScanCmd.Flags().StringVar(&wpscanAPIKeysCSV, "api-keys-csv", "", "CSV file containing API keys")
 	wpscanScanCmd.Flags().StringVar(&wpscanAPIKeysColumn, "api-keys-column", "api_key", "Column name for API keys in CSV")
 
+	// Throttling configuration flags
+	wpscanScanCmd.Flags().DurationVar(&wpscanThrottleDelay, "throttle-delay", 500*time.Millisecond, "Delay between API requests")
+	wpscanScanCmd.Flags().IntVar(&wpscanThrottleBatch, "throttle-batch", 10, "Number of requests before longer pause")
+	wpscanScanCmd.Flags().DurationVar(&wpscanThrottlePause, "throttle-pause", 5*time.Second, "Longer pause after batch completion")
+	wpscanScanCmd.Flags().IntVar(&wpscanMaxConcurrent, "max-concurrent", 3, "Maximum concurrent API requests")
+
 	// SSH connection flags (following the pattern from other commands)
 	wpscanScanCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
 	wpscanScanCmd.Flags().StringP("port", "p", "22", "SSH port")
@@ -76,6 +87,11 @@ func runWPScanScan(cmd *cobra.Command, args []string) error {
 		Local:         wpscanLocal,
 		APIKeysCSV:    wpscanAPIKeysCSV,
 		APIKeysColumn: wpscanAPIKeysColumn,
+		// Add throttling configuration
+		ThrottleDelay: wpscanThrottleDelay,
+		ThrottleBatch: wpscanThrottleBatch,
+		ThrottlePause: wpscanThrottlePause,
+		MaxConcurrent: wpscanMaxConcurrent,
 	}
 
 	if config.UseSSH && len(args) > 0 {
@@ -107,6 +123,14 @@ func runWPScanScan(cmd *cobra.Command, args []string) error {
 			config.SSHTimeout = timeout
 		}
 	}
+
+	// Print throttling configuration for transparency
+	fmt.Printf("API Throttling Configuration:\n")
+	fmt.Printf("  Delay between requests: %v\n", wpscanThrottleDelay)
+	fmt.Printf("  Batch size: %d requests\n", wpscanThrottleBatch)
+	fmt.Printf("  Pause after batch: %v\n", wpscanThrottlePause)
+	fmt.Printf("  Max concurrent requests: %d\n", wpscanMaxConcurrent)
+	fmt.Println()
 
 	scanner, err := wpscan.NewScanner(config)
 	if err != nil {
