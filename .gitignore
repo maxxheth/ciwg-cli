@@ -34,3 +34,8 @@ main
 .DS_Store
 
 dist/
+
+*.log
+*.csv
+*.tgz
+*.md
