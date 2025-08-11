@@ -251,7 +251,72 @@ func printScanSummary(results *wpscan.ScanResults) {
 
 	if len(results.Errors) > 0 {
 		fmt.Printf("Errors encountered: %d\n", len(results.Errors))
+
+		// Group errors by type for better debugging
+		errorCounts := make(map[string]int)
+		errorExamples := make(map[string]string)
+
+		for _, errMsg := range results.Errors {
+			// Categorize errors
+			var category string
+			switch {
+			case strings.Contains(errMsg, "failed to create SSH client"):
+				category = "SSH Connection"
+			case strings.Contains(errMsg, "failed to execute WP-CLI command"):
+				category = "WP-CLI Execution"
+			case strings.Contains(errMsg, "docker exec"):
+				category = "Docker Execution"
+			case strings.Contains(errMsg, "No such container"):
+				category = "Container Not Found"
+			case strings.Contains(errMsg, "connection reset"):
+				category = "Network Connection"
+			case strings.Contains(errMsg, "timeout"):
+				category = "Timeout"
+			case strings.Contains(errMsg, "permission denied"):
+				category = "Permission"
+			case strings.Contains(errMsg, "no output from WP-CLI"):
+				category = "Empty WP-CLI Output"
+			case strings.Contains(errMsg, "unexpected output format"):
+				category = "WP-CLI Parse Error"
+			default:
+				category = "Other"
+			}
+
+			errorCounts[category]++
+			if errorExamples[category] == "" {
+				errorExamples[category] = errMsg
+			}
+		}
+
+		fmt.Println("\n=== Error Breakdown ===")
+		for category, count := range errorCounts {
+			fmt.Printf("%s: %d errors\n", category, count)
+			fmt.Printf("  Example: %s\n", errorExamples[category])
+		}
+
+		// Also log all errors to a file for detailed debugging
+		logErrorsToFile(results.Errors)
 	}
 
 	fmt.Printf("Scan completed at: %s\n", results.Timestamp)
+}
+
+func logErrorsToFile(errors []string) {
+	errorLogFile := fmt.Sprintf("wpscan-errors-%s.log", time.Now().Format("2006-01-02-15-04-05"))
+
+	file, err := os.Create(errorLogFile)
+	if err != nil {
+		fmt.Printf("Warning: Could not create error log file: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	fmt.Fprintf(file, "WPScan Error Log - %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(file, "Total Errors: %d\n\n", len(errors))
+
+	for i, errMsg := range errors {
+		fmt.Fprintf(file, "Error %d: %s\n", i+1, errMsg)
+	}
+
+	fmt.Printf("Detailed errors logged to: %s\n", errorLogFile)
 }

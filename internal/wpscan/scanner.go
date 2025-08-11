@@ -135,7 +135,7 @@ func (s *Scanner) CollectAssetsFromSites(ctx context.Context, sites []SiteInfo) 
 	var mu sync.Mutex
 	errors := make([]error, 0)
 
-	// Group sites by server to reduce connection attempts (but don't pool connections)
+	// Group sites by server to reduce connection attempts
 	serverSites := make(map[string][]SiteInfo)
 	for _, site := range sites {
 		server := site.Server
@@ -152,24 +152,41 @@ func (s *Scanner) CollectAssetsFromSites(ctx context.Context, sites []SiteInfo) 
 	for server, sites := range serverSites {
 		log.Printf("Processing %d sites on server %s", len(sites), server)
 
-		// Create one SSH client per server and process all sites on that server
-		// before moving to the next server (similar to domains.go approach)
 		if server != "localhost" {
 			sshClient, err := s.createSSHClient(server)
 			if err != nil {
-				log.Printf("Failed to connect to %s: %v", server, err)
+				errorMsg := fmt.Sprintf("Failed to connect to server %s: %v", server, err)
+				log.Printf("ERROR: %s", errorMsg)
+
+				// Add error for each site on this failed server
+				mu.Lock()
+				for _, site := range sites {
+					errors = append(errors, fmt.Errorf("site %s on server %s: failed to create SSH client: %w", site.Domain, server, err))
+				}
+				mu.Unlock()
 				continue
 			}
 
 			// Process all sites on this server sequentially
+			successCount := 0
 			for _, site := range sites {
+				log.Printf("Processing site: %s (container: %s)", site.Domain, site.Container)
+
 				assets, err := s.extractAssetsFromSiteWithClient(ctx, site, sshClient)
 				if err != nil {
+					log.Printf("ERROR processing site %s: %v", site.Domain, err)
 					mu.Lock()
 					errors = append(errors, fmt.Errorf("site %s: %w", site.Domain, err))
 					mu.Unlock()
 					continue
 				}
+
+				if assets == nil {
+					log.Printf("WARNING: No assets returned for site %s", site.Domain)
+					continue
+				}
+
+				log.Printf("Site %s: Found %d plugins, %d themes", site.Domain, len(assets.Plugins), len(assets.Themes))
 
 				mu.Lock()
 				for _, plugin := range assets.Plugins {
@@ -179,19 +196,35 @@ func (s *Scanner) CollectAssetsFromSites(ctx context.Context, sites []SiteInfo) 
 					themes[theme.Name] = true
 				}
 				mu.Unlock()
+
+				successCount++
 			}
 
+			log.Printf("Server %s: Successfully processed %d/%d sites", server, successCount, len(sites))
 			sshClient.Close()
 		} else {
 			// Process local sites
+			log.Printf("Processing %d local sites", len(sites))
+			successCount := 0
+
 			for _, site := range sites {
+				log.Printf("Processing local site: %s", site.Domain)
+
 				assets, err := s.extractAssetsFromSite(ctx, site)
 				if err != nil {
+					log.Printf("ERROR processing local site %s: %v", site.Domain, err)
 					mu.Lock()
 					errors = append(errors, fmt.Errorf("site %s: %w", site.Domain, err))
 					mu.Unlock()
 					continue
 				}
+
+				if assets == nil {
+					log.Printf("WARNING: No assets returned for local site %s", site.Domain)
+					continue
+				}
+
+				log.Printf("Local site %s: Found %d plugins, %d themes", site.Domain, len(assets.Plugins), len(assets.Themes))
 
 				mu.Lock()
 				for _, plugin := range assets.Plugins {
@@ -201,14 +234,48 @@ func (s *Scanner) CollectAssetsFromSites(ctx context.Context, sites []SiteInfo) 
 					themes[theme.Name] = true
 				}
 				mu.Unlock()
+
+				successCount++
 			}
+
+			log.Printf("Local processing: Successfully processed %d/%d sites", successCount, len(sites))
 		}
 	}
 
+	log.Printf("Asset collection complete. Found %d unique plugins, %d unique themes", len(plugins), len(themes))
+
 	if len(errors) > 0 {
 		log.Printf("Encountered %d errors while collecting assets", len(errors))
+
+		// Group errors for summary logging
+		errorCounts := make(map[string]int)
 		for _, err := range errors {
-			log.Printf("  - %v", err)
+			errStr := err.Error()
+			switch {
+			case strings.Contains(errStr, "failed to create SSH client"):
+				errorCounts["SSH Connection"]++
+			case strings.Contains(errStr, "failed to execute WP-CLI command"):
+				errorCounts["WP-CLI Execution"]++
+			case strings.Contains(errStr, "No such container"):
+				errorCounts["Container Missing"]++
+			case strings.Contains(errStr, "no output from WP-CLI"):
+				errorCounts["Empty Output"]++
+			default:
+				errorCounts["Other"]++
+			}
+		}
+
+		for category, count := range errorCounts {
+			log.Printf("  %s errors: %d", category, count)
+		}
+
+		// Log first few detailed errors for debugging
+		log.Printf("First 5 detailed errors:")
+		for i, err := range errors {
+			if i >= 5 {
+				break
+			}
+			log.Printf("  %d: %v", i+1, err)
 		}
 	}
 
@@ -222,19 +289,38 @@ func (s *Scanner) extractAssetsFromSiteWithClient(ctx context.Context, site Site
 		containerName = "wp_" + strings.Replace(site.Domain, ".", "_", -1)
 	}
 
+	log.Printf("Extracting assets from container %s for site %s", containerName, site.Domain)
+
 	// Command to extract plugins and themes as JSON
 	wpCmd := `wp plugin list --format=json 2>/dev/null && echo "---SEPARATOR---" && wp theme list --format=json 2>/dev/null`
 
-	// Execute docker exec via SSH - same pattern as domains.go
+	// Execute docker exec via SSH
 	dockerCmd := fmt.Sprintf("docker exec %s bash -c '%s'", containerName, wpCmd)
+	log.Printf("Executing command: docker exec %s bash -c '[WP-CLI command]'", containerName)
+
 	stdout, stderr, err := sshClient.ExecuteCommand(dockerCmd)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute WP-CLI command: %w (stderr: %s)", err, stderr)
+		if strings.Contains(stderr, "No such container") {
+			return nil, fmt.Errorf("container %s not found (site: %s)", containerName, site.Domain)
+		}
+		if strings.Contains(stderr, "wp: command not found") {
+			return nil, fmt.Errorf("WP-CLI not available in container %s (site: %s)", containerName, site.Domain)
+		}
+		return nil, fmt.Errorf("failed to execute WP-CLI command in container %s: %w (stderr: %s)", containerName, err, stderr)
 	}
 
-	// Use ctx to handle cancellation and timeouts
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if strings.TrimSpace(stdout) == "" {
+		return nil, fmt.Errorf("no output from WP-CLI command for site %s (container: %s)", site.Domain, containerName)
+	}
+
+	log.Printf("Received output from container %s (length: %d chars)", containerName, len(stdout))
+
+	// Use ctx
+	// ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context error: %w", err)
 	}
 
 	return s.parseAssetsOutput(stdout, containerName, site)
@@ -301,35 +387,56 @@ func (s *Scanner) extractAssetsFromSite(ctx context.Context, site SiteInfo) (*Co
 func (s *Scanner) parseAssetsOutput(output, containerName string, site SiteInfo) (*ContainerAssets, error) {
 	output = strings.TrimSpace(output)
 	if output == "" {
-		return nil, fmt.Errorf("no output from WP-CLI command for %s", site.Domain)
+		return nil, fmt.Errorf("empty output from WP-CLI command for %s", site.Domain)
 	}
+
+	log.Printf("Parsing assets output for site %s (output length: %d)", site.Domain, len(output))
 
 	parts := strings.Split(output, "---SEPARATOR---")
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("unexpected output format from %s", site.Domain)
+		log.Printf("WARNING: Unexpected output format for %s. Expected 2 parts, got %d", site.Domain, len(parts))
+		log.Printf("Raw output: %s", output)
+		return nil, fmt.Errorf("unexpected output format from %s (expected 2 parts separated by ---SEPARATOR---, got %d parts)", site.Domain, len(parts))
 	}
 
 	assets := &ContainerAssets{
 		ContainerName: containerName,
 		SiteInfo:      site,
+		Plugins:       []WordPressAsset{},
+		Themes:        []WordPressAsset{},
 	}
 
 	// Parse plugins
 	pluginJSON := strings.TrimSpace(parts[0])
-	if pluginJSON != "" && pluginJSON != "null" {
+	if pluginJSON != "" && pluginJSON != "null" && pluginJSON != "[]" {
+		log.Printf("Parsing plugins JSON for %s (length: %d)", site.Domain, len(pluginJSON))
 		if err := json.Unmarshal([]byte(pluginJSON), &assets.Plugins); err != nil {
-			log.Printf("Failed to parse plugins for %s: %v", site.Domain, err)
+			log.Printf("ERROR: Failed to parse plugins JSON for %s: %v", site.Domain, err)
+			log.Printf("Plugins JSON: %s", pluginJSON)
+			// Don't return error, continue with themes
+		} else {
+			log.Printf("Successfully parsed %d plugins for %s", len(assets.Plugins), site.Domain)
 		}
+	} else {
+		log.Printf("No plugins found for %s (output: '%s')", site.Domain, pluginJSON)
 	}
 
 	// Parse themes
 	themeJSON := strings.TrimSpace(parts[1])
-	if themeJSON != "" && themeJSON != "null" {
+	if themeJSON != "" && themeJSON != "null" && themeJSON != "[]" {
+		log.Printf("Parsing themes JSON for %s (length: %d)", site.Domain, len(themeJSON))
 		if err := json.Unmarshal([]byte(themeJSON), &assets.Themes); err != nil {
-			log.Printf("Failed to parse themes for %s: %v", site.Domain, err)
+			log.Printf("ERROR: Failed to parse themes JSON for %s: %v", site.Domain, err)
+			log.Printf("Themes JSON: %s", themeJSON)
+			// Don't return error, we got what we could
+		} else {
+			log.Printf("Successfully parsed %d themes for %s", len(assets.Themes), site.Domain)
 		}
+	} else {
+		log.Printf("No themes found for %s (output: '%s')", site.Domain, themeJSON)
 	}
 
+	log.Printf("Site %s final count: %d plugins, %d themes", site.Domain, len(assets.Plugins), len(assets.Themes))
 	return assets, nil
 }
 
@@ -534,12 +641,22 @@ func (s *Scanner) ScanAssets(ctx context.Context, plugins, themes map[string]boo
 		},
 	}
 
+	log.Printf("Starting vulnerability scan for %d plugins and %d themes", len(plugins), len(themes))
+
 	// Scan plugins
 	log.Printf("Scanning %d plugins for vulnerabilities...", len(plugins))
+	pluginCount := 0
 	for plugin := range plugins {
+		pluginCount++
+		if pluginCount%10 == 0 || pluginCount == len(plugins) {
+			log.Printf("Plugin progress: %d/%d", pluginCount, len(plugins))
+		}
+
 		info, err := s.apiClient.GetPluginVulnerabilities(ctx, plugin)
 		if err != nil {
-			results.Errors = append(results.Errors, fmt.Sprintf("plugin %s: %v", plugin, err))
+			errorMsg := fmt.Sprintf("plugin %s: %v", plugin, err)
+			log.Printf("ERROR: %s", errorMsg)
+			results.Errors = append(results.Errors, errorMsg)
 			continue
 		}
 		results.Plugins[plugin] = info
@@ -548,15 +665,26 @@ func (s *Scanner) ScanAssets(ctx context.Context, plugins, themes map[string]boo
 
 	// Scan themes
 	log.Printf("Scanning %d themes for vulnerabilities...", len(themes))
+	themeCount := 0
 	for theme := range themes {
+		themeCount++
+		if themeCount%10 == 0 || themeCount == len(themes) {
+			log.Printf("Theme progress: %d/%d", themeCount, len(themes))
+		}
+
 		info, err := s.apiClient.GetThemeVulnerabilities(ctx, theme)
 		if err != nil {
-			results.Errors = append(results.Errors, fmt.Sprintf("theme %s: %v", theme, err))
+			errorMsg := fmt.Sprintf("theme %s: %v", theme, err)
+			log.Printf("ERROR: %s", errorMsg)
+			results.Errors = append(results.Errors, errorMsg)
 			continue
 		}
 		results.Themes[theme] = info
 		results.Stats.ThemeVulnerabilities += len(info.Vulnerabilities)
 	}
+
+	log.Printf("Vulnerability scan complete. Found %d plugin vulnerabilities, %d theme vulnerabilities",
+		results.Stats.PluginVulnerabilities, results.Stats.ThemeVulnerabilities)
 
 	return results, nil
 }

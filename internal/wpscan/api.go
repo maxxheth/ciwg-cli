@@ -33,9 +33,38 @@ type APIClientConfig struct {
 	CSVColumn string
 }
 
+// Update APIStatus to handle null values properly
 type APIStatus struct {
-	Plan         string `json:"plan"`
-	RequestsLeft int    `json:"requests_left"`
+	Plan          string      `json:"plan"`
+	RequestsLeft  interface{} `json:"requests_left"`  // Can be int or null
+	RequestsLimit interface{} `json:"requests_limit"` // Can be int or null
+}
+
+// Helper method to safely extract int from interface{} (handles null)
+func (s *APIStatus) GetRequestsLeft() int {
+	switch v := s.RequestsLeft.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case nil:
+		return -1 // Use -1 to indicate unknown/unlimited
+	default:
+		return -1
+	}
+}
+
+func (s *APIStatus) GetRequestsLimit() int {
+	switch v := s.RequestsLimit.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case nil:
+		return -1 // Use -1 to indicate unknown/unlimited
+	default:
+		return -1
+	}
 }
 
 type PluginVulnInfo struct {
@@ -108,6 +137,7 @@ func NewAPIClientWithConfig(config APIClientConfig) (*APIClient, error) {
 		},
 		tokens:       tokens,
 		currentToken: 0,
+		requestsLeft: -1, // Initialize as unknown
 	}, nil
 }
 
@@ -199,23 +229,44 @@ func (c *APIClient) checkAndRotateToken(ctx context.Context) error {
 		return err
 	}
 
-	c.requestsLeft = status.RequestsLeft
-	log.Printf("Token %d: %d requests remaining", c.currentToken+1, c.requestsLeft)
+	requestsLeft := status.GetRequestsLeft()
+	requestsLimit := status.GetRequestsLimit()
+	c.requestsLeft = requestsLeft
 
-	// If we're at or below reserve, rotate to next token
-	if c.requestsLeft <= reserveRequests {
+	// Log token status with proper null handling
+	if requestsLeft == -1 {
+		log.Printf("Token %d (%s plan): requests remaining unknown/unlimited", c.currentToken+1, status.Plan)
+	} else {
+		if requestsLimit == -1 {
+			log.Printf("Token %d (%s plan): %d requests remaining (limit unknown)", c.currentToken+1, status.Plan, requestsLeft)
+		} else {
+			log.Printf("Token %d (%s plan): %d/%d requests remaining", c.currentToken+1, status.Plan, requestsLeft, requestsLimit)
+		}
+	}
+
+	// Only rotate if we have a known requests left value and it's at or below reserve
+	// If requests_left is null (unknown), we don't rotate - let the API tell us when we're rate limited
+	if requestsLeft > 0 && requestsLeft <= reserveRequests {
 		if c.currentToken < len(c.tokens)-1 {
 			c.currentToken++
-			log.Printf("Rotating to token %d", c.currentToken+1)
+			log.Printf("Rotating to token %d (reserve threshold reached)", c.currentToken+1)
 
 			// Check new token status
 			status, err := c.getStatus(ctx)
 			if err != nil {
 				return err
 			}
-			c.requestsLeft = status.RequestsLeft
+			c.requestsLeft = status.GetRequestsLeft()
+
+			newRequestsLeft := status.GetRequestsLeft()
+			if newRequestsLeft == -1 {
+				log.Printf("New token %d (%s plan): requests remaining unknown/unlimited", c.currentToken+1, status.Plan)
+			} else {
+				log.Printf("New token %d (%s plan): %d requests remaining", c.currentToken+1, status.Plan, newRequestsLeft)
+			}
 		} else {
-			return fmt.Errorf("all tokens exhausted (at reserve limit)")
+			// Only fail if we know we're at the limit - if it's unknown, let the API decide
+			return fmt.Errorf("all tokens at reserve limit (%d requests remaining on last token)", requestsLeft)
 		}
 	}
 
@@ -286,7 +337,7 @@ func (c *APIClient) makeRequest(ctx context.Context, endpoint string) ([]byte, e
 			c.mu.Lock()
 			if c.currentToken < len(c.tokens)-1 {
 				c.currentToken++
-				log.Printf("Rate limited, rotating to token %d", c.currentToken+1)
+				log.Printf("Rate limited (429), rotating to token %d", c.currentToken+1)
 				c.mu.Unlock()
 				continue
 			}
