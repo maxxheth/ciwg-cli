@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -24,9 +26,12 @@ type ContainerInfo struct {
 }
 
 var (
-	inventoryOutputFile  string
-	inventoryServerRange string
-	inventoryLocal       bool
+	inventoryOutputFile   string
+	inventoryServerRange  string
+	inventoryLocal        bool
+	inventoryFormat       string
+	inventoryFilterSite   string
+	inventoryFilterServer string
 )
 
 var inventoryCmd = &cobra.Command{
@@ -47,9 +52,12 @@ func init() {
 	inventoryCmd.AddCommand(inventoryGenerateCmd)
 
 	// Inventory specific flags
-	inventoryGenerateCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "inventory.json", "Output file for inventory JSON")
+	inventoryGenerateCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "inventory.json", "Output file for inventory")
 	inventoryGenerateCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
 	inventoryGenerateCmd.Flags().BoolVar(&inventoryLocal, "local", false, "Run locally without SSH")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryFormat, "format", "json", "Export format (json or csv)")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterSite, "filter-by-site", "", "Filter by site list (file path, pipe-delimited string, or stdin)")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterServer, "filter-by-server", "", "Filter by server list (file path, pipe-delimited string, or stdin)")
 
 	// SSH connection flags
 	inventoryGenerateCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
@@ -100,18 +108,40 @@ func runInventoryGenerate(cmd *cobra.Command, args []string) error {
 		allInventory = append(allInventory, inventory...)
 	}
 
-	// Write results to JSON file
-	jsonData, err := json.MarshalIndent(allInventory, "", "  ")
+	// Apply filters to the collected inventory
+	filteredInventory, err := applyFilters(allInventory, inventoryFilterSite, inventoryFilterServer)
 	if err != nil {
-		return fmt.Errorf("error marshaling inventory to JSON: %w", err)
+		return fmt.Errorf("error applying filters: %w", err)
 	}
 
-	if err := os.WriteFile(inventoryOutputFile, jsonData, 0644); err != nil {
-		return fmt.Errorf("error writing inventory file: %w", err)
+	// Write results to file based on the selected format
+	switch strings.ToLower(inventoryFormat) {
+	case "json":
+		// Ensure the output file has a .json extension
+		if filepath.Ext(inventoryOutputFile) != ".json" {
+			inventoryOutputFile = strings.TrimSuffix(inventoryOutputFile, filepath.Ext(inventoryOutputFile)) + ".json"
+		}
+		jsonData, err := json.MarshalIndent(filteredInventory, "", "  ")
+		if err != nil {
+			return fmt.Errorf("error marshaling inventory to JSON: %w", err)
+		}
+		if err := os.WriteFile(inventoryOutputFile, jsonData, 0644); err != nil {
+			return fmt.Errorf("error writing inventory file: %w", err)
+		}
+	case "csv":
+		// Ensure the output file has a .csv extension
+		if filepath.Ext(inventoryOutputFile) != ".csv" {
+			inventoryOutputFile = strings.TrimSuffix(inventoryOutputFile, filepath.Ext(inventoryOutputFile)) + ".csv"
+		}
+		if err := writeCSVOutput(inventoryOutputFile, filteredInventory); err != nil {
+			return fmt.Errorf("error writing CSV output: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported format: %s. Please use 'json' or 'csv'", inventoryFormat)
 	}
 
 	fmt.Printf("Inventory written to %s\n", inventoryOutputFile)
-	fmt.Printf("Total containers found: %d\n", len(allInventory))
+	fmt.Printf("Total containers found: %d\n", len(filteredInventory))
 	return nil
 }
 
@@ -201,6 +231,111 @@ func getLocalServerIP() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("could not determine public IP")
+}
+
+// normalizeURL strips scheme, 'www.' prefix, and trailing slashes for fuzzy matching.
+func normalizeURL(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "www.")
+	s = strings.TrimRight(s, "/")
+	return s
+}
+
+func applyFilters(inventory []ContainerInfo, siteFilter, serverFilter string) ([]ContainerInfo, error) {
+	siteFilterList, err := parseFilterList(siteFilter, true) // Normalize sites
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse site filter: %w", err)
+	}
+	serverFilterList, err := parseFilterList(serverFilter, false) // Do not normalize servers
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse server filter: %w", err)
+	}
+
+	if len(siteFilterList) == 0 && len(serverFilterList) == 0 {
+		return inventory, nil
+	}
+
+	var filtered []ContainerInfo
+	for _, item := range inventory {
+		// Normalize the container's WP_HOME value for comparison
+		normalizedWebsite := normalizeURL(item.Website)
+		siteMatch := len(siteFilterList) == 0 || siteFilterList[normalizedWebsite]
+
+		serverMatch := len(serverFilterList) == 0 || serverFilterList[item.Server]
+
+		if siteMatch && serverMatch {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
+func parseFilterList(filter string, normalize bool) (map[string]bool, error) {
+	list := make(map[string]bool)
+	if filter == "" {
+		return list, nil
+	}
+
+	var lines []string
+	// Check for stdin, file path, or pipe-delimited string
+	if filter == "-" {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			lines = append(lines, scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, fmt.Errorf("error reading from stdin: %w", err)
+		}
+	} else if _, err := os.Stat(filter); err == nil {
+		content, err := os.ReadFile(filter)
+		if err != nil {
+			return nil, fmt.Errorf("error reading filter file: %w", err)
+		}
+		lines = strings.Split(string(content), "\n")
+	} else {
+		lines = strings.Split(filter, "|")
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if normalize {
+			list[normalizeURL(trimmed)] = true
+		} else {
+			list[trimmed] = true
+		}
+	}
+	return list, nil
+}
+
+func writeCSVOutput(filePath string, inventory []ContainerInfo) error {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV file: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Write header
+	header := []string{"Domain", "Website", "Server", "IP"}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("failed to write CSV header: %w", err)
+	}
+
+	// Write data rows
+	for _, item := range inventory {
+		record := []string{item.Domain, item.Website, item.Server, item.IP}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write CSV record for domain %s: %w", item.Domain, err)
+		}
+	}
+	return nil
 }
 
 func getContainersViaSSH(sshClient *auth.SSHClient, hostname, serverIP string) ([]ContainerInfo, error) {
