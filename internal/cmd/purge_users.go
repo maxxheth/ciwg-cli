@@ -28,6 +28,8 @@ var (
 	purgeDisplayNames  string // NEW: comma-separated display names to target (case-insensitive exact match)
 	purgeDryRun        bool
 	purgeLargeOutputs  bool // new
+	purgeDelete        bool // NEW: actually delete matched users
+	purgeSkipConfirm   bool // NEW: skip interactive confirmation
 )
 
 var purgeUsersCmd = &cobra.Command{
@@ -55,6 +57,8 @@ func init() {
 	purgeUsersCmd.Flags().StringVar(&purgeIncludeEmails, "include-email", "", "Comma-separated emails to include (if set, only these are considered)")
 	purgeUsersCmd.Flags().BoolVar(&purgeDryRun, "dry-run", false, "Show actions without making changes")
 	purgeUsersCmd.Flags().BoolVar(&purgeLargeOutputs, "large-outputs", false, "Optimize for large outputs (stream locally, use pipes)")
+	purgeUsersCmd.Flags().BoolVar(&purgeDelete, "delete", false, "Delete matched users after reassignment (requires confirmation)")
+	purgeUsersCmd.Flags().BoolVar(&purgeSkipConfirm, "skip-confirmation", false, "Skip confirmation prompt when --delete is used")
 
 	purgeUsersCmd.Flags().StringVar(&purgeIDs, "ids", "", "Comma-separated user IDs to target")
 	purgeUsersCmd.Flags().StringVar(&purgeUsernames, "usernames", "", "Comma-separated usernames to target (case-insensitive)")
@@ -302,11 +306,53 @@ func processContainer(
 		fmt.Fprintf(os.Stderr, "    DB backup warning: %v\n", err)
 	}
 
-	// 5. Delete old users
+	// 5. Delete old users (optional)
+	// Build deletion candidate list (exclude target user)
+	var deletionCandidates []simpleUser
 	for _, u := range users {
 		if strconv.Itoa(u.ID) == newUserID {
 			continue
 		}
+		deletionCandidates = append(deletionCandidates, u)
+	}
+	if len(deletionCandidates) == 0 {
+		fmt.Println("    No users eligible for deletion.")
+		return nil
+	}
+
+	if !purgeDelete {
+		fmt.Printf("    Deletion skipped (use --delete to remove %d user(s)).\n", len(deletionCandidates))
+		return nil
+	}
+
+	if purgeDryRun {
+		fmt.Printf("    [DRY RUN] Would delete %d user(s): ", len(deletionCandidates))
+		var ids []string
+		for _, u := range deletionCandidates {
+			ids = append(ids, strconv.Itoa(u.ID))
+		}
+		fmt.Println(strings.Join(ids, ", "))
+		return nil
+	}
+
+	// Confirmation (unless skipped)
+	if !purgeSkipConfirm {
+		var ids []string
+		for _, u := range deletionCandidates {
+			ids = append(ids, strconv.Itoa(u.ID))
+		}
+		fmt.Printf("    About to DELETE %d user(s) in container %s: %s\n", len(deletionCandidates), container, strings.Join(ids, ", "))
+		fmt.Print("    Confirm delete? Type 'yes' to proceed: ")
+		reader := bufio.NewReader(os.Stdin)
+		resp, _ := reader.ReadString('\n')
+		resp = strings.TrimSpace(strings.ToLower(resp))
+		if resp != "yes" {
+			fmt.Println("    Deletion aborted by user.")
+			return nil
+		}
+	}
+
+	for _, u := range deletionCandidates {
 		if err := deleteUser(cmd, server, container, strconv.Itoa(u.ID)); err != nil {
 			fmt.Fprintf(os.Stderr, "    Delete user %d: %v\n", u.ID, err)
 		}
