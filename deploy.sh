@@ -15,18 +15,19 @@ extract_with_pax() {
     local destination="$2"
     local strip_levels="$3"
     
-    # Use pax which is more portable and part of POSIX
     if command -v pax >/dev/null 2>&1; then
         echo "Using pax for extraction..."
-        
-        # Create strip pattern for pax
-        strip_pattern=""
+        mkdir -p "$destination"
+
+        # Build a pattern like "[^/]*/" repeated strip_levels times
+        local strip_pattern=""
         for ((i=0; i<strip_levels; i++)); do
             strip_pattern="${strip_pattern}[^/]*/"
         done
-        
-        # Extract using pax with stripping
-        if gunzip -c "$tarball" | pax -r -s "|^${strip_pattern}||" -C "$destination"; then
+
+        # Use a subshell to cd into destination; pax -s rewrites the path
+        # Example: strip_level=1 -> remove leading top-level directory
+        if ( cd "$destination" && gunzip -c "$tarball" | pax -r -s "|^${strip_pattern}||" ); then
             echo "Successfully extracted with pax"
             return 0
         else
@@ -199,7 +200,7 @@ if [[ -f $tar_path ]]; then
     # Add to PATH if HOME_PATH is provided
     if [ -n "$HOME_PATH" ] && [ -f "$HOME_PATH/.bashrc" ]; then
         if ! grep -q "/usr/local/bin" "$HOME_PATH/.bashrc"; then
-            echo 'export PATH="$PATH:/usr/local/bin"' >> "$HOME_PATH/.bashrc"
+            echo "export PATH=\"\$PATH:/usr/local/bin\"" >> "$HOME_PATH/.bashrc"
             echo "Added /usr/local/bin to PATH in $HOME_PATH/.bashrc"
         else
             echo "/usr/local/bin already in PATH"
