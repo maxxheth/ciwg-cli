@@ -27,9 +27,10 @@ var (
 	purgeUsernames     string // NEW: comma-separated usernames to target (case-insensitive)
 	purgeDisplayNames  string // NEW: comma-separated display names to target (case-insensitive exact match)
 	purgeDryRun        bool
-	purgeLargeOutputs  bool // new
-	purgeDelete        bool // NEW: actually delete matched users
-	purgeSkipConfirm   bool // NEW: skip interactive confirmation
+	purgeLargeOutputs  bool   // new
+	purgeDelete        bool   // NEW: actually delete matched users
+	purgeSkipConfirm   bool   // NEW: skip interactive confirmation
+	purgeSetRole       string // NEW: set role (or level) for matched (source) users after reassignment
 )
 
 var purgeUsersCmd = &cobra.Command{
@@ -71,6 +72,8 @@ func init() {
 	purgeUsersCmd.Flags().StringP("key", "k", "", "Path to SSH private key")
 	purgeUsersCmd.Flags().BoolP("agent", "a", true, "Use SSH agent")
 	purgeUsersCmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
+
+	purgeUsersCmd.Flags().StringVar(&purgeSetRole, "set-role", "", "Set a WordPress role (name or level number) for matched source users after post reassignment (before optional deletion)")
 }
 
 func runPurgeUsers(cmd *cobra.Command, args []string) error {
@@ -298,6 +301,24 @@ func processContainer(
 		}
 		if err := reassignPosts(cmd, server, container, strconv.Itoa(u.ID), newUserID); err != nil {
 			fmt.Fprintf(os.Stderr, "    Reassign posts (%d): %v\n", u.ID, err)
+		}
+	}
+
+	// 3b. Optionally set role for matched (source) users (excluding target user)
+	if purgeSetRole != "" {
+		roleSlug, level, err := normalizeRole(purgeSetRole)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "    Role normalization error: %v\n", err)
+		} else {
+			fmt.Printf("    Setting role '%s'%s for matched users (excluding target).\n", roleSlug, level)
+			for _, u := range users {
+				if strconv.Itoa(u.ID) == newUserID {
+					continue
+				}
+				if err := setUserRole(cmd, server, container, strconv.Itoa(u.ID), roleSlug); err != nil {
+					fmt.Fprintf(os.Stderr, "      Set role user %d: %v\n", u.ID, err)
+				}
+			}
 		}
 	}
 
@@ -773,4 +794,71 @@ func shellJoin(parts []string) string {
 func readAll(r io.Reader) string {
 	b, _ := io.ReadAll(r)
 	return string(b)
+}
+
+// setUserRole assigns a role slug to a user.
+func setUserRole(cmd *cobra.Command, server, container, userID, role string) error {
+	if purgeDryRun {
+		fmt.Printf("      [DRY RUN] wp user set-role %s %s\n", userID, role)
+		return nil
+	}
+	wpCmd := []string{"user", "set-role", userID, role}
+	_, stderr, err := runWP(cmd, server, container, wpCmd)
+	if err != nil {
+		return fmt.Errorf("wp user set-role failed (stderr: %s): %w", strings.TrimSpace(stderr), err)
+	}
+	fmt.Printf("      Role set for user %s -> %s\n", userID, role)
+	return nil
+}
+
+// normalizeRole converts user input (role name or numeric level) to a role slug.
+// Returns: roleSlug, levelInfo, error
+func normalizeRole(input string) (string, string, error) {
+	in := strings.ToLower(strings.TrimSpace(input))
+	if in == "" {
+		return "", "", errors.New("empty role")
+	}
+	// Direct known slugs / names
+	roleMap := map[string]string{
+		"admin":         "administrator",
+		"administrator": "administrator",
+		"editor":        "editor",
+		"author":        "author",
+		"contributor":   "contributor",
+		"subscriber":    "subscriber",
+	}
+	if slug, ok := roleMap[in]; ok {
+		return slug, "", nil
+	}
+	// Try numeric (treat as user level)
+	if lvl, err := strconv.Atoi(in); err == nil {
+		// Map common levels to closest standard role
+		type levelRole struct {
+			min  int
+			max  int
+			slug string
+		}
+		// Simple mapping based on typical WP capabilities layout
+		var levelMapping = []levelRole{
+			{8, 10, "administrator"},
+			{7, 7, "editor"},
+			{2, 6, "author"},
+			{1, 1, "contributor"},
+			{0, 0, "subscriber"},
+		}
+		for _, lr := range levelMapping {
+			if lvl >= lr.min && lvl <= lr.max {
+				return lr.slug, fmt.Sprintf(" (from level %d)", lvl), nil
+			}
+		}
+		// Fallback
+		if lvl >= 10 {
+			return "administrator", fmt.Sprintf(" (from level %d)", lvl), nil
+		}
+		if lvl <= 0 {
+			return "subscriber", fmt.Sprintf(" (from level %d)", lvl), nil
+		}
+		return "author", fmt.Sprintf(" (from level %d)", lvl), nil
+	}
+	return "", "", fmt.Errorf("unknown role or level: %s", input)
 }
