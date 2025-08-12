@@ -23,6 +23,9 @@ var (
 	purgeExcludeEmails string
 	purgeInclude       string // new
 	purgeIncludeEmails string // new
+	purgeIDs           string // NEW: comma-separated user IDs to target
+	purgeUsernames     string // NEW: comma-separated usernames to target (case-insensitive)
+	purgeDisplayNames  string // NEW: comma-separated display names to target (case-insensitive exact match)
 	purgeDryRun        bool
 	purgeLargeOutputs  bool // new
 )
@@ -53,6 +56,10 @@ func init() {
 	purgeUsersCmd.Flags().BoolVar(&purgeDryRun, "dry-run", false, "Show actions without making changes")
 	purgeUsersCmd.Flags().BoolVar(&purgeLargeOutputs, "large-outputs", false, "Optimize for large outputs (stream locally, use pipes)")
 
+	purgeUsersCmd.Flags().StringVar(&purgeIDs, "ids", "", "Comma-separated user IDs to target")
+	purgeUsersCmd.Flags().StringVar(&purgeUsernames, "usernames", "", "Comma-separated usernames to target (case-insensitive)")
+	purgeUsersCmd.Flags().StringVar(&purgeDisplayNames, "display-names", "", "Comma-separated display names to target (case-insensitive exact match)")
+
 	// Reuse server/SSH flags style from extract-users
 	purgeUsersCmd.Flags().StringVarP(&serverRange, "server-range", "s", "local", "Server range (e.g., 'local', 'wp%d.ciwgserver.com:1-14')")
 	purgeUsersCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
@@ -78,9 +85,13 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Validation of selection method
-	if purgeEmailPattern == "" && purgeEmailListFile == "" {
-		return errors.New("must provide --email-pattern or --email-list")
+	// Validation of selection method (now broader)
+	if purgeEmailPattern == "" &&
+		purgeEmailListFile == "" &&
+		purgeIDs == "" &&
+		purgeUsernames == "" &&
+		purgeDisplayNames == "" {
+		return errors.New("must provide at least one selector: --email-pattern | --email-list | --ids | --usernames | --display-names")
 	}
 	if purgeEmailPattern != "" && purgeEmailListFile != "" {
 		return errors.New("cannot use both --email-pattern and --email-list")
@@ -112,12 +123,17 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Starting purge across %d server(s). Dry-run=%v\n", len(servers), purgeDryRun)
 
+	// Build selection sets
 	var excludeContainers = csvToSet(purgeExclude)
-	var excludeEmails = csvToSet(strings.ToLower(purgeExcludeEmails))
+	var excludeEmails = csvToLowerSet(purgeExcludeEmails)
 	var includeContainers = csvToSet(purgeInclude)
-	var includeEmails = csvToSet(strings.ToLower(purgeIncludeEmails))
+	var includeEmails = csvToLowerSet(purgeIncludeEmails)
 
-	// Preload email list if needed
+	idSet := csvToIntSet(purgeIDs)
+	usernameSet := csvToLowerSet(purgeUsernames)
+	displayNameSet := csvToLowerSet(purgeDisplayNames)
+
+	// Preload email list file (lowercased)
 	emailList := map[string]struct{}{}
 	if purgeEmailListFile != "" {
 		f, err := os.Open(purgeEmailListFile)
@@ -167,7 +183,11 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		for _, container := range filtered {
-			if err := processContainer(cmd, server, container, createArgs, emailList, excludeEmails, includeEmails); err != nil {
+			if err := processContainer(
+				cmd, server, container, createArgs,
+				emailList, excludeEmails, includeEmails,
+				idSet, usernameSet, displayNameSet,
+			); err != nil {
 				fmt.Fprintf(os.Stderr, "  Container %s error: %v\n", container, err)
 			}
 		}
@@ -177,11 +197,21 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func processContainer(cmd *cobra.Command, server, container string, createArgs []string, emailList map[string]struct{}, excludeEmails map[string]struct{}, includeEmails map[string]struct{}) error {
+func processContainer(
+	cmd *cobra.Command,
+	server, container string,
+	createArgs []string,
+	emailList map[string]struct{},
+	excludeEmails map[string]struct{},
+	includeEmails map[string]struct{},
+	idSet map[int]struct{},
+	usernameSet map[string]struct{},
+	displayNameSet map[string]struct{},
+) error {
 	fmt.Printf("  > Container: %s\n", container)
 
 	// 1. Find users
-	users, err := findTargetUsers(cmd, server, container, emailList)
+	users, err := findTargetUsers(cmd, server, container, emailList, idSet, usernameSet, displayNameSet)
 	if err != nil {
 		return fmt.Errorf("find users: %w", err)
 	}
@@ -259,67 +289,111 @@ func processContainer(cmd *cobra.Command, server, container string, createArgs [
 	return nil
 }
 
+// Expanded simpleUser with login & display name
 type simpleUser struct {
-	ID    int    `json:"ID"` // changed from string to int
-	Email string `json:"user_email"`
+	ID          int    `json:"ID"`
+	Login       string `json:"user_login"`
+	Email       string `json:"user_email"`
+	DisplayName string `json:"display_name"`
+	UserName    string `json:"user_name"`
 }
 
-func findTargetUsers(cmd *cobra.Command, server, container string, emailList map[string]struct{}) ([]simpleUser, error) {
-	var collected []simpleUser
+// Unified finder: pulls all needed fields once, filters in Go
+func findTargetUsers(
+	cmd *cobra.Command,
+	server, container string,
+	emailList map[string]struct{},
+	idSet map[int]struct{},
+	usernameSet map[string]struct{},
+	displayNameSet map[string]struct{},
+) ([]simpleUser, error) {
 
-	if purgeEmailPattern != "" {
-		// Use WP search (substr already with wildcard)
-		search := fmt.Sprintf("*%s*", purgeEmailPattern)
-		fmt.Printf("    Searching users with pattern: %s\n", search)
-		wpCmd := []string{"user", "list", "--fields=ID,user_email", "--search=" + escapeArg(search), "--format=json"}
-		fmt.Printf("    WP Command: wp %s\n", strings.Join(wpCmd, " "))
-		out, stderr, err := runWP(cmd, server, container, wpCmd)
-		if err != nil {
-			fmt.Printf("    WP command error: %v (stderr: %s)\n", err, strings.TrimSpace(stderr))
-			return nil, err
-		}
-		if err := json.Unmarshal([]byte(out), &collected); err != nil {
-			return nil, fmt.Errorf("decode search users: %w", err)
-		}
-	} else {
-		// Iterate list
-		for email := range emailList {
-			wpCmd := []string{"user", "list", "--fields=ID,user_email", "--search=" + escapeArg(email), "--format=json"}
-			fmt.Printf("    Searching user by email: %s\n", email)
-			fmt.Printf("    WP Command: wp %s\n", strings.Join(wpCmd, " "))
-			out, stderr, err := runWP(cmd, server, container, wpCmd)
-			if err != nil {
-				fmt.Printf("    WP command failed for %s: %v (stderr: %s)\n", email, err, strings.TrimSpace(stderr))
-				continue
-			}
-			fmt.Printf("    WP output for %s: %s\n", email, out)
-			var batch []simpleUser
-			if err := json.Unmarshal([]byte(out), &batch); err != nil {
-				fmt.Printf("    JSON decode skipped for %s: %v\n", email, err)
-				continue
-			}
-			for _, u := range batch {
-				if strings.EqualFold(u.Email, email) {
-					collected = append(collected, u)
-				}
-			}
-		}
+	wpCmd := []string{"user", "list", "--fields=ID,user_login,user_email,display_name", "--format=json"}
+	fmt.Printf("    Enumerating users: wp %s\n", strings.Join(wpCmd, " "))
+	out, stderr, err := runWP(cmd, server, container, wpCmd)
+	if err != nil {
+		fmt.Printf("    WP user list error: %v (stderr: %s)\n", err, strings.TrimSpace(stderr))
+		return nil, err
 	}
 
-	// Deduplicate by ID
-	seen := map[int]struct{}{}
-	res := make([]simpleUser, 0, len(collected))
-	for _, u := range collected {
-		if u.ID == 0 || u.Email == "" {
+	var all []simpleUser
+	if err := json.Unmarshal([]byte(out), &all); err != nil {
+		return nil, fmt.Errorf("decode users: %w", err)
+	}
+
+	pattern := strings.ToLower(purgeEmailPattern)
+	hasPattern := pattern != ""
+	hasEmailList := len(emailList) > 0
+	hasIDs := len(idSet) > 0
+	hasUsernames := len(usernameSet) > 0
+	hasDisplayNames := len(displayNameSet) > 0
+
+	anySelector := hasPattern || hasEmailList || hasIDs || hasUsernames || hasDisplayNames
+
+	var matched []simpleUser
+	for _, u := range all {
+		if u.ID == 0 {
 			continue
 		}
+		fmt.Printf("    Checking user %v\n", u)
+		emailL := strings.ToLower(u.Email)
+		loginL := strings.ToLower(u.Login)
+		displayL := strings.ToLower(u.DisplayName)
+		usernameL := strings.ToLower(u.UserName)
+
+		fmt.Printf("    User %d: email=%s, login=%s, display=%s, username=%s\n", u.ID, emailL, loginL, displayL, usernameL)
+
+		fmt.Printf("Pattern: %s\n", pattern)
+
+		match := false
+		if hasPattern {
+			// Substring match across email, login, display name
+			if strings.Contains(emailL, pattern) ||
+				strings.Contains(loginL, pattern) ||
+				strings.Contains(displayL, pattern) {
+				match = true
+			}
+		}
+		if !match && hasEmailList {
+			if _, ok := emailList[emailL]; ok {
+				match = true
+			}
+		}
+		if !match && hasIDs {
+			if _, ok := idSet[u.ID]; ok {
+				match = true
+			}
+		}
+		if !match && hasUsernames {
+			if _, ok := usernameSet[loginL]; ok {
+				match = true
+			}
+		}
+		if !match && hasDisplayNames {
+			if _, ok := displayNameSet[displayL]; ok {
+				match = true
+			}
+		}
+
+		if anySelector && !match {
+			continue
+		}
+		matched = append(matched, u)
+	}
+
+	// Deduplicate by ID (should already be unique)
+	seen := map[int]struct{}{}
+	outUsers := make([]simpleUser, 0, len(matched))
+	for _, u := range matched {
 		if _, ok := seen[u.ID]; ok {
 			continue
 		}
 		seen[u.ID] = struct{}{}
-		res = append(res, u)
+		outUsers = append(outUsers, u)
 	}
-	return res, nil
+
+	fmt.Printf("    Matched %d user(s) in container %s\n", len(outUsers), container)
+	return outUsers, nil
 }
 
 func ensureTargetUser(cmd *cobra.Command, server, container string, createArgs []string) (string, error) {
@@ -550,6 +624,39 @@ func csvToSet(s string) map[string]struct{} {
 	return m
 }
 
+// Convert comma-separated string of ints to set
+func csvToIntSet(s string) map[int]struct{} {
+	m := map[int]struct{}{}
+	if strings.TrimSpace(s) == "" {
+		return m
+	}
+	for _, part := range strings.Split(s, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if id, err := strconv.Atoi(p); err == nil {
+			m[id] = struct{}{}
+		}
+	}
+	return m
+}
+
+// Lowercasing string set
+func csvToLowerSet(s string) map[string]struct{} {
+	m := map[string]struct{}{}
+	if strings.TrimSpace(s) == "" {
+		return m
+	}
+	for _, part := range strings.Split(s, ",") {
+		p := strings.ToLower(strings.TrimSpace(part))
+		if p != "" {
+			m[p] = struct{}{}
+		}
+	}
+	return m
+}
+
 var reNumber = regexp.MustCompile(`\b\d+\b`)
 
 func extractFirstNumber(s string) string {
@@ -584,15 +691,15 @@ func shellJoin(parts []string) string {
 	return strings.Join(out, " ")
 }
 
-func escapeArg(s string) string {
-	if s == "" {
-		return "''"
-	}
-	if strings.ContainsAny(s, " \t\n\"'\\$`") {
-		return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
-	}
-	return s
-}
+// func escapeArg(s string) string {
+// 	if s == "" {
+// 		return "''"
+// 	}
+// 	if strings.ContainsAny(s, " \t\n\"'\\$`") {
+// 		return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+// 	}
+// 	return s
+// }
 
 // (Optional) If large outputs needed (not currently), stream helper:
 func readAll(r io.Reader) string {
