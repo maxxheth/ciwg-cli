@@ -48,7 +48,7 @@ func init() {
 
 	// Selection flags
 	purgeUsersCmd.Flags().StringVar(&purgeEmailPattern, "email-pattern", "", "Email pattern to match (substr match, e.g. '@old-domain.com')")
-	purgeUsersCmd.Flags().StringVar(&purgeEmailListFile, "email-list", "", "File with one email per line")
+	purgeUsersCmd.Flags().StringVar(&purgeEmailListFile, "email-list", "", "File with one entry per line: email, user ID, username, or display name")
 	purgeUsersCmd.Flags().StringVar(&purgeExclude, "exclude", "", "Comma-separated container names to exclude")
 	purgeUsersCmd.Flags().StringVar(&purgeExcludeEmails, "exclude-email", "", "Comma-separated emails to exclude from deletion")
 	purgeUsersCmd.Flags().StringVar(&purgeInclude, "include", "", "Comma-separated container names to include (if set, only these are processed)")
@@ -133,25 +133,51 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 	usernameSet := csvToLowerSet(purgeUsernames)
 	displayNameSet := csvToLowerSet(purgeDisplayNames)
 
-	// Preload email list file (lowercased)
+	// Preload email list file (now: emails, IDs, usernames, or display names)
 	emailList := map[string]struct{}{}
 	if purgeEmailListFile != "" {
 		f, err := os.Open(purgeEmailListFile)
 		if err != nil {
-			return fmt.Errorf("open email list: %w", err)
+			return fmt.Errorf("open selector list: %w", err)
 		}
 		defer f.Close()
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
+			raw := strings.TrimSpace(sc.Text())
+			if raw == "" || strings.HasPrefix(raw, "#") {
 				continue
 			}
-			emailList[strings.ToLower(line)] = struct{}{}
+
+			// Heuristics:
+			// 1. Pure integer -> user ID
+			// 2. Contains '@' -> email
+			// 3. Else -> treat as username and display name candidate
+			if id, errConv := strconv.Atoi(raw); errConv == nil {
+				idSet[id] = struct{}{}
+				continue
+			}
+			lc := strings.ToLower(raw)
+			if strings.Contains(raw, "@") {
+				emailList[lc] = struct{}{}
+				continue
+			}
+			// Username (login)
+			usernameSet[lc] = struct{}{}
+			// Display name (case-insensitive exact match)
+			displayNameSet[lc] = struct{}{}
 		}
 		if err := sc.Err(); err != nil {
-			return fmt.Errorf("read email list: %w", err)
+			return fmt.Errorf("read selector list: %w", err)
 		}
+	}
+
+	// If after loading list we still have no selectors (defensive)
+	if purgeEmailPattern == "" &&
+		len(emailList) == 0 &&
+		len(idSet) == 0 &&
+		len(usernameSet) == 0 &&
+		len(displayNameSet) == 0 {
+		return errors.New("no valid selectors found (emails / ids / usernames / display names)")
 	}
 
 	for si, server := range servers {
@@ -422,10 +448,6 @@ func ensureTargetUser(cmd *cobra.Command, server, container string, createArgs [
 	fmt.Printf("      Failed to create user: %s %s\n", out, errOut)
 
 	// If already exists, lookup by login (first arg)
-
-	stringsContainAlreadyRegistered := strings.Contains(out+errOut, "already registered")
-
-	fmt.Printf("stringsContainAlreadyRegistered: %v\n", stringsContainAlreadyRegistered)
 
 	if strings.Contains(out+errOut, "already registered") || err != nil {
 		login := createArgs[0]
