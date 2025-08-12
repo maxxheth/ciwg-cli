@@ -27,11 +27,14 @@ var (
 )
 
 var purgeUsersCmd = &cobra.Command{
-	Use:   "purge-users [--email-pattern=PATTERN | --email-list=FILE] [flags] -- <wp user create args>",
+	Use:   "purge-users [server] [--email-pattern=PATTERN | --email-list=FILE] [flags] -- <wp user create args>",
 	Short: "Reassign posts to a new user and delete old users across containers / servers",
 	Long: `Creates (or finds) a target user in each WordPress container, reassigns posts
 from matching users (by email pattern or list), backs up the DB, then deletes old users.
-Supports local or remote servers (via --server-range and SSH flags).`,
+Supports local or remote servers (via --server-range and SSH flags).
+You may specify a single target server as the first positional argument (before --). Example:
+  purge-users wp3.example.com --email-pattern='@old.com' -- newowner newowner@new.com --role=editor
+If no server is given, --server-range is used (default: local).`,
 	RunE:                  runPurgeUsers,
 	DisableFlagsInUseLine: true,
 }
@@ -59,13 +62,29 @@ func init() {
 }
 
 func runPurgeUsers(cmd *cobra.Command, args []string) error {
-	// Remaining args after flags are the wp user create args.
+	// Interpret optional single server positional argument.
+	// Heuristic: If there are at least 3 args and the third contains '@' (email),
+	// treat first as server, second as login, third as email (remaining as create flags).
+	// This avoids ambiguity with normal (login email) two-arg case.
+	var serverOverride string
+	if !cmd.Flags().Lookup("server-range").Changed {
+		if len(args) >= 3 &&
+			strings.Contains(args[2], "@") &&
+			!strings.Contains(args[0], "@") &&
+			!strings.Contains(args[1], "@") {
+			serverOverride = args[0]
+			args = args[1:]
+		}
+	}
+
+	// Validation of selection method
 	if purgeEmailPattern == "" && purgeEmailListFile == "" {
 		return errors.New("must provide --email-pattern or --email-list")
 	}
 	if purgeEmailPattern != "" && purgeEmailListFile != "" {
 		return errors.New("cannot use both --email-pattern and --email-list")
 	}
+	// Remaining args are wp user create args.
 	if len(args) < 2 {
 		return errors.New("must provide wp user create arguments after '--' (at least: <login> <email>)")
 	}
@@ -73,16 +92,20 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 	createArgs := args
 
 	// Build server list
-	pattern, start, end, err := parseServerRange(serverRange)
-	if err != nil {
-		return fmt.Errorf("parse server range: %w", err)
-	}
 	var servers []string
-	if serverRange == "local" {
-		servers = []string{"local"}
+	if serverOverride != "" {
+		servers = []string{serverOverride}
 	} else {
-		for i := start; i <= end; i++ {
-			servers = append(servers, fmt.Sprintf(pattern, i))
+		pattern, start, end, err := parseServerRange(serverRange)
+		if err != nil {
+			return fmt.Errorf("parse server range: %w", err)
+		}
+		if serverRange == "local" {
+			servers = []string{"local"}
+		} else {
+			for i := start; i <= end; i++ {
+				servers = append(servers, fmt.Sprintf(pattern, i))
+			}
 		}
 	}
 
