@@ -20,6 +20,8 @@ var (
 	purgeEmailListFile string
 	purgeExclude       string
 	purgeExcludeEmails string
+	purgeInclude       string // new
+	purgeIncludeEmails string // new
 	purgeDryRun        bool
 	purgeLargeOutputs  bool // new
 )
@@ -42,6 +44,8 @@ func init() {
 	purgeUsersCmd.Flags().StringVar(&purgeEmailListFile, "email-list", "", "File with one email per line")
 	purgeUsersCmd.Flags().StringVar(&purgeExclude, "exclude", "", "Comma-separated container names to exclude")
 	purgeUsersCmd.Flags().StringVar(&purgeExcludeEmails, "exclude-email", "", "Comma-separated emails to exclude from deletion")
+	purgeUsersCmd.Flags().StringVar(&purgeInclude, "include", "", "Comma-separated container names to include (if set, only these are processed)")
+	purgeUsersCmd.Flags().StringVar(&purgeIncludeEmails, "include-email", "", "Comma-separated emails to include (if set, only these are considered)")
 	purgeUsersCmd.Flags().BoolVar(&purgeDryRun, "dry-run", false, "Show actions without making changes")
 	purgeUsersCmd.Flags().BoolVar(&purgeLargeOutputs, "large-outputs", false, "Optimize for large outputs (stream locally, use pipes)")
 
@@ -86,6 +90,8 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 
 	var excludeContainers = csvToSet(purgeExclude)
 	var excludeEmails = csvToSet(strings.ToLower(purgeExcludeEmails))
+	var includeContainers = csvToSet(purgeInclude)
+	var includeEmails = csvToSet(strings.ToLower(purgeIncludeEmails))
 
 	// Preload email list if needed
 	emailList := map[string]struct{}{}
@@ -122,6 +128,11 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 		// Filter excludes
 		filtered := make([]string, 0, len(containers))
 		for _, c := range containers {
+			if len(includeContainers) > 0 {
+				if _, ok := includeContainers[c]; !ok {
+					continue
+				}
+			}
 			if _, skip := excludeContainers[c]; skip {
 				continue
 			}
@@ -132,7 +143,7 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		for _, container := range filtered {
-			if err := processContainer(cmd, server, container, createArgs, emailList, excludeEmails); err != nil {
+			if err := processContainer(cmd, server, container, createArgs, emailList, excludeEmails, includeEmails); err != nil {
 				fmt.Fprintf(os.Stderr, "  Container %s error: %v\n", container, err)
 			}
 		}
@@ -142,7 +153,7 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func processContainer(cmd *cobra.Command, server, container string, createArgs []string, emailList map[string]struct{}, excludeEmails map[string]struct{}) error {
+func processContainer(cmd *cobra.Command, server, container string, createArgs []string, emailList map[string]struct{}, excludeEmails map[string]struct{}, includeEmails map[string]struct{}) error {
 	fmt.Printf("  > Container: %s\n", container)
 
 	// 1. Find users
@@ -153,6 +164,21 @@ func processContainer(cmd *cobra.Command, server, container string, createArgs [
 	if len(users) == 0 {
 		fmt.Println("    No matching users.")
 		return nil
+	}
+
+	// Apply include-email filter first (narrowing)
+	if len(includeEmails) > 0 {
+		tmp := users[:0]
+		for _, u := range users {
+			if _, ok := includeEmails[strings.ToLower(u.Email)]; ok {
+				tmp = append(tmp, u)
+			}
+		}
+		users = tmp
+		if len(users) == 0 {
+			fmt.Println("    No users after include-email filtering.")
+			return nil
+		}
 	}
 
 	// Exclude emails
