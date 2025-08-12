@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv" // added
 	"strings"
 	"time"
 
@@ -208,7 +209,7 @@ func processContainer(cmd *cobra.Command, server, container string, createArgs [
 	filtered := users[:0]
 	for _, u := range users {
 		if _, skip := excludeEmails[strings.ToLower(u.Email)]; skip {
-			fmt.Printf("    Excluding user %s (%s)\n", u.ID, u.Email)
+			fmt.Printf("    Excluding user %d (%s)\n", u.ID, u.Email)
 			continue
 		}
 		filtered = append(filtered, u)
@@ -232,11 +233,11 @@ func processContainer(cmd *cobra.Command, server, container string, createArgs [
 
 	// 3. Reassign posts
 	for _, u := range users {
-		if u.ID == newUserID {
+		if strconv.Itoa(u.ID) == newUserID {
 			continue
 		}
-		if err := reassignPosts(cmd, server, container, u.ID, newUserID); err != nil {
-			fmt.Fprintf(os.Stderr, "    Reassign posts (%s): %v\n", u.ID, err)
+		if err := reassignPosts(cmd, server, container, strconv.Itoa(u.ID), newUserID); err != nil {
+			fmt.Fprintf(os.Stderr, "    Reassign posts (%d): %v\n", u.ID, err)
 		}
 	}
 
@@ -247,11 +248,11 @@ func processContainer(cmd *cobra.Command, server, container string, createArgs [
 
 	// 5. Delete old users
 	for _, u := range users {
-		if u.ID == newUserID {
+		if strconv.Itoa(u.ID) == newUserID {
 			continue
 		}
-		if err := deleteUser(cmd, server, container, u.ID); err != nil {
-			fmt.Fprintf(os.Stderr, "    Delete user %s: %v\n", u.ID, err)
+		if err := deleteUser(cmd, server, container, strconv.Itoa(u.ID)); err != nil {
+			fmt.Fprintf(os.Stderr, "    Delete user %d: %v\n", u.ID, err)
 		}
 	}
 
@@ -259,7 +260,7 @@ func processContainer(cmd *cobra.Command, server, container string, createArgs [
 }
 
 type simpleUser struct {
-	ID    string `json:"ID"`
+	ID    int    `json:"ID"` // changed from string to int
 	Email string `json:"user_email"`
 }
 
@@ -291,11 +292,8 @@ func findTargetUsers(cmd *cobra.Command, server, container string, emailList map
 				fmt.Printf("    WP command failed for %s: %v (stderr: %s)\n", email, err, strings.TrimSpace(stderr))
 				continue
 			}
-			var batch []simpleUser
-			// Log `out`
-
 			fmt.Printf("    WP output for %s: %s\n", email, out)
-
+			var batch []simpleUser
 			if err := json.Unmarshal([]byte(out), &batch); err != nil {
 				fmt.Printf("    JSON decode skipped for %s: %v\n", email, err)
 				continue
@@ -309,10 +307,10 @@ func findTargetUsers(cmd *cobra.Command, server, container string, emailList map
 	}
 
 	// Deduplicate by ID
-	seen := map[string]struct{}{}
+	seen := map[int]struct{}{}
 	res := make([]simpleUser, 0, len(collected))
 	for _, u := range collected {
-		if u.ID == "" || u.Email == "" {
+		if u.ID == 0 || u.Email == "" {
 			continue
 		}
 		if _, ok := seen[u.ID]; ok {
@@ -347,18 +345,30 @@ func ensureTargetUser(cmd *cobra.Command, server, container string, createArgs [
 		}
 	}
 
+	fmt.Printf("      Failed to create user: %s %s\n", out, errOut)
+
 	// If already exists, lookup by login (first arg)
-	if strings.Contains(out+errOut, "already exists") || err != nil {
+
+	stringsContainAlreadyRegistered := strings.Contains(out+errOut, "already registered")
+
+	fmt.Printf("stringsContainAlreadyRegistered: %v\n", stringsContainAlreadyRegistered)
+
+	if strings.Contains(out+errOut, "already registered") || err != nil {
 		login := createArgs[0]
-		getCmd := []string{"user", "get", login, "--field=ID", "--format=ids"}
+		getCmd := []string{"user", "get", login, "--field=ID"}
 		idOut, _, gErr := runWP(cmd, server, container, getCmd)
+
+		fmt.Printf("      Attempting to find existing user by login '%s'...\n", login)
+		fmt.Printf("      WP Command: wp %s\n", strings.Join(getCmd, " "))
 		if gErr == nil {
+			fmt.Printf("      Found existing user by login '%s': %s\n", login, idOut)
 			id := strings.TrimSpace(idOut)
 			if id != "" {
 				fmt.Printf("      Found existing user ID %s\n", id)
 				return id, nil
 			}
 		}
+		fmt.Printf("      Failed to find existing user by login '%s': %v\n", login, gErr)
 	}
 
 	return "", fmt.Errorf("failed to create or find target user: %s %s", out, errOut)
