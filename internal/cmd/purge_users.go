@@ -269,9 +269,12 @@ func findTargetUsers(cmd *cobra.Command, server, container string, emailList map
 	if purgeEmailPattern != "" {
 		// Use WP search (substr already with wildcard)
 		search := fmt.Sprintf("*%s*", purgeEmailPattern)
+		fmt.Printf("    Searching users with pattern: %s\n", search)
 		wpCmd := []string{"user", "list", "--fields=ID,user_email", "--search=" + escapeArg(search), "--format=json"}
-		out, _, err := runWP(cmd, server, container, wpCmd)
+		fmt.Printf("    WP Command: wp %s\n", strings.Join(wpCmd, " "))
+		out, stderr, err := runWP(cmd, server, container, wpCmd)
 		if err != nil {
+			fmt.Printf("    WP command error: %v (stderr: %s)\n", err, strings.TrimSpace(stderr))
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(out), &collected); err != nil {
@@ -281,12 +284,20 @@ func findTargetUsers(cmd *cobra.Command, server, container string, emailList map
 		// Iterate list
 		for email := range emailList {
 			wpCmd := []string{"user", "list", "--fields=ID,user_email", "--search=" + escapeArg(email), "--format=json"}
-			out, _, err := runWP(cmd, server, container, wpCmd)
+			fmt.Printf("    Searching user by email: %s\n", email)
+			fmt.Printf("    WP Command: wp %s\n", strings.Join(wpCmd, " "))
+			out, stderr, err := runWP(cmd, server, container, wpCmd)
 			if err != nil {
+				fmt.Printf("    WP command failed for %s: %v (stderr: %s)\n", email, err, strings.TrimSpace(stderr))
 				continue
 			}
 			var batch []simpleUser
+			// Log `out`
+
+			fmt.Printf("    WP output for %s: %s\n", email, out)
+
 			if err := json.Unmarshal([]byte(out), &batch); err != nil {
+				fmt.Printf("    JSON decode skipped for %s: %v\n", email, err)
 				continue
 			}
 			for _, u := range batch {
