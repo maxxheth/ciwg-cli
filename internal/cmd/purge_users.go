@@ -294,75 +294,71 @@ func processContainer(
 		return errors.New("could not determine target user ID")
 	}
 
-	// 3. Reassign posts
+	// Build list excluding target user
+	var sourceUsers []simpleUser
 	for _, u := range users {
 		if strconv.Itoa(u.ID) == newUserID {
 			continue
 		}
-		if err := reassignPosts(cmd, server, container, strconv.Itoa(u.ID), newUserID); err != nil {
-			fmt.Fprintf(os.Stderr, "    Reassign posts (%d): %v\n", u.ID, err)
-		}
+		sourceUsers = append(sourceUsers, u)
 	}
 
-	// 3b. Optionally set role for matched (source) users (excluding target user)
-	if purgeSetRole != "" {
-		roleSlug, level, err := normalizeRole(purgeSetRole)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "    Role normalization error: %v\n", err)
-		} else {
-			fmt.Printf("    Setting role '%s'%s for matched users (excluding target).\n", roleSlug, level)
-			for _, u := range users {
-				if strconv.Itoa(u.ID) == newUserID {
-					continue
-				}
-				if err := setUserRole(cmd, server, container, strconv.Itoa(u.ID), roleSlug); err != nil {
-					fmt.Fprintf(os.Stderr, "      Set role user %d: %v\n", u.ID, err)
+	if len(sourceUsers) == 0 {
+		fmt.Println("    No non-target users to process.")
+		return nil
+	}
+
+	// 3. If NOT deleting, perform standalone reassignment (legacy behavior preserved)
+	if !purgeDelete {
+		for _, u := range sourceUsers {
+			if err := reassignPosts(cmd, server, container, strconv.Itoa(u.ID), newUserID); err != nil {
+				fmt.Fprintf(os.Stderr, "    Reassign posts (%d): %v\n", u.ID, err)
+			}
+		}
+		// Optional role adjustment only makes sense if users remain
+		if purgeSetRole != "" {
+			roleSlug, level, err := normalizeRole(purgeSetRole)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "    Role normalization error: %v\n", err)
+			} else {
+				fmt.Printf("    Setting role '%s'%s for matched users (excluding target).\n", roleSlug, level)
+				for _, u := range sourceUsers {
+					if err := setUserRole(cmd, server, container, strconv.Itoa(u.ID), roleSlug); err != nil {
+						fmt.Fprintf(os.Stderr, "      Set role user %d: %v\n", u.ID, err)
+					}
 				}
 			}
 		}
 	}
 
-	// 4. Backup DB
+	// 4. Backup DB (now before any delete-with-reassign operations)
 	if err := backupDatabase(cmd, server, container); err != nil {
 		fmt.Fprintf(os.Stderr, "    DB backup warning: %v\n", err)
 	}
 
-	// 5. Delete old users (optional)
-	// Build deletion candidate list (exclude target user)
-	var deletionCandidates []simpleUser
-	for _, u := range users {
-		if strconv.Itoa(u.ID) == newUserID {
-			continue
-		}
-		deletionCandidates = append(deletionCandidates, u)
-	}
-	if len(deletionCandidates) == 0 {
-		fmt.Println("    No users eligible for deletion.")
-		return nil
-	}
-
+	// 5. Deletion (with reassignment inline)
 	if !purgeDelete {
-		fmt.Printf("    Deletion skipped (use --delete to remove %d user(s)).\n", len(deletionCandidates))
+		fmt.Printf("    Deletion skipped (use --delete to remove %d user(s)).\n", len(sourceUsers))
 		return nil
 	}
 
 	if purgeDryRun {
-		fmt.Printf("    [DRY RUN] Would delete %d user(s): ", len(deletionCandidates))
+		fmt.Printf("    [DRY RUN] Would delete %d user(s) with reassignment to %s: ", len(sourceUsers), newUserID)
 		var ids []string
-		for _, u := range deletionCandidates {
+		for _, u := range sourceUsers {
 			ids = append(ids, strconv.Itoa(u.ID))
 		}
 		fmt.Println(strings.Join(ids, ", "))
 		return nil
 	}
 
-	// Confirmation (unless skipped)
 	if !purgeSkipConfirm {
 		var ids []string
-		for _, u := range deletionCandidates {
+		for _, u := range sourceUsers {
 			ids = append(ids, strconv.Itoa(u.ID))
 		}
-		fmt.Printf("    About to DELETE %d user(s) in container %s: %s\n", len(deletionCandidates), container, strings.Join(ids, ", "))
+		fmt.Printf("    About to DELETE %d user(s) in container %s (reassign -> %s): %s\n",
+			len(sourceUsers), container, newUserID, strings.Join(ids, ", "))
 		fmt.Print("    Confirm delete? Type 'yes' to proceed: ")
 		reader := bufio.NewReader(os.Stdin)
 		resp, _ := reader.ReadString('\n')
@@ -373,9 +369,9 @@ func processContainer(
 		}
 	}
 
-	for _, u := range deletionCandidates {
-		if err := deleteUser(cmd, server, container, strconv.Itoa(u.ID)); err != nil {
-			fmt.Fprintf(os.Stderr, "    Delete user %d: %v\n", u.ID, err)
+	for _, u := range sourceUsers {
+		if err := deleteUserWithReassign(cmd, server, container, strconv.Itoa(u.ID), newUserID); err != nil {
+			fmt.Fprintf(os.Stderr, "    Delete/Reassign user %d: %v\n", u.ID, err)
 		}
 	}
 
@@ -607,17 +603,32 @@ func backupDatabase(cmd *cobra.Command, server, container string) error {
 	return nil
 }
 
-func deleteUser(cmd *cobra.Command, server, container, userID string) error {
+// func deleteUser(cmd *cobra.Command, server, container, userID string) error {
+// 	if purgeDryRun {
+// 		fmt.Printf("    [DRY RUN] wp user delete %s --yes\n", userID)
+// 		return nil
+// 	}
+// 	delCmd := []string{"user", "delete", userID, "--yes"}
+// 	_, _, err := runWP(cmd, server, container, delCmd)
+// 	if err == nil {
+// 		fmt.Printf("    Deleted user %s\n", userID)
+// 	}
+// 	return err
+// }
+
+// NEW: delete user while reassigning their content in one step
+func deleteUserWithReassign(cmd *cobra.Command, server, container, userID, newUserID string) error {
 	if purgeDryRun {
-		fmt.Printf("    [DRY RUN] wp user delete %s --yes\n", userID)
+		fmt.Printf("    [DRY RUN] wp user delete %s --reassign=%s --yes\n", userID, newUserID)
 		return nil
 	}
-	delCmd := []string{"user", "delete", userID, "--yes"}
-	_, _, err := runWP(cmd, server, container, delCmd)
-	if err == nil {
-		fmt.Printf("    Deleted user %s\n", userID)
+	delCmd := []string{"user", "delete", userID, "--reassign=" + newUserID, "--yes"}
+	_, stderr, err := runWP(cmd, server, container, delCmd)
+	if err != nil {
+		return fmt.Errorf("wp user delete %s --reassign=%s failed (stderr: %s): %w", userID, newUserID, strings.TrimSpace(stderr), err)
 	}
-	return err
+	fmt.Printf("    Deleted user %s (reassigned to %s)\n", userID, newUserID)
+	return nil
 }
 
 // runWP executes a wp command inside a container (local or remote).
