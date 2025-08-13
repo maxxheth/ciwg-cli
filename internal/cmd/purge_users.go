@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bufio"
+	"crypto/rand"     // added
+	"encoding/base64" // added
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,20 +19,21 @@ import (
 )
 
 var (
-	purgeEmailPattern  string
-	purgeEmailListFile string
-	purgeExclude       string
-	purgeExcludeEmails string
-	purgeInclude       string // new
-	purgeIncludeEmails string // new
-	purgeIDs           string // NEW: comma-separated user IDs to target
-	purgeUsernames     string // NEW: comma-separated usernames to target (case-insensitive)
-	purgeDisplayNames  string // NEW: comma-separated display names to target (case-insensitive exact match)
-	purgeDryRun        bool
-	purgeLargeOutputs  bool   // new
-	purgeDelete        bool   // NEW: actually delete matched users
-	purgeSkipConfirm   bool   // NEW: skip interactive confirmation
-	purgeSetRole       string // NEW: set role (or level) for matched (source) users after reassignment
+	purgeEmailPattern   string
+	purgeEmailListFile  string
+	purgeExclude        string
+	purgeExcludeEmails  string
+	purgeInclude        string // new
+	purgeIncludeEmails  string // new
+	purgeIDs            string // NEW: comma-separated user IDs to target
+	purgeUsernames      string // NEW: comma-separated usernames to target (case-insensitive)
+	purgeDisplayNames   string // NEW: comma-separated display names to target (case-insensitive exact match)
+	purgeDryRun         bool
+	purgeLargeOutputs   bool   // new
+	purgeDelete         bool   // NEW: actually delete matched users
+	purgeSkipConfirm    bool   // NEW: skip interactive confirmation
+	purgeSetRole        string // NEW: set role (or level) for matched (source) users after reassignment
+	purgeUpdatePassword string // NEW: update (or randomize) password for matched source users
 )
 
 var purgeUsersCmd = &cobra.Command{
@@ -74,6 +77,9 @@ func init() {
 	purgeUsersCmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
 
 	purgeUsersCmd.Flags().StringVar(&purgeSetRole, "set-role", "", "Set a WordPress role (name or level number) for matched source users after post reassignment (before optional deletion)")
+	purgeUsersCmd.Flags().StringVar(&purgeUpdatePassword, "update-password", "", "Update password for matched source users. If a value is provided it is used; if flag present with no value a random base64 password is generated per user.")
+	// Allow --update-password with no explicit value
+	purgeUsersCmd.Flags().Lookup("update-password").NoOptDefVal = "__AUTO__"
 }
 
 func runPurgeUsers(cmd *cobra.Command, args []string) error {
@@ -327,6 +333,26 @@ func processContainer(
 						fmt.Fprintf(os.Stderr, "      Set role user %d: %v\n", u.ID, err)
 					}
 				}
+			}
+		}
+	}
+
+	// 3b. Password updates (applies whether deleting or not)
+	if f := cmd.Flags().Lookup("update-password"); f != nil && f.Changed {
+		fmt.Println("    Updating passwords for matched source users...")
+		for _, u := range sourceUsers {
+			pass := purgeUpdatePassword
+			if pass == "" || pass == "__AUTO__" {
+				randPass, err := randomBase64Password()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "      Generate password user %d: %v\n", u.ID, err)
+					continue
+				}
+				pass = randPass
+			}
+			if err := updateUserPassword(cmd, server, container, strconv.Itoa(u.ID), pass); err != nil {
+				fmt.Fprintf(os.Stderr, "      Update password user %d: %v\n", u.ID, err)
+				continue
 			}
 		}
 	}
@@ -629,6 +655,31 @@ func deleteUserWithReassign(cmd *cobra.Command, server, container, userID, newUs
 	}
 	fmt.Printf("    Deleted user %s (reassigned to %s)\n", userID, newUserID)
 	return nil
+}
+
+// NEW: update a user's password
+func updateUserPassword(cmd *cobra.Command, server, container, userID, password string) error {
+    if purgeDryRun {
+        fmt.Printf("      [DRY RUN] wp user reset-password %s --password=<redacted> --skip-email\n", userID)
+        return nil
+    }
+    // Use reset-password to avoid triggering password change notifications.
+    wpCmd := []string{"user", "reset-password", userID, "--password=" + password, "--skip-email"}
+    _, stderr, err := runWP(cmd, server, container, wpCmd)
+    if err != nil {
+        return fmt.Errorf("wp user reset-password %s failed (stderr: %s): %w", userID, strings.TrimSpace(stderr), err)
+    }
+    fmt.Printf("      Password reset for user %s\n", userID)
+    return nil
+}
+
+// NEW: generate random base64 password
+func randomBase64Password() (string, error) {
+	b := make([]byte, 32) // 32 bytes -> 43 chars (raw, no padding)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(b), nil
 }
 
 // runWP executes a wp command inside a container (local or remote).
