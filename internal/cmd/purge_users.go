@@ -40,14 +40,16 @@ var (
 )
 
 var purgeUsersCmd = &cobra.Command{
-	Use:   "purge-users [server] [--email-pattern=PATTERN | --email-list=FILE] [flags] -- <wp user create args>",
-	Short: "Reassign posts to a new user and delete old users across containers / servers",
-	Long: `Creates (or finds) a target user in each WordPress container, reassigns posts
-from matching users (by email pattern or list), backs up the DB, then deletes old users.
-Supports local or remote servers (via --server-range and SSH flags).
-You may specify a single target server as the first positional argument (before --). Example:
-  purge-users wp3.example.com --email-pattern='@old.com' -- newowner newowner@new.com --role=editor
-If no server is given, --server-range is used (default: local).`,
+	Use:   "purge-users [server] [selectors] [flags] -- <wp user create args>",
+	Short: "Reassign posts to a target user (optionally create) and delete/modify old users",
+	Long: `Find users by selectors (email pattern/list, ids, usernames, display names).
+Optionally:
+  * Provide '--reassign-to-user=<selector>' to reuse an existing user.
+  * Provide wp user create args after '--' (e.g. '-- newlogin new@site.com --role=author') to create the target user.
+If both are omitted the command fails when a target user is required.
+Examples:
+  purge-users --email-pattern='@old.com' --reassign-to-user=admin
+  purge-users wp3.example.com --email-list=users.txt -- newowner newowner@new.com --role=editor`,
 	RunE:                  runPurgeUsers,
 	DisableFlagsInUseLine: true,
 }
@@ -99,40 +101,55 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 		return errors.New("must provide at least one selector: --email-pattern | --email-list | --ids | --usernames | --display-names")
 	}
 
-	// Target user mode validation
-	if !purgeCreateUser && purgeReassignToUser == "" {
-		return errors.New("must specify either --create-user (with create args) or --reassign-to-user")
-	}
-	if purgeCreateUser && purgeReassignToUser != "" {
-		return errors.New("cannot use both --create-user and --reassign-to-user")
-	}
+	// Remove old target user mode validation; both creation and reassign are optional now.
 
 	var serverOverride string
 	var createArgs []string
 
-	if purgeCreateUser {
-		// Original heuristic for single server positional argument.
-		if len(args) < 2 {
-			return errors.New("when using --create-user you must provide wp user create args after '--' (at least: <login> <email>)")
+	// Argument heuristic:
+	// Cases:
+	//   serverOverride only:                [server]
+	//   create (no server):                 [login email ...]
+	//   serverOverride + create:            [server login email ...]
+	// Determine index of first email-looking arg (contains '@').
+	emailIdx := -1
+	for i, a := range args {
+		if strings.Contains(a, "@") {
+			emailIdx = i
+			break
 		}
-		if !cmd.Flags().Lookup("server-range").Changed {
-			if len(args) >= 3 &&
-				strings.Contains(args[2], "@") &&
-				!strings.Contains(args[0], "@") &&
-				!strings.Contains(args[1], "@") {
-				serverOverride = args[0]
-				args = args[1:]
-			}
-		}
+	}
+
+	switch {
+	case len(args) == 0:
+		// nothing (server-range will drive)
+	case len(args) == 1 && emailIdx == -1:
+		// single non-email -> server override
+		serverOverride = args[0]
+	case emailIdx == 1:
+		// login email ... (create only)
 		createArgs = args
-	} else {
-		// Not creating a user: optional single positional server override allowed.
-		if len(args) > 1 {
-			return errors.New("unexpected extra positional arguments; supply at most one server when not using --create-user")
-		}
-		if len(args) == 1 {
-			serverOverride = args[0]
-		}
+	case emailIdx == 2:
+		// server login email ...
+		serverOverride = args[0]
+		createArgs = args[1:]
+	case emailIdx == -1:
+		// Multiple args but no email -> ambiguous / invalid
+		return errors.New("could not detect create args (no email found); supply login email after '--' or reduce to a single server arg")
+	case emailIdx == 0:
+		return errors.New("first create arg cannot be an email; expected <login> <email>")
+	default:
+		// email at position >2 unsupported (would be ambiguous)
+		return errors.New("unexpected argument layout; email must appear as second (login email) or third (server login email) positional")
+	}
+
+	if len(createArgs) > 0 && len(createArgs) < 2 {
+		return errors.New("insufficient create args (need at least <login> <email>)")
+	}
+
+	// Disallow conflicting specification
+	if len(createArgs) > 0 && purgeReassignToUser != "" {
+		return errors.New("cannot use both create args (after '--') and --reassign-to-user")
 	}
 
 	// Build server list
@@ -310,13 +327,15 @@ func processContainer(
 
 	fmt.Printf("    Users to process: %d\n", len(users))
 
-	// 2. Obtain target user (create or resolve)
+	// 2. Obtain target user (create or resolve). Both optional until here.
 	var newUserID string
 	var err error
-	if purgeCreateUser {
+	if len(createArgs) > 0 {
 		newUserID, err = ensureTargetUser(cmd, server, container, createArgs)
-	} else {
+	} else if purgeReassignToUser != "" {
 		newUserID, err = resolveExistingTargetUser(cmd, server, container, purgeReassignToUser)
+	} else {
+		return errors.New("no target user specified: provide --reassign-to-user or wp user create args after '--'")
 	}
 	if err != nil {
 		return fmt.Errorf("determine target user: %w", err)
