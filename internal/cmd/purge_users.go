@@ -659,18 +659,18 @@ func deleteUserWithReassign(cmd *cobra.Command, server, container, userID, newUs
 
 // NEW: update a user's password
 func updateUserPassword(cmd *cobra.Command, server, container, userID, password string) error {
-    if purgeDryRun {
-        fmt.Printf("      [DRY RUN] wp user reset-password %s --password=<redacted> --skip-email\n", userID)
-        return nil
-    }
-    // Use reset-password to avoid triggering password change notifications.
-    wpCmd := []string{"user", "reset-password", userID, "--password=" + password, "--skip-email"}
-    _, stderr, err := runWP(cmd, server, container, wpCmd)
-    if err != nil {
-        return fmt.Errorf("wp user reset-password %s failed (stderr: %s): %w", userID, strings.TrimSpace(stderr), err)
-    }
-    fmt.Printf("      Password reset for user %s\n", userID)
-    return nil
+	if purgeDryRun {
+		fmt.Printf("      [DRY RUN] wp user reset-password %s --password=<redacted> --skip-email\n", userID)
+		return nil
+	}
+	// Use reset-password to avoid triggering password change notifications.
+	wpCmd := []string{"user", "reset-password", userID, "--password=" + password, "--skip-email"}
+	_, stderr, err := runWP(cmd, server, container, wpCmd)
+	if err != nil {
+		return fmt.Errorf("wp user reset-password %s failed (stderr: %s): %w", userID, strings.TrimSpace(stderr), err)
+	}
+	fmt.Printf("      Password reset for user %s\n", userID)
+	return nil
 }
 
 // NEW: generate random base64 password
