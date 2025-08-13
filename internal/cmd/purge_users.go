@@ -327,30 +327,37 @@ func processContainer(
 
 	fmt.Printf("    Users to process: %d\n", len(users))
 
-	// 2. Obtain target user (create or resolve). Both optional until here.
-	var newUserID string
-	var err error
+	// 2. Obtain target user only if specified (creation args or --reassign-to-user)
+	var (
+		newUserID string
+		err       error
+		hasTarget bool
+	)
 	if len(createArgs) > 0 {
 		newUserID, err = ensureTargetUser(cmd, server, container, createArgs)
+		hasTarget = true
 	} else if purgeReassignToUser != "" {
 		newUserID, err = resolveExistingTargetUser(cmd, server, container, purgeReassignToUser)
-	} else {
-		return errors.New("no target user specified: provide --reassign-to-user or wp user create args after '--'")
+		hasTarget = true
 	}
 	if err != nil {
 		return fmt.Errorf("determine target user: %w", err)
 	}
-	if newUserID == "" {
+	if hasTarget && newUserID == "" {
 		return errors.New("could not determine target user ID")
 	}
 
-	// Build list excluding target user
-	var sourceUsers []simpleUser
-	for _, u := range users {
-		if strconv.Itoa(u.ID) == newUserID {
-			continue
+	// Build list excluding target user if we have one
+	sourceUsers := users
+	if hasTarget {
+		src := sourceUsers[:0]
+		for _, u := range users {
+			if strconv.Itoa(u.ID) == newUserID {
+				continue
+			}
+			src = append(src, u)
 		}
-		sourceUsers = append(sourceUsers, u)
+		sourceUsers = src
 	}
 
 	if len(sourceUsers) == 0 {
@@ -358,30 +365,37 @@ func processContainer(
 		return nil
 	}
 
-	// 3. If NOT deleting, perform standalone reassignment (legacy behavior preserved)
-	if !purgeDelete {
+	// 3. Post reassignment only if a target user is present AND we are not deleting (legacy behavior)
+	if hasTarget && !purgeDelete {
 		for _, u := range sourceUsers {
 			if err := reassignPosts(cmd, server, container, strconv.Itoa(u.ID), newUserID); err != nil {
 				fmt.Fprintf(os.Stderr, "    Reassign posts (%d): %v\n", u.ID, err)
 			}
 		}
-		// Optional role adjustment only makes sense if users remain
-		if purgeSetRole != "" {
-			roleSlug, level, err := normalizeRole(purgeSetRole)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "    Role normalization error: %v\n", err)
-			} else {
-				fmt.Printf("    Setting role '%s'%s for matched users (excluding target).\n", roleSlug, level)
-				for _, u := range sourceUsers {
-					if err := setUserRole(cmd, server, container, strconv.Itoa(u.ID), roleSlug); err != nil {
-						fmt.Fprintf(os.Stderr, "      Set role user %d: %v\n", u.ID, err)
+	}
+
+	// 3a. Role adjustment (allowed even without target user)
+	if purgeSetRole != "" && !purgeDelete {
+		roleSlug, level, err := normalizeRole(purgeSetRole)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "    Role normalization error: %v\n", err)
+		} else {
+			fmt.Printf("    Setting role '%s'%s for matched users%s.\n",
+				roleSlug, level, func() string {
+					if hasTarget {
+						return " (excluding target)"
 					}
+					return ""
+				}())
+			for _, u := range sourceUsers {
+				if err := setUserRole(cmd, server, container, strconv.Itoa(u.ID), roleSlug); err != nil {
+					fmt.Fprintf(os.Stderr, "      Set role user %d: %v\n", u.ID, err)
 				}
 			}
 		}
 	}
 
-	// 3b. Password updates (applies whether deleting or not)
+	// 3b. Password updates (applies whether deleting or not; does not require target)
 	if f := cmd.Flags().Lookup("update-password"); f != nil && f.Changed {
 		fmt.Println("    Updating passwords for matched source users...")
 		for _, u := range sourceUsers {
@@ -401,7 +415,7 @@ func processContainer(
 		}
 	}
 
-	// 3c. Email scrambling / replacement
+	// 3c. Email scrambling / replacement (does not require target)
 	if f := cmd.Flags().Lookup("scramble-email-addrs"); f != nil && f.Changed && purgeScrambleEmail != "" {
 		spec, err := parseScrambleEmailSpec(purgeScrambleEmail)
 		if err != nil {
@@ -424,15 +438,24 @@ func processContainer(
 		}
 	}
 
-	// 4. Backup DB (now before any delete-with-reassign operations)
-	if err := backupDatabase(cmd, server, container); err != nil {
-		fmt.Fprintf(os.Stderr, "    DB backup warning: %v\n", err)
+	// 4. Backup DB before any delete operations
+	if purgeDelete {
+		if err := backupDatabase(cmd, server, container); err != nil {
+			fmt.Fprintf(os.Stderr, "    DB backup warning: %v\n", err)
+		}
 	}
 
-	// 5. Deletion (with reassignment inline)
+	// 5. Deletion (requires target user for reassignment)
 	if !purgeDelete {
-		fmt.Printf("    Deletion skipped (use --delete to remove %d user(s)).\n", len(sourceUsers))
+		if !hasTarget {
+			fmt.Println("    No target user specified; reassignment skipped (no deletion requested).")
+		} else {
+			fmt.Printf("    Deletion skipped (use --delete to remove %d user(s)).\n", len(sourceUsers))
+		}
 		return nil
+	}
+	if purgeDelete && !hasTarget {
+		return errors.New("deletion requested but no target user provided (need --reassign-to-user or create args)")
 	}
 
 	if purgeDryRun {
