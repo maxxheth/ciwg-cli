@@ -34,6 +34,7 @@ var (
 	purgeSkipConfirm    bool   // NEW: skip interactive confirmation
 	purgeSetRole        string // NEW: set role (or level) for matched (source) users after reassignment
 	purgeUpdatePassword string // NEW: update (or randomize) password for matched source users
+	purgeScrambleEmail  string // NEW: scramble or replace user email addresses
 )
 
 var purgeUsersCmd = &cobra.Command{
@@ -80,6 +81,8 @@ func init() {
 	purgeUsersCmd.Flags().StringVar(&purgeUpdatePassword, "update-password", "", "Update password for matched source users. If a value is provided it is used; if flag present with no value a random base64 password is generated per user.")
 	// Allow --update-password with no explicit value
 	purgeUsersCmd.Flags().Lookup("update-password").NoOptDefVal = "__AUTO__"
+
+	purgeUsersCmd.Flags().StringVar(&purgeScrambleEmail, "scramble-email-addrs", "", "Scramble or replace source user email addresses. Forms: inject-hash-before (ihb), inject-hash-after (iha), combine with '|', or replace-with=<email>")
 }
 
 func runPurgeUsers(cmd *cobra.Command, args []string) error {
@@ -353,6 +356,29 @@ func processContainer(
 			if err := updateUserPassword(cmd, server, container, strconv.Itoa(u.ID), pass); err != nil {
 				fmt.Fprintf(os.Stderr, "      Update password user %d: %v\n", u.ID, err)
 				continue
+			}
+		}
+	}
+
+	// 3c. Email scrambling / replacement
+	if f := cmd.Flags().Lookup("scramble-email-addrs"); f != nil && f.Changed && purgeScrambleEmail != "" {
+		spec, err := parseScrambleEmailSpec(purgeScrambleEmail)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "    Scramble spec error: %v\n", err)
+		} else {
+			fmt.Println("    Scrambling/replacing emails for matched source users...")
+			for _, u := range sourceUsers {
+				newEmail, err := scrambleEmail(u.Email, spec)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "      User %d email scramble error: %v\n", u.ID, err)
+					continue
+				}
+				if strings.EqualFold(newEmail, u.Email) {
+					continue
+				}
+				if err := updateUserEmail(cmd, server, container, strconv.Itoa(u.ID), newEmail); err != nil {
+					fmt.Fprintf(os.Stderr, "      Update email user %d: %v\n", u.ID, err)
+				}
 			}
 		}
 	}
@@ -673,13 +699,127 @@ func updateUserPassword(cmd *cobra.Command, server, container, userID, password 
 	return nil
 }
 
-// NEW: generate random base64 password
-func randomBase64Password() (string, error) {
-	b := make([]byte, 32) // 32 bytes -> 43 chars (raw, no padding)
+// NEW: update a user's email
+func updateUserEmail(cmd *cobra.Command, server, container, userID, email string) error {
+	if purgeDryRun {
+		fmt.Printf("      [DRY RUN] wp user update %s --user_email=%s\n", userID, email)
+		return nil
+	}
+	wpCmd := []string{"user", "update", userID, "--user_email=" + email}
+	_, stderr, err := runWP(cmd, server, container, wpCmd)
+	if err != nil {
+		return fmt.Errorf("wp user update %s email failed (stderr: %s): %w", userID, strings.TrimSpace(stderr), err)
+	}
+	fmt.Printf("      Email updated for user %s -> %s\n", userID, email)
+	return nil
+}
+
+// NEW: scramble spec
+type scrambleSpec struct {
+	replace      string
+	injectBefore bool
+	injectAfter  bool
+}
+
+var reEmailSimple = regexp.MustCompile(`^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$`)
+
+// Parse --scramble-email-addrs value
+func parseScrambleEmailSpec(val string) (scrambleSpec, error) {
+	val = strings.TrimSpace(val)
+	var spec scrambleSpec
+	if val == "" {
+		return spec, errors.New("empty scramble spec")
+	}
+	if strings.HasPrefix(strings.ToLower(val), "replace-with=") {
+		raw := strings.TrimSpace(val[len("replace-with="):])
+		if !reEmailSimple.MatchString(raw) {
+			return spec, fmt.Errorf("invalid replacement email: %s", raw)
+		}
+		spec.replace = raw
+		return spec, nil
+	}
+	toks := strings.Split(val, "|")
+	for _, t := range toks {
+		t = strings.ToLower(strings.TrimSpace(t))
+		switch t {
+		case "inject-hash-before", "ihb":
+			spec.injectBefore = true
+		case "inject-hash-after", "iha":
+			spec.injectAfter = true
+		case "":
+			// skip
+		default:
+			return spec, fmt.Errorf("unknown scramble token: %s", t)
+		}
+	}
+	if !spec.injectBefore && !spec.injectAfter {
+		return spec, errors.New("no valid scramble actions found (expected ihb/iha or replace-with=...)")
+	}
+	return spec, nil
+}
+
+// NEW: perform email scrambling per spec
+func scrambleEmail(original string, spec scrambleSpec) (string, error) {
+	if spec.replace != "" {
+		return spec.replace, nil
+	}
+	at := strings.IndexByte(original, '@')
+	if at <= 0 || at == len(original)-1 {
+		return "", fmt.Errorf("not a normal email: %s", original)
+	}
+	local := original[:at]
+	domain := original[at+1:]
+	modLocal := local
+	modDomain := domain
+
+	if spec.injectBefore {
+		// Find first non-alphanumeric boundary
+		var boundary = -1
+		for i, r := range local {
+			if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+				boundary = i
+				break
+			}
+		}
+		randSeg, _ := randomBase64Segment(16)
+		if boundary >= 0 && boundary < len(local) {
+			modLocal = local[:boundary] + randSeg + local[boundary:]
+		} else {
+			modLocal = local + randSeg
+		}
+	}
+
+	if spec.injectAfter {
+		randSeg, _ := randomBase64Segment(10)
+		// Insert as new left-most label
+		modDomain = randSeg + "." + domain
+	}
+
+	return modLocal + "@" + modDomain, nil
+}
+
+// NEW: random base64 (sanitized) segment
+func randomBase64Segment(n int) (string, error) {
+	if n <= 0 {
+		n = 12
+	}
+	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return base64.RawStdEncoding.EncodeToString(b), nil
+	s := base64.StdEncoding.EncodeToString(b)
+	// Remove padding and non-alphanumerics for email safety
+	var sb strings.Builder
+	for _, r := range s {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
+	}
+	out := sb.String()
+	if len(out) > 24 {
+		out = out[:24]
+	}
+	return out, nil
 }
 
 // runWP executes a wp command inside a container (local or remote).
@@ -923,4 +1063,25 @@ func normalizeRole(input string) (string, string, error) {
 		return "author", fmt.Sprintf(" (from level %d)", lvl), nil
 	}
 	return "", "", fmt.Errorf("unknown role or level: %s", input)
+}
+
+func randomBase64Password() (string, error) {
+	// Generate a random base64 string and sanitize it for password use
+	b := make([]byte, 16) // 16 bytes = 24 base64 characters
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	s := base64.StdEncoding.EncodeToString(b)
+	// Remove padding and non-alphanumerics for password safety
+	var sb strings.Builder
+	for _, r := range s {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			sb.WriteRune(r)
+		}
+	}
+	out := sb.String()
+	if len(out) < 8 {
+		return "", errors.New("generated password too short")
+	}
+	return out, nil
 }
