@@ -35,6 +35,8 @@ var (
 	purgeSetRole        string // NEW: set role (or level) for matched (source) users after reassignment
 	purgeUpdatePassword string // NEW: update (or randomize) password for matched source users
 	purgeScrambleEmail  string // NEW: scramble or replace user email addresses
+	purgeReassignToUser string // NEW: existing user selector for reassignment (ID, login, email, or display name)
+	purgeCreateUser     bool   // NEW: whether to create the target user (requires create args)
 )
 
 var purgeUsersCmd = &cobra.Command{
@@ -83,24 +85,11 @@ func init() {
 	purgeUsersCmd.Flags().Lookup("update-password").NoOptDefVal = "__AUTO__"
 
 	purgeUsersCmd.Flags().StringVar(&purgeScrambleEmail, "scramble-email-addrs", "", "Scramble or replace source user email addresses. Forms: inject-hash-before (ihb), inject-hash-after (iha), combine with '|', or replace-with=<email>")
+	purgeUsersCmd.Flags().StringVar(&purgeReassignToUser, "reassign-to-user", "", "Existing user (ID, login, email, or display name) to receive reassigned posts")
+	purgeUsersCmd.Flags().BoolVar(&purgeCreateUser, "create-user", false, "Create the target user (provide wp user create args after '--')")
 }
 
 func runPurgeUsers(cmd *cobra.Command, args []string) error {
-	// Interpret optional single server positional argument.
-	// Heuristic: If there are at least 3 args and the third contains '@' (email),
-	// treat first as server, second as login, third as email (remaining as create flags).
-	// This avoids ambiguity with normal (login email) two-arg case.
-	var serverOverride string
-	if !cmd.Flags().Lookup("server-range").Changed {
-		if len(args) >= 3 &&
-			strings.Contains(args[2], "@") &&
-			!strings.Contains(args[0], "@") &&
-			!strings.Contains(args[1], "@") {
-			serverOverride = args[0]
-			args = args[1:]
-		}
-	}
-
 	// Validation of selection method (now broader)
 	if purgeEmailPattern == "" &&
 		purgeEmailListFile == "" &&
@@ -109,15 +98,42 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 		purgeDisplayNames == "" {
 		return errors.New("must provide at least one selector: --email-pattern | --email-list | --ids | --usernames | --display-names")
 	}
-	if purgeEmailPattern != "" && purgeEmailListFile != "" {
-		return errors.New("cannot use both --email-pattern and --email-list")
+
+	// Target user mode validation
+	if !purgeCreateUser && purgeReassignToUser == "" {
+		return errors.New("must specify either --create-user (with create args) or --reassign-to-user")
 	}
-	// Remaining args are wp user create args.
-	if len(args) < 2 {
-		return errors.New("must provide wp user create arguments after '--' (at least: <login> <email>)")
+	if purgeCreateUser && purgeReassignToUser != "" {
+		return errors.New("cannot use both --create-user and --reassign-to-user")
 	}
 
-	createArgs := args
+	var serverOverride string
+	var createArgs []string
+
+	if purgeCreateUser {
+		// Original heuristic for single server positional argument.
+		if len(args) < 2 {
+			return errors.New("when using --create-user you must provide wp user create args after '--' (at least: <login> <email>)")
+		}
+		if !cmd.Flags().Lookup("server-range").Changed {
+			if len(args) >= 3 &&
+				strings.Contains(args[2], "@") &&
+				!strings.Contains(args[0], "@") &&
+				!strings.Contains(args[1], "@") {
+				serverOverride = args[0]
+				args = args[1:]
+			}
+		}
+		createArgs = args
+	} else {
+		// Not creating a user: optional single positional server override allowed.
+		if len(args) > 1 {
+			return errors.New("unexpected extra positional arguments; supply at most one server when not using --create-user")
+		}
+		if len(args) == 1 {
+			serverOverride = args[0]
+		}
+	}
 
 	// Build server list
 	var servers []string
@@ -253,9 +269,9 @@ func processContainer(
 	fmt.Printf("  > Container: %s\n", container)
 
 	// 1. Find users
-	users, err := findTargetUsers(cmd, server, container, emailList, idSet, usernameSet, displayNameSet)
-	if err != nil {
-		return fmt.Errorf("find users: %w", err)
+	users, usersErr := findTargetUsers(cmd, server, container, emailList, idSet, usernameSet, displayNameSet)
+	if usersErr != nil {
+		return fmt.Errorf("find users: %w", usersErr)
 	}
 	if len(users) == 0 {
 		fmt.Println("    No matching users.")
@@ -294,10 +310,16 @@ func processContainer(
 
 	fmt.Printf("    Users to process: %d\n", len(users))
 
-	// 2. Create (or get) target user
-	newUserID, err := ensureTargetUser(cmd, server, container, createArgs)
+	// 2. Obtain target user (create or resolve)
+	var newUserID string
+	var err error
+	if purgeCreateUser {
+		newUserID, err = ensureTargetUser(cmd, server, container, createArgs)
+	} else {
+		newUserID, err = resolveExistingTargetUser(cmd, server, container, purgeReassignToUser)
+	}
 	if err != nil {
-		return fmt.Errorf("create target user: %w", err)
+		return fmt.Errorf("determine target user: %w", err)
 	}
 	if newUserID == "" {
 		return errors.New("could not determine target user ID")
@@ -1084,4 +1106,59 @@ func randomBase64Password() (string, error) {
 		return "", errors.New("generated password too short")
 	}
 	return out, nil
+}
+
+// NEW: resolve existing target user by selector (ID, login, email, or display name)
+func resolveExistingTargetUser(cmd *cobra.Command, server, container, selector string) (string, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return "", errors.New("empty target user selector")
+	}
+	fmt.Printf("    Resolving target user '%s'...\n", selector)
+
+	// Fast path: numeric ID
+	if _, err := strconv.Atoi(selector); err == nil {
+		idOut, stderr, err := runWP(cmd, server, container, []string{"user", "get", selector, "--field=ID"})
+		if err != nil {
+			return "", fmt.Errorf("verify user ID %s failed (stderr: %s): %w", selector, strings.TrimSpace(stderr), err)
+		}
+		return strings.TrimSpace(idOut), nil
+	}
+
+	// If looks like email or login (wp user get supports login/email)
+	if strings.Contains(selector, "@") || selector != "" {
+		idOut, stderr, err := runWP(cmd, server, container, []string{"user", "get", selector, "--field=ID"})
+		if err == nil && strings.TrimSpace(idOut) != "" {
+			return strings.TrimSpace(idOut), nil
+		}
+
+		if err != nil {
+			return "", fmt.Errorf("get user by login/email '%s' failed (stderr: %s): %w", selector, strings.TrimSpace(stderr), err)
+		}
+
+		// Fall through to display name search if that failed
+	}
+
+	// Display name fallback (case-insensitive exact)
+	listCmd := []string{"user", "list", "--fields=ID,display_name,user_login,user_email", "--format=json"}
+	out, stderr, err := runWP(cmd, server, container, listCmd)
+	if err != nil {
+		return "", fmt.Errorf("list users for display name search failed (stderr: %s): %w", strings.TrimSpace(stderr), err)
+	}
+	var users []struct {
+		ID          int    `json:"ID"`
+		DisplayName string `json:"display_name"`
+		Login       string `json:"user_login"`
+		Email       string `json:"user_email"`
+	}
+	if jErr := json.Unmarshal([]byte(out), &users); jErr != nil {
+		return "", fmt.Errorf("decode users (display search): %w", jErr)
+	}
+	targetLower := strings.ToLower(selector)
+	for _, u := range users {
+		if strings.ToLower(u.DisplayName) == targetLower {
+			return strconv.Itoa(u.ID), nil
+		}
+	}
+	return "", fmt.Errorf("could not resolve target user '%s' in container %s", selector, container)
 }
