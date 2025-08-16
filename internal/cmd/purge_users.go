@@ -399,16 +399,16 @@ func processContainer(
 	if f := cmd.Flags().Lookup("update-password"); f != nil && f.Changed {
 		fmt.Println("    Updating passwords for matched source users...")
 		for _, u := range sourceUsers {
-			pass := purgeUpdatePassword
-			if pass == "" || pass == "__AUTO__" {
-				randPass, err := randomBase64Password()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "      Generate password user %d: %v\n", u.ID, err)
-					continue
-				}
-				pass = randPass
-			}
-			if err := updateUserPassword(cmd, server, container, strconv.Itoa(u.ID), pass); err != nil {
+			// pass := purgeUpdatePassword
+			// if pass == "" || pass == "__AUTO__" {
+			// 	randPass, err := randomBase64Password()
+			// 	if err != nil {
+			// 		fmt.Fprintf(os.Stderr, "      Generate password user %d: %v\n", u.ID, err)
+			// 		continue
+			// 	}
+			// 	pass = randPass
+			// }
+			if err := updateUserPassword(cmd, server, container, strconv.Itoa(u.ID)); err != nil {
 				fmt.Fprintf(os.Stderr, "      Update password user %d: %v\n", u.ID, err)
 				continue
 			}
@@ -748,7 +748,7 @@ func deleteUserWithReassign(cmd *cobra.Command, server, container, userID, newUs
 }
 
 // NEW: update a user's password
-func updateUserPassword(cmd *cobra.Command, server, container, userID, password string) error {
+func updateUserPassword(cmd *cobra.Command, server, container, userID string) error {
 	if purgeDryRun {
 		fmt.Printf("      [DRY RUN] wp user reset-password %s --skip-email\n", userID)
 		return nil
@@ -1129,26 +1129,26 @@ func normalizeRole(input string) (string, string, error) {
 	return "", "", fmt.Errorf("unknown role or level: %s", input)
 }
 
-func randomBase64Password() (string, error) {
-	// Generate a random base64 string and sanitize it for password use
-	b := make([]byte, 16) // 16 bytes = 24 base64 characters
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	s := base64.StdEncoding.EncodeToString(b)
-	// Remove padding and non-alphanumerics for password safety
-	var sb strings.Builder
-	for _, r := range s {
-		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
-			sb.WriteRune(r)
-		}
-	}
-	out := sb.String()
-	if len(out) < 8 {
-		return "", errors.New("generated password too short")
-	}
-	return out, nil
-}
+// func randomBase64Password() (string, error) {
+// 	// Generate a random base64 string and sanitize it for password use
+// 	b := make([]byte, 16) // 16 bytes = 24 base64 characters
+// 	if _, err := rand.Read(b); err != nil {
+// 		return "", err
+// 	}
+// 	s := base64.StdEncoding.EncodeToString(b)
+// 	// Remove padding and non-alphanumerics for password safety
+// 	var sb strings.Builder
+// 	for _, r := range s {
+// 		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+// 			sb.WriteRune(r)
+// 		}
+// 	}
+// 	out := sb.String()
+// 	if len(out) < 8 {
+// 		return "", errors.New("generated password too short")
+// 	}
+// 	return out, nil
+// }
 
 // NEW: resolve existing target user by selector (ID, login, email, or display name)
 func resolveExistingTargetUser(cmd *cobra.Command, server, container, selector string) (string, error) {
