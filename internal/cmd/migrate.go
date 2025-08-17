@@ -88,8 +88,12 @@ func newMigrateCmd() *cobra.Command {
 		// new flag: activate the migrated site on the target
 		activateMigrated bool
 
-		// new flag: import exported SQL on target after migration
+		// import SQL on the target after migration
 		importSQL bool
+
+		// local relay flags
+		localRelay     bool
+		localRelayPath string
 	)
 
 	cmd := &cobra.Command{
@@ -233,6 +237,10 @@ Notes:
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would SSH to %s and run: cd %s && docker compose up -d\n", tgtHostPart, siteDir)
 						wpMgrDir := filepath.Join(targetPath, "wordpress-manager")
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would SSH to %s and run: cd %s && docker compose down && docker compose up -d\n", tgtHostPart, wpMgrDir)
+					}
+					// import-sql dry-run info (moved here so it actually prints)
+					if importSQL {
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would import latest SQL file for %s on target %s\n", domain, tgtHostPart)
 					}
 					if archiveDir != "" {
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would archive source directory of %s to %s (ts:%v, compress:%v:%s)\n", domain, archiveDir, archiveWithTimestamp, compressArchive, archiveCompression)
@@ -400,7 +408,8 @@ Notes:
 				}
 
 				// Attempt DB import on target (remote or local)
-				if importSQL {
+				// Run only when not in dry-run (the dry-run message is printed above)
+				if importSQL && !dryRunFlag {
 					sqlNameCmd := fmt.Sprintf("ls -1t %s/wp-content/*.sql 2>/dev/null | head -n1", filepath.Join(targetPath, domain))
 					if isLocal(tgtHostPart) {
 						// local import
@@ -508,6 +517,10 @@ Notes:
 
 	// import SQL flag
 	cmd.Flags().BoolVar(&importSQL, "import-sql", false, "After migration, detect latest exported .sql in wp-content and import it into WordPress on the target")
+
+	// local-relay flags
+	cmd.Flags().BoolVar(&localRelay, "local-relay", false, "Stage the site locally first (rsync -> local-relay-path) then rsync from relay to target")
+	cmd.Flags().StringVar(&localRelayPath, "local-relay-path", "/tmp/ciwg_migrate", "Path for local relay staging (used when --local-relay is set)")
 
 	return cmd
 }
