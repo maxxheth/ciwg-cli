@@ -84,6 +84,12 @@ func newMigrateCmd() *cobra.Command {
 
 		cfEmail string
 		cfKey   string
+
+		// new flag: activate the migrated site on the target
+		activateMigrated bool
+
+		// new flag: import exported SQL on target after migration
+		importSQL bool
 	)
 
 	cmd := &cobra.Command{
@@ -221,6 +227,13 @@ Notes:
 					if cfEmail != "" && cfKey != "" && newIP != "" {
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would update Cloudflare A record for %s -> %s\n", domain, newIP)
 					}
+					// activation dry-run info
+					if activateMigrated {
+						siteDir := filepath.Join(targetPath, domain)
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would SSH to %s and run: cd %s && docker compose up -d\n", tgtHostPart, siteDir)
+						wpMgrDir := filepath.Join(targetPath, "wordpress-manager")
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would SSH to %s and run: cd %s && docker compose down && docker compose up -d\n", tgtHostPart, wpMgrDir)
+					}
 					if archiveDir != "" {
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would archive source directory of %s to %s (ts:%v, compress:%v:%s)\n", domain, archiveDir, archiveWithTimestamp, compressArchive, archiveCompression)
 					}
@@ -320,6 +333,105 @@ Notes:
 					fmt.Fprintf(os.Stderr, "[INFO] Cloudflare credentials missing; skipping DNS update for %s\n", domain)
 				}
 
+				// Activate migrated site on target if requested
+				if activateMigrated {
+					siteDir := filepath.Join(targetPath, domain)
+					wpMgrDir := filepath.Join(targetPath, "wordpress-manager")
+
+					// If target is local, run commands locally; otherwise run over targetClient SSH
+					if isLocal(tgtHostPart) {
+						// local: run docker compose up -d in site dir
+						cmdRun := exec.Command("docker", "compose", "up", "-d")
+						cmdRun.Dir = siteDir
+						cmdRun.Stdout = os.Stdout
+						cmdRun.Stderr = os.Stderr
+						if err := cmdRun.Run(); err != nil {
+							fmt.Fprintf(os.Stderr, "[WARN] local activation failed for %s: %v\n", siteDir, err)
+						} else {
+							fmt.Fprintf(os.Stderr, "[INFO] Activated site locally: %s\n", siteDir)
+						}
+
+						// local: restart wordpress-manager
+						cmdDown := exec.Command("docker", "compose", "down")
+						cmdDown.Dir = wpMgrDir
+						cmdDown.Stdout = os.Stdout
+						cmdDown.Stderr = os.Stderr
+						_ = cmdDown.Run() // ignore error for down; we'll attempt up after
+						cmdUp := exec.Command("docker", "compose", "up", "-d")
+						cmdUp.Dir = wpMgrDir
+						cmdUp.Stdout = os.Stdout
+						cmdUp.Stderr = os.Stderr
+						if err := cmdUp.Run(); err != nil {
+							fmt.Fprintf(os.Stderr, "[WARN] local wordpress-manager restart failed for %s: %v\n", wpMgrDir, err)
+						} else {
+							fmt.Fprintf(os.Stderr, "[INFO] Restarted wordpress-manager locally: %s\n", wpMgrDir)
+						}
+					} else {
+						// remote: run via targetClient (we created targetClient earlier)
+						// ensure targetClient is available
+						if targetClient == nil {
+							// attempt to create connection if missing
+							tc, err := createSSHClient(cmd, tgtHostPart)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "[WARN] could not connect to target %s to activate site: %v\n", tgtHostPart, err)
+							} else {
+								targetClient = tc
+								defer targetClient.Close()
+							}
+						}
+						if targetClient != nil {
+							// run docker compose up -d in site dir
+							cmd1 := fmt.Sprintf("cd %q && docker compose up -d", siteDir)
+							if out, stderr, err := targetClient.ExecuteCommand(cmd1); err != nil {
+								fmt.Fprintf(os.Stderr, "[WARN] remote activation failed for %s on %s: %v (stderr: %s, out: %s)\n", siteDir, tgtHostPart, err, stderr, out)
+							} else {
+								fmt.Fprintf(os.Stderr, "[INFO] Activated site on %s: %s\n", tgtHostPart, siteDir)
+							}
+
+							// restart wordpress-manager
+							cmd2 := fmt.Sprintf("cd %q && docker compose down && docker compose up -d", wpMgrDir)
+							if out, stderr, err := targetClient.ExecuteCommand(cmd2); err != nil {
+								fmt.Fprintf(os.Stderr, "[WARN] remote wordpress-manager restart failed on %s: %v (stderr: %s, out: %s)\n", tgtHostPart, err, stderr, out)
+							} else {
+								fmt.Fprintf(os.Stderr, "[INFO] Restarted wordpress-manager on %s: %s\n", tgtHostPart, wpMgrDir)
+							}
+						}
+					}
+				}
+
+				// Attempt DB import on target (remote or local)
+				if importSQL {
+					sqlNameCmd := fmt.Sprintf("ls -1t %s/wp-content/*.sql 2>/dev/null | head -n1", filepath.Join(targetPath, domain))
+					if isLocal(tgtHostPart) {
+						// local import
+						sqlFile, _ := runLocalCommand(sqlNameCmd)
+						sqlFile = strings.TrimSpace(sqlFile)
+						if sqlFile != "" {
+							// Find WP container name
+							container, _ := getContainerNameLocal(filepath.Join(targetPath, domain, "docker-compose.yml"))
+							cmd := exec.Command("docker", "exec", container, "sh", "-c", fmt.Sprintf("cd /var/www/html/wp-content && wp db import %q --allow-root", sqlFile))
+							cmd.Stdout = os.Stdout
+							cmd.Stderr = os.Stderr
+							_ = cmd.Run()
+						}
+					} else {
+						// remote import via SSH client
+						sqlFileCmdRemote := fmt.Sprintf("ls -1t %s/wp-content/*.sql 2>/dev/null | head -n1", filepath.Join(targetPath, domain))
+						sqlFile, _, _ := targetClient.ExecuteCommand(sqlFileCmdRemote)
+						sqlFile = strings.TrimSpace(sqlFile)
+						if sqlFile != "" {
+							// determine container name remotely
+							container, _ := getContainerName(targetClient, filepath.Join(targetPath, domain, "docker-compose.yml"))
+							importCmd := fmt.Sprintf("docker exec %s sh -c 'cd /var/www/html/wp-content && wp db import %q --allow-root'", container, sqlFile)
+							if out, stderr, err := targetClient.ExecuteCommand(importCmd); err != nil {
+								fmt.Fprintf(os.Stderr, "[WARN] DB import failed: %v stderr:%s out:%s\n", err, stderr, out)
+							} else {
+								fmt.Fprintf(os.Stderr, "[INFO] DB import completed: %s\n", sqlFile)
+							}
+						}
+					}
+				}
+
 				// Optional archive of source
 				if archiveDir != "" {
 					if sourceIsLocal {
@@ -390,6 +502,12 @@ Notes:
 	cmd.Flags().BoolP("agent", "a", true, "Use SSH agent")
 	cmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
 	cmd.Flags().CountVarP(&verboseCount, "verbose", "v", "Set verbosity level")
+
+	// activation flag registration
+	cmd.Flags().BoolVar(&activateMigrated, "activate-migrated-site", false, "After migration and DNS update, activate the migrated site on the target (runs docker compose commands)")
+
+	// import SQL flag
+	cmd.Flags().BoolVar(&importSQL, "import-sql", false, "After migration, detect latest exported .sql in wp-content and import it into WordPress on the target")
 
 	return cmd
 }
