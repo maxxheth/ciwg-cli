@@ -33,6 +33,41 @@ type migratePlanEntry struct {
 
 type migratePlan map[string]migratePlanEntry
 
+// splitHostPath splits an input like "user@host:/path" or "host:/path" or "host" or "local:/custom"
+// into hostPart (e.g. "user@host" or "host" or "local") and pathPart (e.g. "/path" or "").
+func splitHostPath(input string) (hostPart, pathPart string) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", ""
+	}
+	// Find first ':' that indicates start of a path (avoid confusing with user@)
+	// For typical inputs user@host:/path or host:/path this works.
+	// IPv6 literal with colon is uncommon in these plans and not handled here.
+	if idx := strings.Index(input, ":"); idx != -1 {
+		return input[:idx], input[idx+1:]
+	}
+	return input, ""
+}
+
+// joinPathWithDomain returns a path that points to the domain directory.
+// If base is empty defaultBase ("/var/opt") is used. If the provided base already
+// ends with the domain name we return it as-is.
+func joinPathWithDomain(base, domain string) string {
+	defaultBase := "/var/opt"
+	if base == "" {
+		return filepath.Join(defaultBase, domain)
+	}
+	// If base starts with "~" expand (simple)
+	if strings.HasPrefix(base, "~") {
+		base = filepath.Join(os.Getenv("HOME"), strings.TrimPrefix(base, "~"))
+	}
+	cleanBase := filepath.Clean(base)
+	if filepath.Base(cleanBase) == domain {
+		return cleanBase
+	}
+	return filepath.Join(cleanBase, domain)
+}
+
 func newMigrateCmd() *cobra.Command {
 	var (
 		planFile             string
@@ -141,7 +176,7 @@ Notes:
 			}
 
 			// SSH params to build rsync -e "ssh ..." consistently with flags
-			user, port, keyPath := getSSHParams(cmd)
+			_, port, keyPath := getSSHParams(cmd)
 			sshRsyncArg := buildRsyncSSHArg(port, keyPath)
 
 			for domain, entry := range plan {
@@ -154,20 +189,35 @@ Notes:
 					}
 				}
 
-				source := strings.TrimSpace(entry.From)
-				target := strings.TrimSpace(entry.To)
-				if target == "" {
-					target = targetServer
+				sourceRaw := strings.TrimSpace(entry.From)
+				targetRaw := strings.TrimSpace(entry.To)
+				if targetRaw == "" {
+					targetRaw = targetServer
 				}
-				if source == "" {
-					source = "local"
+				if sourceRaw == "" {
+					sourceRaw = "local"
 				}
 
-				fmt.Fprintf(os.Stderr, "[INFO] Migrating %s: %s -> %s\n", domain, source, target)
+				// Split host and optional path for both source and target.
+				srcHostPart, srcPathPart := splitHostPath(sourceRaw)
+				tgtHostPart, tgtPathPart := splitHostPath(targetRaw)
+
+				// Build sourcePath and targetPath that point to the domain directory.
+				sourcePath := joinPathWithDomain(srcPathPart, domain)
+				targetPath := tgtPathPart
+				// If no explicit target path provided, default to /var/opt (parent dir)
+				if targetPath == "" {
+					targetPath = "/var/opt"
+				}
+
+				fmt.Fprintf(os.Stderr, "[INFO] Migrating %s: %s -> %s\n", domain, sourceRaw, targetRaw)
 				if dryRunFlag {
-					newIP := lookupIPForHost(target)
+					newIP := lookupIPForHost(hostOnly(tgtHostPart))
 					fmt.Fprintf(os.Stderr, "[DRY RUN] Would dump DB for %s\n", domain)
-					fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync /var/opt/%s to %s@%s:/var/opt/ (ssh: %s)\n", domain, user, target, sshRsyncArg)
+					// Use srcHostPart (which may include user@) when constructing rsync src spec
+					srcSpec := fmt.Sprintf("%s:%s", srcHostPart, sourcePath)
+					destSpec := fmt.Sprintf("%s:%s", tgtHostPart, targetPath)
+					fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync %s to %s (ssh: %s)\n", srcSpec, destSpec, sshRsyncArg)
 					if cfEmail != "" && cfKey != "" && newIP != "" {
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would update Cloudflare A record for %s -> %s\n", domain, newIP)
 					}
@@ -184,22 +234,21 @@ Notes:
 					continue
 				}
 
-				// Resolve source path and ensure site exists
+				// Resolve source connection & existence
 				var sourceIsLocal bool
 				var sourceClient *auth.SSHClient
-				sourcePath := filepath.Join("/var/opt", domain)
 
-				if !isLocal(source) {
+				if !isLocal(srcHostPart) {
 					var err error
-					sourceClient, err = createSSHClient(cmd, source)
+					sourceClient, err = createSSHClient(cmd, srcHostPart)
 					if err != nil {
-						return fmt.Errorf("connect to source %s: %w", source, err)
+						return fmt.Errorf("connect to source %s: %w", srcHostPart, err)
 					}
 					defer sourceClient.Close()
 
 					// Verify directory exists remotely
 					if _, _, err := sourceClient.ExecuteCommand(fmt.Sprintf("test -d %q", sourcePath)); err != nil {
-						fmt.Fprintf(os.Stderr, "[WARN] %s: not found on source %s\n", sourcePath, source)
+						fmt.Fprintf(os.Stderr, "[WARN] %s: not found on source %s\n", sourcePath, srcHostPart)
 						continue
 					}
 				} else {
@@ -217,7 +266,7 @@ Notes:
 					}
 				} else {
 					if err := dumpDBRemote(sourceClient, sourcePath); err != nil {
-						fmt.Fprintf(os.Stderr, "[WARN] DB dump failed on %s for %s: %v\n", source, domain, err)
+						fmt.Fprintf(os.Stderr, "[WARN] DB dump failed on %s for %s: %v\n", srcHostPart, domain, err)
 					}
 				}
 
@@ -230,29 +279,34 @@ Notes:
 						return fmt.Errorf("create staging: %w", err)
 					}
 					// trailing slash to copy content
-					srcSpec := fmt.Sprintf("%s@%s:%s/", user, hostOnly(source), sourcePath)
+					srcSpec := fmt.Sprintf("%s:%s/", srcHostPart, sourcePath)
 					if err := runRsync(srcSpec, localStage, sshRsyncArg); err != nil {
-						return fmt.Errorf("rsync from source %s failed: %w", source, err)
+						return fmt.Errorf("rsync from source %s failed: %w", srcHostPart, err)
 					}
 					needsCleanup = true
 				}
 
-				// Ensure target SSH connectivity
-				targetClient, err := createSSHClient(cmd, target)
+				// Ensure target SSH connectivity (pass only host part to createSSHClient)
+				targetConn := tgtHostPart
+				if targetConn == "" {
+					return fmt.Errorf("invalid target host for %q", targetRaw)
+				}
+				targetClient, err := createSSHClient(cmd, targetConn)
 				if err != nil {
-					return fmt.Errorf("connect to target %s: %w", target, err)
+					return fmt.Errorf("connect to target %s: %w", targetConn, err)
 				}
 				defer targetClient.Close()
 
-				// Rsync localStage to target:/var/opt/
-				destSpec := fmt.Sprintf("%s@%s:%s", user, hostOnly(target), "/var/opt/")
+				// Rsync localStage to target:path
+				// destSpec uses tgtHostPart (may include user@)
+				destSpec := fmt.Sprintf("%s:%s", tgtHostPart, targetPath)
 				if err := runRsync(localStage, destSpec, sshRsyncArg); err != nil {
-					return fmt.Errorf("rsync to target %s failed: %w", target, err)
+					return fmt.Errorf("rsync to target %s failed: %w", tgtHostPart, err)
 				}
 
 				// Cloudflare DNS update
 				if cfEmail != "" && cfKey != "" {
-					newIP := lookupIPForHost(hostOnly(target))
+					newIP := lookupIPForHost(hostOnly(tgtHostPart))
 					if newIP != "" {
 						if err := cfUpdateARecord(domain, newIP, cfEmail, cfKey); err != nil {
 							fmt.Fprintf(os.Stderr, "[WARN] DNS update failed for %s: %v\n", domain, err)
@@ -260,7 +314,7 @@ Notes:
 							fmt.Fprintf(os.Stderr, "[INFO] DNS updated for %s -> %s\n", domain, newIP)
 						}
 					} else {
-						fmt.Fprintf(os.Stderr, "[WARN] Could not resolve IP for %s; skipping DNS update\n", target)
+						fmt.Fprintf(os.Stderr, "[WARN] Could not resolve IP for %s; skipping DNS update\n", tgtHostPart)
 					}
 				} else {
 					fmt.Fprintf(os.Stderr, "[INFO] Cloudflare credentials missing; skipping DNS update for %s\n", domain)
@@ -283,7 +337,7 @@ Notes:
 				if deleteAfter {
 					ok := forceDelete
 					if !forceDelete {
-						ok = promptConfirm(fmt.Sprintf("Delete source directory %s on %s? [y/N]: ", sourcePath, source))
+						ok = promptConfirm(fmt.Sprintf("Delete source directory %s on %s? [y/N]: ", sourcePath, srcHostPart))
 					}
 					if ok {
 						if sourceIsLocal {
@@ -303,7 +357,7 @@ Notes:
 					_ = os.RemoveAll(localStage)
 				}
 
-				fmt.Fprintf(os.Stderr, "[INFO] Migration finished for %s. Next on %s: cd /var/opt/%s && docker compose up -d\n", domain, hostOnly(target), domain)
+				fmt.Fprintf(os.Stderr, "[INFO] Migration finished for %s. Next on %s: cd %s && docker compose up -d\n", domain, hostOnly(tgtHostPart), filepath.Join(targetPath, domain))
 			}
 
 			return nil
