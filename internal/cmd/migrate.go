@@ -54,7 +54,63 @@ func newMigrateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "migrate",
 		Short: "Migrate one or more sites between servers and update DNS",
-		Long:  "Migrate sites between servers (local or remote), update Cloudflare DNS, and optionally archive/delete the source.",
+		Long: `Migrate sites between servers (local or remote), update Cloudflare DNS, and optionally archive/delete the source.
+
+Credentials (Cloudflare) should be supplied via a .env file or flags:
+  CLOUDFLARE_EMAIL and CLOUDFLARE_API_KEY (preferred via .env) or --cf-email / --cf-key.
+
+Plan files (JSON/YAML) map domains to from/to hosts and optional delayUntil values.
+If --plan is not provided, use --sites and --target to migrate matching directories under /var/opt.`,
+		Example: `
+# Simple: migrate a single domain from local to target (dry run)
+ciwg-cli migrate --sites example.com --target wp18.ciwgserver.com --dry-run
+
+# Plan file (JSON) example (plan.json):
+{
+  "example.com": {
+    "from": "local",
+    "to": "wp18.ciwgserver.com",
+    "delayUntil": "in 2h"
+  },
+  "blog.example.net": {
+    "from": "user@old.server.com",
+    "to": "root@new.server.com",
+    "delayUntil": "2025-09-01T10:00:00Z"
+  }
+}
+
+# Plan file (YAML) example (plan.yaml):
+example.com:
+  from: local
+  to: wp18.ciwgserver.com
+  delayUntil: "in 2h"
+blog.example.net:
+  from: user@old.server.com
+  to: root@new.server.com
+
+# Use a plan file (dry run)
+ciwg-cli migrate --plan ./plan.json --dry-run
+
+# Archive then delete after successful migration (prompted)
+ciwg-cli migrate --plan ./plan.yaml --archive-dir /var/backups/migrated --archive-with-timestamp --compress-archive --archive-compression xz --delete
+
+# Force delete without prompt
+ciwg-cli migrate --plan ./plan.yaml --force-delete
+
+# Apply a global fuzzy delay to all plan entries that lack delayUntil
+ciwg-cli migrate --plan ./plan.json --set-global-delay "in 30m"
+
+# Pass Cloudflare credentials via flags (overrides .env)
+ciwg-cli migrate --plan ./plan.json --cf-email admin@example.com --cf-key your_api_key_here
+
+# SSH options (applies to rsync/ssh connections)
+ciwg-cli migrate --plan ./plan.json -u root -p 2222 -k ~/.ssh/id_ed25519
+
+Notes:
+ - 'from' and 'to' may be 'local' or a remote host optionally prefixed with user@ (e.g. user@host.example.com).
+ - When migrating from a remote host, the tool stages files to /tmp/ciwg_migrate/<domain> before shipping to the target.
+ - Use --dry-run to verify actions before making changes.
+`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_ = godotenv.Load()
 
