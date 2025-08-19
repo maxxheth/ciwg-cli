@@ -85,9 +85,6 @@ func newMigrateCmd() *cobra.Command {
 		cfEmail string
 		cfKey   string
 
-		// new flag: skip DNS update
-		skipDNS bool
-
 		// new flag: activate the migrated site on the target
 		activateMigrated bool
 
@@ -255,19 +252,9 @@ Notes:
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync %s to %s (ssh: %s)\n", srcSpec, destSpec, sshRsyncArg)
 					}
 
-					// Cloudflare
-					if skipDNS {
-						fmt.Fprintf(os.Stderr, "[DRY RUN] Would skip DNS update for %s due to --skip-dns flag\n", domain)
-					} else {
-						if cfEmail != "" && cfKey != "" && newIP != "" {
-							fmt.Fprintf(os.Stderr, "[DRY RUN] Would update Cloudflare A record for %s -> %s\n", domain, newIP)
-						} else if cfEmail == "" || cfKey == "" {
-							fmt.Fprintf(os.Stderr, "[DRY RUN] Cloudflare credentials missing; would skip DNS update for %s\n", domain)
-						} else {
-							fmt.Fprintf(os.Stderr, "[DRY RUN] Could not resolve target IP; would skip DNS update for %s\n", domain)
-						}
+					if cfEmail != "" && cfKey != "" && newIP != "" {
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would update Cloudflare A record for %s -> %s\n", domain, newIP)
 					}
-
 					if activateMigrated {
 						siteDir := filepath.Join(targetPath, domain)
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would SSH to %s and run: cd %s && docker compose up -d\n", tgtHostPart, siteDir)
@@ -396,23 +383,19 @@ Notes:
 				}
 
 				// Cloudflare DNS update
-				if !skipDNS {
-					if cfEmail != "" && cfKey != "" {
-						newIP := lookupIPForHost(hostOnly(tgtHostPart))
-						if newIP != "" {
-							if err := cfUpdateARecord(domain, newIP, cfEmail, cfKey); err != nil {
-								fmt.Fprintf(os.Stderr, "[WARN] DNS update failed for %s: %v\n", domain, err)
-							} else {
-								fmt.Fprintf(os.Stderr, "[INFO] DNS updated for %s -> %s\n", domain, newIP)
-							}
+				if cfEmail != "" && cfKey != "" {
+					newIP := lookupIPForHost(hostOnly(tgtHostPart))
+					if newIP != "" {
+						if err := cfUpdateARecord(domain, newIP, cfEmail, cfKey); err != nil {
+							fmt.Fprintf(os.Stderr, "[WARN] DNS update failed for %s: %v\n", domain, err)
 						} else {
-							fmt.Fprintf(os.Stderr, "[WARN] Could not resolve IP for %s; skipping DNS update\n", tgtHostPart)
+							fmt.Fprintf(os.Stderr, "[INFO] DNS updated for %s -> %s\n", domain, newIP)
 						}
 					} else {
-						fmt.Fprintf(os.Stderr, "[INFO] Cloudflare credentials missing; skipping DNS update for %s\n", domain)
+						fmt.Fprintf(os.Stderr, "[WARN] Could not resolve IP for %s; skipping DNS update\n", tgtHostPart)
 					}
 				} else {
-					fmt.Fprintf(os.Stderr, "[INFO] --skip-dns flag is set; bypassing DNS update for %s\n", domain)
+					fmt.Fprintf(os.Stderr, "[INFO] Cloudflare credentials missing; skipping DNS update for %s\n", domain)
 				}
 
 				// Activate migrated site on target if requested
@@ -577,7 +560,6 @@ Notes:
 	// Cloudflare override (env is default)
 	cmd.Flags().StringVar(&cfEmail, "cf-email", "", "Cloudflare email (default from CLOUDFLARE_EMAIL)")
 	cmd.Flags().StringVar(&cfKey, "cf-key", "", "Cloudflare API key (default from CLOUDFLARE_API_KEY)")
-	cmd.Flags().BoolVar(&skipDNS, "skip-dns", false, "Bypass Cloudflare DNS record update")
 
 	// SSH flags (align with other commands)
 	cmd.Flags().StringP("user", "u", "", "SSH username (default: current user or 'root')")
