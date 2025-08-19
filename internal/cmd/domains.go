@@ -1277,7 +1277,7 @@ func generateFinalReport(results []string, removedDomains []string, removalOpera
 
 // Add new function to process multiple servers
 func processServerRange(cmd *cobra.Command, createSSHClientFunc func(*cobra.Command, string) (*auth.SSHClient, error), serverRange string, excludeList string, remove bool, dryRun bool, report bool) {
-	pattern, start, end, err := parseServerRange(serverRange)
+	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing server range: %v\n", err)
 		os.Exit(1)
@@ -1313,6 +1313,10 @@ func processServerRange(cmd *cobra.Command, createSSHClientFunc func(*cobra.Comm
 
 	// Process each server in the range
 	for i := start; i <= end; i++ {
+		if exclusions[i] {
+			fmt.Printf("Skipping excluded server: %s\n", fmt.Sprintf(pattern, i))
+			continue
+		}
 		serverHost := fmt.Sprintf(pattern, i)
 		log(1, "Processing server: %s", serverHost)
 

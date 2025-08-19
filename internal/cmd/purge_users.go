@@ -157,7 +157,7 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 	if serverOverride != "" {
 		servers = []string{serverOverride}
 	} else {
-		pattern, start, end, err := parseServerRange(serverRange)
+		pattern, start, end, exclusions, err := parseServerRange(serverRange)
 		if err != nil {
 			return fmt.Errorf("parse server range: %w", err)
 		}
@@ -165,6 +165,10 @@ func runPurgeUsers(cmd *cobra.Command, args []string) error {
 			servers = []string{"local"}
 		} else {
 			for i := start; i <= end; i++ {
+				if exclusions[i] {
+					fmt.Printf("Skipping server index: %d\n", i)
+					continue
+				}
 				servers = append(servers, fmt.Sprintf(pattern, i))
 			}
 		}

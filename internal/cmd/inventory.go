@@ -38,33 +38,33 @@ var inventoryCmd = &cobra.Command{
 	Use:   "inventory",
 	Short: "Generate inventory of WordPress containers",
 	Long:  `Scan Docker containers and generate an inventory of WordPress sites with their domains, URLs, and server information.`,
-}
-
-var inventoryGenerateCmd = &cobra.Command{
-	Use:   "generate [user@]host",
-	Short: "Generate inventory of WordPress containers on specified server(s)",
-	Args:  cobra.MaximumNArgs(1),
 	RunE:  runInventoryGenerate,
 }
 
+// var inventoryGenerateCmd = &cobra.Command{
+// 	Use:   "generate [user@]host",
+// 	Short: "Generate inventory of WordPress containers on specified server(s)",
+// 	Args:  cobra.MaximumNArgs(1),
+// }
+
 func init() {
 	rootCmd.AddCommand(inventoryCmd)
-	inventoryCmd.AddCommand(inventoryGenerateCmd)
+	// inventoryCmd.AddCommand(inventoryGenerateCmd)
 
 	// Inventory specific flags
-	inventoryGenerateCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "inventory.json", "Output file for inventory")
-	inventoryGenerateCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
-	inventoryGenerateCmd.Flags().BoolVar(&inventoryLocal, "local", false, "Run locally without SSH")
-	inventoryGenerateCmd.Flags().StringVar(&inventoryFormat, "format", "json", "Export format (json or csv)")
-	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterSite, "filter-by-site", "", "Filter by site list (file path, pipe-delimited string, or stdin)")
-	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterServer, "filter-by-server", "", "Filter by server list (file path, pipe-delimited string, or stdin)")
+	inventoryCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "inventory.json", "Output file for inventory")
+	inventoryCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
+	inventoryCmd.Flags().BoolVar(&inventoryLocal, "local", false, "Run locally without SSH")
+	inventoryCmd.Flags().StringVar(&inventoryFormat, "format", "json", "Export format (json or csv)")
+	inventoryCmd.Flags().StringVar(&inventoryFilterSite, "filter-by-site", "", "Filter by site list (file path, pipe-delimited string, or stdin)")
+	inventoryCmd.Flags().StringVar(&inventoryFilterServer, "filter-by-server", "", "Filter by server list (file path, pipe-delimited string, or stdin)")
 
 	// SSH connection flags
-	inventoryGenerateCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
-	inventoryGenerateCmd.Flags().StringP("port", "p", "22", "SSH port")
-	inventoryGenerateCmd.Flags().StringP("key", "k", "", "Path to SSH private key")
-	inventoryGenerateCmd.Flags().BoolP("agent", "a", true, "Use SSH agent")
-	inventoryGenerateCmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
+	inventoryCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
+	inventoryCmd.Flags().StringP("port", "p", "22", "SSH port")
+	inventoryCmd.Flags().StringP("key", "k", "", "Path to SSH private key")
+	inventoryCmd.Flags().BoolP("agent", "a", true, "Use SSH agent")
+	inventoryCmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
 }
 
 func runInventoryGenerate(cmd *cobra.Command, args []string) error {
@@ -72,12 +72,16 @@ func runInventoryGenerate(cmd *cobra.Command, args []string) error {
 
 	if inventoryServerRange != "" {
 		// Process multiple servers
-		pattern, start, end, err := parseServerRange(inventoryServerRange)
+		pattern, start, end, exclusions, err := parseServerRange(inventoryServerRange)
 		if err != nil {
 			return fmt.Errorf("error parsing server range: %w", err)
 		}
 
 		for i := start; i <= end; i++ {
+			if exclusions[i] {
+				fmt.Printf("Skipping server index: %d\n", i)
+				continue
+			}
 			serverHost := fmt.Sprintf(pattern, i)
 			fmt.Printf("Processing server: %s\n", serverHost)
 

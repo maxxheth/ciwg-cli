@@ -97,6 +97,9 @@ func newMigrateCmd() *cobra.Command {
 
 		// new flag: base destination path
 		baseDestPath string
+
+		// new flag: skip Cloudflare DNS updates
+		skipDNS bool
 	)
 
 	cmd := &cobra.Command{
@@ -252,7 +255,9 @@ Notes:
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync %s to %s (ssh: %s)\n", srcSpec, destSpec, sshRsyncArg)
 					}
 
-					if cfEmail != "" && cfKey != "" && newIP != "" {
+					if skipDNS {
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Skipping DNS update for %s due to --skip-dns\n", domain)
+					} else if cfEmail != "" && cfKey != "" && newIP != "" {
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would update Cloudflare A record for %s -> %s\n", domain, newIP)
 					}
 					if activateMigrated {
@@ -383,7 +388,9 @@ Notes:
 				}
 
 				// Cloudflare DNS update
-				if cfEmail != "" && cfKey != "" {
+				if skipDNS {
+					fmt.Fprintf(os.Stderr, "[INFO] --skip-dns set; skipping Cloudflare DNS update for %s\n", domain)
+				} else if cfEmail != "" && cfKey != "" {
 					newIP := lookupIPForHost(hostOnly(tgtHostPart))
 					if newIP != "" {
 						if err := cfUpdateARecord(domain, newIP, cfEmail, cfKey); err != nil {
@@ -560,6 +567,8 @@ Notes:
 	// Cloudflare override (env is default)
 	cmd.Flags().StringVar(&cfEmail, "cf-email", "", "Cloudflare email (default from CLOUDFLARE_EMAIL)")
 	cmd.Flags().StringVar(&cfKey, "cf-key", "", "Cloudflare API key (default from CLOUDFLARE_API_KEY)")
+	// Skip DNS updates
+	cmd.Flags().BoolVar(&skipDNS, "skip-dns", false, "Skip Cloudflare DNS update")
 
 	// SSH flags (align with other commands)
 	cmd.Flags().StringP("user", "u", "", "SSH username (default: current user or 'root')")

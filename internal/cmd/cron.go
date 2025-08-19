@@ -91,12 +91,16 @@ func runCronList(cmd *cobra.Command, args []string) error {
 }
 
 func processCronListForServerRange(cmd *cobra.Command, serverRange string) error {
-	pattern, start, end, err := parseServerRange(serverRange)
+	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return fmt.Errorf("error parsing server range: %w", err)
 	}
 
 	for i := start; i <= end; i++ {
+		if exclusions[i] {
+			fmt.Printf("Skipping excluded server: %s\n", fmt.Sprintf(pattern, i))
+			continue
+		}
 		hostname := fmt.Sprintf(pattern, i)
 		fmt.Printf("--- Processing server: %s ---\n", hostname)
 		err := listCronsForHost(cmd, hostname)
@@ -210,13 +214,17 @@ func runCronAdd(cmd *cobra.Command, args []string) error {
 }
 
 func processCronAddForServerRange(cmd *cobra.Command, serverRange string) error {
-	pattern, start, end, err := parseServerRange(serverRange)
+	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return fmt.Errorf("error parsing server range: %w", err)
 	}
 
 	// It's assumed AddCronJob is interactive. We will prompt for each server.
 	for i := start; i <= end; i++ {
+		if exclusions[i] {
+			fmt.Printf("Skipping excluded server: %s\n", fmt.Sprintf(pattern, i))
+			continue
+		}
 		hostname := fmt.Sprintf(pattern, i)
 		fmt.Printf("--- Processing server: %s ---\n", hostname)
 		err := addCronForHost(cmd, hostname)
@@ -295,12 +303,16 @@ func runCronRemove(cmd *cobra.Command, args []string) error {
 }
 
 func processCronRemoveForServerRange(cmd *cobra.Command, serverRange, jobID string) error {
-	pattern, start, end, err := parseServerRange(serverRange)
+	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return fmt.Errorf("error parsing server range: %w", err)
 	}
 
 	for i := start; i <= end; i++ {
+		if exclusions[i] {
+			fmt.Printf("Skipping excluded server: %s\n", fmt.Sprintf(pattern, i))
+			continue
+		}
 		hostname := fmt.Sprintf(pattern, i)
 		fmt.Printf("--- Processing server: %s ---\n", hostname)
 		err := removeCronForHost(cmd, hostname, jobID)
