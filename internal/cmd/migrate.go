@@ -85,6 +85,9 @@ func newMigrateCmd() *cobra.Command {
 		cfEmail string
 		cfKey   string
 
+		// new flag: skip DNS update
+		skipDNS bool
+
 		// new flag: activate the migrated site on the target
 		activateMigrated bool
 
@@ -94,6 +97,9 @@ func newMigrateCmd() *cobra.Command {
 		// local relay flags
 		localRelay     bool
 		localRelayPath string
+
+		// new flag: base destination path
+		baseDestPath string
 	)
 
 	cmd := &cobra.Command{
@@ -151,6 +157,9 @@ ciwg-cli migrate --plan ./plan.json --cf-email admin@example.com --cf-key your_a
 # SSH options (applies to rsync/ssh connections)
 ciwg-cli migrate --plan ./plan.json -u root -p 2222 -k ~/.ssh/id_ed25519
 
+# Use a custom base destination path on the target server
+ciwg-cli migrate --sites example.com --target wp18.ciwgserver.com --base-dest-path /home/sites
+
 Notes:
  - 'from' and 'to' may be 'local' or a remote host optionally prefixed with user@ (e.g. user@host.example.com).
  - When migrating from a remote host, the tool stages files to /tmp/ciwg_migrate/<domain> before shipping to the target.
@@ -186,8 +195,8 @@ Notes:
 			}
 
 			// SSH params to build rsync -e "ssh ..." consistently with flags
-			_, port, keyPath := getSSHParams(cmd)
-			sshRsyncArg := buildRsyncSSHArg(port, keyPath)
+			user, port, keyPath := getSSHParams(cmd)
+			sshRsyncArg := buildRsyncSSHArg(user, port, keyPath)
 
 			for domain, entry := range plan {
 				// Delay scheduling
@@ -215,30 +224,56 @@ Notes:
 				// Build sourcePath and targetPath that point to the domain directory.
 				sourcePath := joinPathWithDomain(srcPathPart, domain)
 				targetPath := tgtPathPart
-				// If no explicit target path provided, default to /var/opt (parent dir)
+				// If no explicit target path provided in the plan, check the flag, then use default.
 				if targetPath == "" {
-					targetPath = "/var/opt"
+					if baseDestPath != "" {
+						targetPath = baseDestPath
+					} else {
+						targetPath = "/var/opt"
+					}
 				}
 
 				fmt.Fprintf(os.Stderr, "[INFO] Migrating %s: %s -> %s\n", domain, sourceRaw, targetRaw)
 				if dryRunFlag {
 					newIP := lookupIPForHost(hostOnly(tgtHostPart))
 					fmt.Fprintf(os.Stderr, "[DRY RUN] Would dump DB for %s\n", domain)
-					// Use srcHostPart (which may include user@) when constructing rsync src spec
-					srcSpec := fmt.Sprintf("%s:%s", srcHostPart, sourcePath)
-					destSpec := fmt.Sprintf("%s:%s", tgtHostPart, targetPath)
-					fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync %s to %s (ssh: %s)\n", srcSpec, destSpec, sshRsyncArg)
-					if cfEmail != "" && cfKey != "" && newIP != "" {
-						fmt.Fprintf(os.Stderr, "[DRY RUN] Would update Cloudflare A record for %s -> %s\n", domain, newIP)
+
+					// Be explicit about relay vs direct copy
+					if localRelay {
+						relayDir := filepath.Join(localRelayPath, domain)
+						if isLocal(srcHostPart) {
+							fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync local %s/ to relay %s (ssh: <local>)\n", sourcePath, relayDir)
+						} else {
+							fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync %s:%s/ to relay %s (ssh: %s)\n", srcHostPart, sourcePath, relayDir, sshRsyncArg)
+						}
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync relay %s to %s:%s (ssh: %s)\n", relayDir, tgtHostPart, targetPath, sshRsyncArg)
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would remove relay directory %s after successful transfer\n", relayDir)
+					} else {
+						// one-hop
+						srcSpec := fmt.Sprintf("%s:%s", srcHostPart, sourcePath)
+						destSpec := fmt.Sprintf("%s:%s", tgtHostPart, targetPath)
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would rsync %s to %s (ssh: %s)\n", srcSpec, destSpec, sshRsyncArg)
 					}
-					// activation dry-run info
+
+					// Cloudflare
+					if skipDNS {
+						fmt.Fprintf(os.Stderr, "[DRY RUN] Would skip DNS update for %s due to --skip-dns flag\n", domain)
+					} else {
+						if cfEmail != "" && cfKey != "" && newIP != "" {
+							fmt.Fprintf(os.Stderr, "[DRY RUN] Would update Cloudflare A record for %s -> %s\n", domain, newIP)
+						} else if cfEmail == "" || cfKey == "" {
+							fmt.Fprintf(os.Stderr, "[DRY RUN] Cloudflare credentials missing; would skip DNS update for %s\n", domain)
+						} else {
+							fmt.Fprintf(os.Stderr, "[DRY RUN] Could not resolve target IP; would skip DNS update for %s\n", domain)
+						}
+					}
+
 					if activateMigrated {
 						siteDir := filepath.Join(targetPath, domain)
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would SSH to %s and run: cd %s && docker compose up -d\n", tgtHostPart, siteDir)
 						wpMgrDir := filepath.Join(targetPath, "wordpress-manager")
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would SSH to %s and run: cd %s && docker compose down && docker compose up -d\n", tgtHostPart, wpMgrDir)
 					}
-					// import-sql dry-run info (moved here so it actually prints)
 					if importSQL {
 						fmt.Fprintf(os.Stderr, "[DRY RUN] Would import latest SQL file for %s on target %s\n", domain, tgtHostPart)
 					}
@@ -294,17 +329,37 @@ Notes:
 				// Stage directory for transfer if source is remote (rsync remote->local), else use local path directly
 				localStage := sourcePath
 				needsCleanup := false
-				if !sourceIsLocal {
-					localStage = filepath.Join("/tmp", "ciwg_migrate", domain)
+
+				if localRelay {
+					// Always stage to relay path when enabled
+					localStage = filepath.Join(localRelayPath, domain)
 					if err := os.MkdirAll(localStage, 0755); err != nil {
-						return fmt.Errorf("create staging: %w", err)
+						return fmt.Errorf("create relay staging: %w", err)
 					}
-					// trailing slash to copy content
-					srcSpec := fmt.Sprintf("%s:%s/", srcHostPart, sourcePath)
-					if err := runRsync(srcSpec, localStage, sshRsyncArg); err != nil {
-						return fmt.Errorf("rsync from source %s failed: %w", srcHostPart, err)
+					if sourceIsLocal {
+						if err := runRsync(sourcePath+"/", localStage, ""); err != nil {
+							return fmt.Errorf("rsync local -> relay failed: %w", err)
+						}
+					} else {
+						srcSpec := fmt.Sprintf("%s:%s/", srcHostPart, sourcePath)
+						if err := runRsync(srcSpec, localStage, sshRsyncArg); err != nil {
+							return fmt.Errorf("rsync remote -> relay failed: %w", err)
+						}
 					}
 					needsCleanup = true
+				} else {
+					// previous behavior: only stage when source is remote
+					if !sourceIsLocal {
+						localStage = filepath.Join("/tmp", "ciwg_migrate", domain)
+						if err := os.MkdirAll(localStage, 0755); err != nil {
+							return fmt.Errorf("create staging: %w", err)
+						}
+						srcSpec := fmt.Sprintf("%s:%s/", srcHostPart, sourcePath)
+						if err := runRsync(srcSpec, localStage, sshRsyncArg); err != nil {
+							return fmt.Errorf("rsync from source %s failed: %w", srcHostPart, err)
+						}
+						needsCleanup = true
+					}
 				}
 
 				// Ensure target SSH connectivity (pass only host part to createSSHClient)
@@ -321,24 +376,43 @@ Notes:
 				// Rsync localStage to target:path
 				// destSpec uses tgtHostPart (may include user@)
 				destSpec := fmt.Sprintf("%s:%s", tgtHostPart, targetPath)
-				if err := runRsync(localStage, destSpec, sshRsyncArg); err != nil {
+
+				// CRITICAL: Ensure the source for the final hop does NOT have a trailing slash.
+				// This prevents rsync from wiping the target directory.
+				// We are copying the directory *itself* into the target path.
+				finalStageSource := strings.TrimSuffix(localStage, "/")
+
+				if err := runRsync(finalStageSource, destSpec, sshRsyncArg); err != nil {
 					return fmt.Errorf("rsync to target %s failed: %w", tgtHostPart, err)
 				}
 
+				// Cleanup staging/relay after successful second hop
+				if needsCleanup {
+					if err := os.RemoveAll(localStage); err != nil {
+						fmt.Fprintf(os.Stderr, "[WARN] failed to remove staging dir %s: %v\n", localStage, err)
+					} else {
+						fmt.Fprintf(os.Stderr, "[INFO] removed staging dir %s\n", localStage)
+					}
+				}
+
 				// Cloudflare DNS update
-				if cfEmail != "" && cfKey != "" {
-					newIP := lookupIPForHost(hostOnly(tgtHostPart))
-					if newIP != "" {
-						if err := cfUpdateARecord(domain, newIP, cfEmail, cfKey); err != nil {
-							fmt.Fprintf(os.Stderr, "[WARN] DNS update failed for %s: %v\n", domain, err)
+				if !skipDNS {
+					if cfEmail != "" && cfKey != "" {
+						newIP := lookupIPForHost(hostOnly(tgtHostPart))
+						if newIP != "" {
+							if err := cfUpdateARecord(domain, newIP, cfEmail, cfKey); err != nil {
+								fmt.Fprintf(os.Stderr, "[WARN] DNS update failed for %s: %v\n", domain, err)
+							} else {
+								fmt.Fprintf(os.Stderr, "[INFO] DNS updated for %s -> %s\n", domain, newIP)
+							}
 						} else {
-							fmt.Fprintf(os.Stderr, "[INFO] DNS updated for %s -> %s\n", domain, newIP)
+							fmt.Fprintf(os.Stderr, "[WARN] Could not resolve IP for %s; skipping DNS update\n", tgtHostPart)
 						}
 					} else {
-						fmt.Fprintf(os.Stderr, "[WARN] Could not resolve IP for %s; skipping DNS update\n", tgtHostPart)
+						fmt.Fprintf(os.Stderr, "[INFO] Cloudflare credentials missing; skipping DNS update for %s\n", domain)
 					}
 				} else {
-					fmt.Fprintf(os.Stderr, "[INFO] Cloudflare credentials missing; skipping DNS update for %s\n", domain)
+					fmt.Fprintf(os.Stderr, "[INFO] --skip-dns flag is set; bypassing DNS update for %s\n", domain)
 				}
 
 				// Activate migrated site on target if requested
@@ -503,6 +577,7 @@ Notes:
 	// Cloudflare override (env is default)
 	cmd.Flags().StringVar(&cfEmail, "cf-email", "", "Cloudflare email (default from CLOUDFLARE_EMAIL)")
 	cmd.Flags().StringVar(&cfKey, "cf-key", "", "Cloudflare API key (default from CLOUDFLARE_API_KEY)")
+	cmd.Flags().BoolVar(&skipDNS, "skip-dns", false, "Bypass Cloudflare DNS record update")
 
 	// SSH flags (align with other commands)
 	cmd.Flags().StringP("user", "u", "", "SSH username (default: current user or 'root')")
@@ -521,6 +596,9 @@ Notes:
 	// local-relay flags
 	cmd.Flags().BoolVar(&localRelay, "local-relay", false, "Stage the site locally first (rsync -> local-relay-path) then rsync from relay to target")
 	cmd.Flags().StringVar(&localRelayPath, "local-relay-path", "/tmp/ciwg_migrate", "Path for local relay staging (used when --local-relay is set)")
+
+	// base destination path flag
+	cmd.Flags().StringVar(&baseDestPath, "base-dest-path", "/var/opt", "Base destination path on the target server (defaults to /var/opt)")
 
 	return cmd
 }
@@ -699,9 +777,13 @@ func getSSHParams(cmd *cobra.Command) (user, port, key string) {
 	return
 }
 
-func buildRsyncSSHArg(port, key string) string {
+func buildRsyncSSHArg(user, port, key string) string {
 	var b strings.Builder
 	b.WriteString("ssh")
+	if user != "" {
+		b.WriteString(" -l ")
+		b.WriteString(user)
+	}
 	if port != "" && port != "22" {
 		b.WriteString(" -p ")
 		b.WriteString(port)
@@ -715,13 +797,27 @@ func buildRsyncSSHArg(port, key string) string {
 
 func runRsync(src, dst, sshCmd string) error {
 	args := []string{"-azv", "--delete"}
+
+	// Skip archives and backups
+	excludePatterns := []string{
+		"*.tar", "*.tar.gz", "*.tgz", "*.tar.xz", "*.txz", "*.tar.bz2", "*.tbz2",
+		"*.zip",
+		"*backup*", "*Backup*", "*BACKUP*",
+	}
+	for _, pat := range excludePatterns {
+		args = append(args, "--exclude", pat)
+	}
+
 	if sshCmd != "" {
 		args = append(args, "-e", sshCmd)
 	}
-	// Ensure correct trailing slash semantics when copying directory content
-	if fi, err := os.Stat(src); err == nil && fi.IsDir() && !strings.HasSuffix(src, "/") && !strings.Contains(src, ":") {
-		src = src + "/"
-	}
+
+	// DO NOT automatically add a trailing slash. The caller must decide.
+	// This was the source of the destructive bug.
+	// if fi, err := os.Stat(src); err == nil && fi.IsDir() && !strings.HasSuffix(src, "/") && !strings.Contains(src, ":") {
+	// 	src = src + "/"
+	// }
+
 	args = append(args, src, dst)
 	c := exec.Command("rsync", args...)
 	c.Stdout = os.Stdout
