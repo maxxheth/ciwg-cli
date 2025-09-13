@@ -123,6 +123,27 @@ if [[ -f $tar_path ]]; then
         fi
     fi
     
+    # New section: Run Docker commands if available
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        echo "Docker and docker compose available. Starting containers..."
+        cd /usr/local/bin/ciwg-cli-utils || exit
+        if docker compose up -d; then
+            echo "Containers started successfully."
+        else
+            echo "Failed to start containers with docker compose."
+        fi
+    elif command -v docker-compose >/dev/null 2>&1; then
+        echo "Docker Compose (legacy) available. Starting containers..."
+        cd /usr/local/bin/ciwg-cli-utils || exit
+        if docker-compose up -d; then
+            echo "Containers started successfully."
+        else
+            echo "Failed to start containers with docker-compose."
+        fi
+    else
+        echo "Docker not available. Skipping container startup."
+    fi
+    
     if [ ! -L "/usr/local/bin/ciwg-cli" ]; then
         ln -s /usr/local/bin/ciwg-cli-utils/ciwg-cli /usr/local/bin/ciwg-cli
         echo "Symlink created."
@@ -132,7 +153,7 @@ if [[ -f $tar_path ]]; then
     
     if [ -n "$HOME_PATH" ] && [ -f "$HOME_PATH/.bashrc" ]; then
         if ! grep -q "/usr/local/bin" "$HOME_PATH/.bashrc"; then
-            echo 'export PATH="$PATH:/usr/local/bin"' >> "$HOME_PATH/.bashrc"
+            echo "export PATH=\"$PATH:/usr/local/bin\"" >> "$HOME_PATH/.bashrc"
             echo "Added /usr/local/bin to PATH in .bashrc"
         fi
     fi
