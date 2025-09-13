@@ -39,3 +39,4 @@ dist/
 *.csv
 *.tgz
 *.md
+vendor
