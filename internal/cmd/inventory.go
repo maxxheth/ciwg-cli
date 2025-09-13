@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +34,9 @@ var (
 	inventoryFormat       string
 	inventoryFilterSite   string
 	inventoryFilterServer string
+
+	// new flag: produce per-server site counts from existing inventory JSON
+	inventoryGetQty bool
 )
 
 var inventoryCmd = &cobra.Command{
@@ -59,6 +64,9 @@ func init() {
 	inventoryCmd.Flags().StringVar(&inventoryFilterSite, "filter-by-site", "", "Filter by site list (file path, pipe-delimited string, or stdin)")
 	inventoryCmd.Flags().StringVar(&inventoryFilterServer, "filter-by-server", "", "Filter by server list (file path, pipe-delimited string, or stdin)")
 
+	// new flag registration
+	inventoryCmd.Flags().BoolVar(&inventoryGetQty, "get-qty", false, "Read inventory JSON and output per-server site counts")
+
 	// SSH connection flags
 	inventoryCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
 	inventoryCmd.Flags().StringP("port", "p", "22", "SSH port")
@@ -68,6 +76,84 @@ func init() {
 }
 
 func runInventoryGenerate(cmd *cobra.Command, args []string) error {
+	// If --get-qty was requested, read the inventory JSON file and produce the tally.
+	if inventoryGetQty {
+		type tallyEntry struct {
+			Server  string `json:"server"`
+			SiteQty int    `json:"siteQty"`
+		}
+
+		// Read input JSON (use inventoryOutputFile default or provided)
+		inPath := inventoryOutputFile
+		if inPath == "" {
+			inPath = "inventory.json"
+		}
+		data, err := os.ReadFile(inPath)
+		if err != nil {
+			return fmt.Errorf("failed to read inventory file %s: %w", inPath, err)
+		}
+
+		var items []ContainerInfo
+		if err := json.Unmarshal(data, &items); err != nil {
+			return fmt.Errorf("failed to parse inventory JSON: %w", err)
+		}
+
+		// Tally by server, normalizing simple names to include the ciwg domain when missing.
+		counts := make(map[string]int)
+		for _, it := range items {
+			srv := strings.TrimSpace(it.Server)
+			if srv == "" {
+				continue
+			}
+			// If server doesn't contain a dot, append the default domain for clarity.
+			if !strings.Contains(srv, ".") {
+				srv = srv + ".ciwgserver.com"
+			}
+			counts[srv]++
+		}
+
+		// Build slice and sort by numeric server index when possible (wpNNN)
+		var list []tallyEntry
+		for s, q := range counts {
+			list = append(list, tallyEntry{Server: s, SiteQty: q})
+		}
+
+		// Sort helper: try to extract numeric suffix after "wp" and sort by that, fallback to string compare.
+		extractIdx := func(s string) (int, bool) {
+			// e.g. wp12.ciwgserver.com or wp12
+			if strings.HasPrefix(s, "wp") {
+				rest := s[2:]
+				// strip after first dot if present
+				if idx := strings.IndexByte(rest, '.'); idx >= 0 {
+					rest = rest[:idx]
+				}
+				if n, err := strconv.Atoi(rest); err == nil {
+					return n, true
+				}
+			}
+			return 0, false
+		}
+
+		sort.Slice(list, func(i, j int) bool {
+			ai, aok := extractIdx(list[i].Server)
+			bi, bok := extractIdx(list[j].Server)
+			if aok && bok {
+				return ai < bi
+			}
+			if aok != bok {
+				return aok // numbers come before non-numeric
+			}
+			return list[i].Server < list[j].Server
+		})
+
+		out, err := json.MarshalIndent(list, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal tally JSON: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
+
 	var allInventory []ContainerInfo
 
 	if inventoryServerRange != "" {
