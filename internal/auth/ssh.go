@@ -171,6 +171,18 @@ func (c *SSHClient) ExecuteCommand(command string) (string, string, error) {
 	return string(stdoutBuf), string(stderrBuf), err
 }
 
+// GetSession returns a new SSH session for more complex operations like piping.
+func (c *SSHClient) GetSession() (*ssh.Session, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("ssh client is not connected")
+	}
+	session, err := c.client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+	return session, nil
+}
+
 // ExecuteInteractiveCommand executes a command with real-time output
 func (c *SSHClient) ExecuteInteractiveCommand(command string, stdout, stderr io.Writer) error {
 	session, err := c.client.NewSession()
