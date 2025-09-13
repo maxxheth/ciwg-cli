@@ -913,6 +913,9 @@ func cfGetARecordID(zoneID, domain, email, apiKey string) (string, error) {
 
 func cfPutARecord(zoneID, recID, domain, ip, email, apiKey string) error {
 	apiURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, recID)
+	// print domain and ip
+
+	fmt.Printf("Updating Cloudflare A record for %s to %s\n", domain, ip)
 	payload := fmt.Sprintf(`{"type":"A","name":"%s","content":"%s","ttl":120,"proxied":true}`, domain, ip)
 	req, err := http.NewRequest("PUT", apiURL, bytes.NewBufferString(payload))
 	if err != nil {
