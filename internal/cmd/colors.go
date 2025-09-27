@@ -35,7 +35,7 @@ func init() {
 	colorsCmd.AddCommand(generatePaletteCmd)
 
 	// --- Command-specific flags ---
-	generatePaletteCmd.Flags().String("palette", "", "Comma-separated list of hex colors for the palette")
+	generatePaletteCmd.Flags().String("palette", "", "Comma-separated list of hex colors for the palette (if empty, generates random base colors)")
 	generatePaletteCmd.Flags().String("output-path", "/var/www/html", "Remote directory path to save the generated files")
 	generatePaletteCmd.Flags().String("config-name", "tailwind.colors.json", "Filename for the generated Tailwind JSON config")
 	generatePaletteCmd.Flags().String("html-name", "palette-preview.html", "Filename for the generated HTML preview")
@@ -104,7 +104,28 @@ func runGeneratePaletteOnServer(cmd *cobra.Command, hostname string) error {
 	secondaryColorValue := processColorFlag(secondaryColor)
 
 	// --- Generate Palette ---
-	palette := strings.Split(paletteStr, ",")
+	var palette []string
+	if paletteStr == "" {
+		// Generate a completely random base palette
+		palette = generateRandomBasePalette()
+		fmt.Printf("[%s] ✓ Generated random base palette\n", hostname)
+	} else {
+		palette = strings.Split(paletteStr, ",")
+		// Clean up any empty strings from splitting
+		var cleanPalette []string
+		for _, color := range palette {
+			if strings.TrimSpace(color) != "" {
+				cleanPalette = append(cleanPalette, strings.TrimSpace(color))
+			}
+		}
+		palette = cleanPalette
+
+		// If after cleaning we have no valid colors, generate random ones
+		if len(palette) == 0 {
+			palette = generateRandomBasePalette()
+			fmt.Printf("[%s] ✓ Generated random base palette (no valid colors provided)\n", hostname)
+		}
+	}
 
 	// If both primary and secondary colors are set, we can bypass the 2-color requirement
 	if primaryColorValue != "" && secondaryColorValue != "" && len(palette) < 2 {
@@ -184,7 +205,28 @@ func runGeneratePaletteLocally(cmd *cobra.Command) error {
 	secondaryColorValue := processColorFlag(secondaryColor)
 
 	// --- Generate Palette ---
-	palette := strings.Split(paletteStr, ",")
+	var palette []string
+	if paletteStr == "" {
+		// Generate a completely random base palette
+		palette = generateRandomBasePalette()
+		fmt.Printf("[local] ✓ Generated random base palette\n")
+	} else {
+		palette = strings.Split(paletteStr, ",")
+		// Clean up any empty strings from splitting
+		var cleanPalette []string
+		for _, color := range palette {
+			if strings.TrimSpace(color) != "" {
+				cleanPalette = append(cleanPalette, strings.TrimSpace(color))
+			}
+		}
+		palette = cleanPalette
+
+		// If after cleaning we have no valid colors, generate random ones
+		if len(palette) == 0 {
+			palette = generateRandomBasePalette()
+			fmt.Printf("[local] ✓ Generated random base palette (no valid colors provided)\n")
+		}
+	}
 
 	// If both primary and secondary colors are set, we can bypass the 2-color requirement
 	if primaryColorValue != "" && secondaryColorValue != "" && len(palette) < 2 {
@@ -280,4 +322,39 @@ func processColorFlag(flagValue string) string {
 
 	// If not a valid hex color, generate a random color
 	return generateRandomColor()
+}
+
+// generateRandomBasePalette creates a random starting palette with good color distribution
+func generateRandomBasePalette() []string {
+	rand.Seed(time.Now().UnixNano())
+
+	// Create a diverse set of base colors with good distribution
+	palette := make([]string, 0, 3)
+
+	// Generate 2-3 diverse base colors
+	numColors := rand.Intn(2) + 2 // 2 or 3 colors
+
+	for i := 0; i < numColors; i++ {
+		var color string
+		switch rand.Intn(6) {
+		case 0: // Deep blues
+			color = fmt.Sprintf("#%02x%02x%02x", rand.Intn(80), rand.Intn(80)+40, rand.Intn(100)+100)
+		case 1: // Warm oranges/reds
+			color = fmt.Sprintf("#%02x%02x%02x", rand.Intn(100)+150, rand.Intn(80)+40, rand.Intn(60))
+		case 2: // Earth tones
+			base := rand.Intn(40) + 40
+			color = fmt.Sprintf("#%02x%02x%02x", base+rand.Intn(40), base+rand.Intn(30), base-rand.Intn(20))
+		case 3: // Purples
+			color = fmt.Sprintf("#%02x%02x%02x", rand.Intn(80)+60, rand.Intn(60), rand.Intn(80)+80)
+		case 4: // Greens
+			color = fmt.Sprintf("#%02x%02x%02x", rand.Intn(60), rand.Intn(120)+60, rand.Intn(80)+40)
+		case 5: // Dark neutrals
+			base := rand.Intn(60) + 20
+			variation := rand.Intn(20) - 10
+			color = fmt.Sprintf("#%02x%02x%02x", base+variation, base+variation, base+variation)
+		}
+		palette = append(palette, color)
+	}
+
+	return palette
 }

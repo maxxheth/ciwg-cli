@@ -48,43 +48,121 @@ func GeneratePaletteConfig(hexColors []string) (*TailwindColorConfig, string, er
 
 	config := &TailwindColorConfig{}
 
-	// 2. Randomly assign darkest/lightest to primary/secondary.
+	// 2. Assign primary/secondary with more variety
 	rand.Seed(time.Now().UnixNano())
-	if rand.Intn(2) == 0 {
-		config.Primary = darkest.Hex
-		config.Secondary = lightest.Hex
-	} else {
-		config.Primary = lightest.Hex
-		config.Secondary = darkest.Hex
+
+	// Sometimes use middle colors instead of just darkest/lightest for more variety
+	assignmentStrategy := rand.Intn(4)
+	switch assignmentStrategy {
+	case 0, 1: // 50% chance: traditional darkest/lightest assignment
+		if rand.Intn(2) == 0 {
+			config.Primary = darkest.Hex
+			config.Secondary = lightest.Hex
+		} else {
+			config.Primary = lightest.Hex
+			config.Secondary = darkest.Hex
+		}
+	case 2: // 25% chance: use middle tones for more subtle palettes
+		if len(remaining) >= 2 {
+			config.Primary = remaining[rand.Intn(len(remaining))].Hex
+			config.Secondary = remaining[rand.Intn(len(remaining))].Hex
+			// Ensure they're different
+			for config.Primary == config.Secondary && len(remaining) > 1 {
+				config.Secondary = remaining[rand.Intn(len(remaining))].Hex
+			}
+		} else {
+			// Fallback to darkest/lightest
+			config.Primary = darkest.Hex
+			config.Secondary = lightest.Hex
+		}
+	case 3: // 25% chance: mix extreme with middle
+		if len(remaining) > 0 {
+			if rand.Intn(2) == 0 {
+				config.Primary = darkest.Hex
+				config.Secondary = remaining[rand.Intn(len(remaining))].Hex
+			} else {
+				config.Primary = lightest.Hex
+				config.Secondary = remaining[rand.Intn(len(remaining))].Hex
+			}
+		} else {
+			config.Primary = darkest.Hex
+			config.Secondary = lightest.Hex
+		}
 	}
 
 	// Get primary/secondary as Color objects for comparison
 	primaryColor, _ := NewColor(config.Primary)
 	secondaryColor, _ := NewColor(config.Secondary)
 
-	// 3. Assign remaining colors based on harmonic relationships (contrast).
-	// Find the best accent color: the one with the highest average distance to primary and secondary.
-	sort.Slice(remaining, func(i, j int) bool {
-		distI := ColorDifference(remaining[i], primaryColor) + ColorDifference(remaining[i], secondaryColor)
-		distJ := ColorDifference(remaining[j], primaryColor) + ColorDifference(remaining[j], secondaryColor)
-		return distI > distJ // Sort descending by distance
-	})
+	// 3. Assign remaining colors with some randomization for variety
+	if len(remaining) >= 3 {
+		// Sort by contrast but with some randomization
+		sort.Slice(remaining, func(i, j int) bool {
+			distI := ColorDifference(remaining[i], primaryColor) + ColorDifference(remaining[i], secondaryColor)
+			distJ := ColorDifference(remaining[j], primaryColor) + ColorDifference(remaining[j], secondaryColor)
 
-	config.Accent = remaining[0].Hex
+			// Add some randomness: 20% chance to ignore optimal sorting
+			if rand.Intn(5) == 0 {
+				return rand.Intn(2) == 0
+			}
+			return distI > distJ // Sort descending by distance
+		})
 
-	// Determine base and neutral from the last two colors.
-	// The 'base' (background) should have high contrast with the 'primary' (text).
-	rem1, rem2 := remaining[1], remaining[2]
+		// Choose accent from top 2 colors (adds variety while maintaining quality)
+		accentChoice := 0
+		if len(remaining) > 1 && rand.Intn(3) == 0 { // 33% chance to use second-best
+			accentChoice = 1
+		}
+		config.Accent = remaining[accentChoice].Hex
 
-	contrast1 := ColorDifference(rem1, primaryColor)
-	contrast2 := ColorDifference(rem2, primaryColor)
+		// Assign base and neutral with more variation
+		rem1, rem2 := remaining[1], remaining[2]
+		if accentChoice == 1 && len(remaining) > 2 {
+			rem1, rem2 = remaining[0], remaining[2]
+		}
 
-	if contrast1 > contrast2 {
-		config.Base = rem1.Hex
-		config.Neutral = rem2.Hex
+		// Sometimes prioritize aesthetics over pure contrast
+		assignmentMethod := rand.Intn(3)
+		switch assignmentMethod {
+		case 0: // Traditional contrast-based assignment
+			contrast1 := ColorDifference(rem1, primaryColor)
+			contrast2 := ColorDifference(rem2, primaryColor)
+			if contrast1 > contrast2 {
+				config.Base = rem1.Hex
+				config.Neutral = rem2.Hex
+			} else {
+				config.Base = rem2.Hex
+				config.Neutral = rem1.Hex
+			}
+		case 1: // Random assignment for more variety
+			if rand.Intn(2) == 0 {
+				config.Base = rem1.Hex
+				config.Neutral = rem2.Hex
+			} else {
+				config.Base = rem2.Hex
+				config.Neutral = rem1.Hex
+			}
+		case 2: // Luminance-based assignment
+			if rem1.Luminance() > rem2.Luminance() {
+				config.Base = rem1.Hex    // Lighter color as base
+				config.Neutral = rem2.Hex // Darker color as neutral
+			} else {
+				config.Base = rem2.Hex
+				config.Neutral = rem1.Hex
+			}
+		}
 	} else {
-		config.Base = rem2.Hex
-		config.Neutral = rem1.Hex
+		// Fallback for insufficient colors
+		if len(remaining) > 0 {
+			config.Accent = remaining[0].Hex
+		}
+		if len(remaining) > 1 {
+			config.Base = remaining[1].Hex
+			config.Neutral = lightest.Hex
+		} else {
+			config.Base = lightest.Hex
+			config.Neutral = darkest.Hex
+		}
 	}
 
 	// Generate the HTML preview page
@@ -329,19 +407,12 @@ func generateHTMLPreview(config *TailwindColorConfig) (string, error) {
 }
 
 // completePalette generates missing colors if the input palette has fewer than 5.
-// This is a placeholder for a more sophisticated color generation algorithm.
-// Currently, it adds basic shades to reach 5 colors.
+// Uses color theory and randomization to create diverse, quality palettes.
 func completePalette(colors []string) []string {
-	// This is a simplified approach. A more advanced version would use color theory
-	// (e.g., complementary, triadic, analogous colors) to generate new colors.
 	fmt.Printf("--- Notice: Less than 5 colors provided. Generating %d additional colors. ---\n", 5-len(colors))
 
-	baseColors := map[string]string{
-		"dark_gray":  "#333333",
-		"gray":       "#808080",
-		"light_gray": "#D3D3D3",
-		"off_white":  "#F5F5F5",
-	}
+	// Seed random number generator with current time for variety
+	rand.Seed(time.Now().UnixNano())
 
 	// Create a set of existing colors to avoid duplicates
 	existing := make(map[string]bool)
@@ -349,23 +420,91 @@ func completePalette(colors []string) []string {
 		existing[c] = true
 	}
 
-	// Add new colors until we have 5
-	for name, hex := range baseColors {
-		if len(colors) >= 5 {
-			break
-		}
-		if !existing[hex] {
-			fmt.Printf("--- Added fallback color '%s' (%s) to complete the palette. ---\n", name, hex)
-			colors = append(colors, hex)
-			existing[hex] = true
+	// Parse existing colors to understand their characteristics
+	var existingColors []*Color
+	for _, hex := range colors {
+		if c, err := NewColor(hex); err == nil {
+			existingColors = append(existingColors, c)
 		}
 	}
 
-	// If still not enough (e.g., user provided all the fallback colors), add randoms
+	// Generate colors with more variety and better distribution
+	colorGenerators := []func() string{
+		func() string { // Complementary neutrals
+			base := rand.Intn(40) + 40     // 40-79 range
+			variation := rand.Intn(15) - 7 // -7 to +7 variation
+			return fmt.Sprintf("#%02x%02x%02x", base+variation, base+variation, base+variation)
+		},
+		func() string { // Light accent colors
+			return fmt.Sprintf("#%02x%02x%02x", rand.Intn(60)+180, rand.Intn(60)+180, rand.Intn(60)+180)
+		},
+		func() string { // Medium tones with slight color bias
+			base := rand.Intn(80) + 80 // 80-159 range
+			switch rand.Intn(3) {
+			case 0: // Warm bias
+				return fmt.Sprintf("#%02x%02x%02x", base+rand.Intn(40), base-rand.Intn(20), base-rand.Intn(30))
+			case 1: // Cool bias
+				return fmt.Sprintf("#%02x%02x%02x", base-rand.Intn(30), base-rand.Intn(20), base+rand.Intn(40))
+			default: // Neutral with slight variation
+				return fmt.Sprintf("#%02x%02x%02x", base+rand.Intn(20)-10, base+rand.Intn(20)-10, base+rand.Intn(20)-10)
+			}
+		},
+		func() string { // Dark colors for depth
+			return fmt.Sprintf("#%02x%02x%02x", rand.Intn(60)+20, rand.Intn(60)+20, rand.Intn(60)+20)
+		},
+		func() string { // Saturated accent colors
+			switch rand.Intn(4) {
+			case 0: // Blue family
+				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(80)+20, rand.Intn(100)+80, rand.Intn(100)+120)
+			case 1: // Orange/Red family
+				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(120)+120, rand.Intn(80)+60, rand.Intn(40)+20)
+			case 2: // Green family
+				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(80)+40, rand.Intn(120)+80, rand.Intn(80)+60)
+			default: // Purple family
+				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(100)+80, rand.Intn(60)+40, rand.Intn(100)+100)
+			}
+		},
+	}
+
+	// Add colors until we have 5, using different generators for variety
+	generatorIndex := 0
+	attempts := 0
+	maxAttempts := 50 // Prevent infinite loops
+
+	for len(colors) < 5 && attempts < maxAttempts {
+		// Use a different generator each time, cycling through them
+		generator := colorGenerators[generatorIndex%len(colorGenerators)]
+		hex := generator()
+
+		if !existing[hex] {
+			// Verify the color is different enough from existing ones
+			newColor, err := NewColor(hex)
+			if err == nil {
+				tooSimilar := false
+				for _, existing := range existingColors {
+					if ColorDifference(newColor, existing) < 30 { // Minimum difference threshold
+						tooSimilar = true
+						break
+					}
+				}
+
+				if !tooSimilar {
+					fmt.Printf("--- Added generated color (%s) to complete the palette. ---\n", hex)
+					colors = append(colors, hex)
+					existing[hex] = true
+					existingColors = append(existingColors, newColor)
+					generatorIndex++
+				}
+			}
+		}
+		attempts++
+	}
+
+	// Fallback: if we still don't have enough colors, add truly random ones
 	for len(colors) < 5 {
 		hex := fmt.Sprintf("#%06x", rand.Intn(0xFFFFFF))
 		if !existing[hex] {
-			fmt.Printf("--- Added random color (%s) to complete the palette. ---\n", hex)
+			fmt.Printf("--- Added random fallback color (%s) to complete the palette. ---\n", hex)
 			colors = append(colors, hex)
 			existing[hex] = true
 		}
