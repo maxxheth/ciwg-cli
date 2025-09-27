@@ -73,67 +73,98 @@ func isGrayscale(color *Color) bool {
 	return hsl.S < 0.15
 }
 
-// generateGrayscaleColor creates a grayscale color within specified luminance range
+// generateGrayscaleColor creates a grayscale color much closer to true black or white
 func generateGrayscaleColor(minLum, maxLum float64) string {
-	// Generate a luminance value within the specified range
-	lum := minLum + rand.Float64()*(maxLum-minLum)
+	var val int
 
-	// Convert luminance to RGB (grayscale)
-	// For grayscale, R=G=B, and luminance ≈ 0.299*R + 0.587*G + 0.114*B
-	// Since R=G=B, luminance = R (approximately, for grayscale)
-	val := int(lum * 255)
-	if val > 255 {
-		val = 255
-	}
-	if val < 0 {
-		val = 0
-	}
-
-	// Add slight variation to make it more natural
-	variation := rand.Intn(10) - 5 // -5 to +5
-	val += variation
-	if val > 255 {
-		val = 255
-	}
-	if val < 0 {
-		val = 0
+	if maxLum <= 0.3 {
+		// Generate very dark colors (close to black) - 0-40 range
+		val = rand.Intn(35) + 5 // 5-39
+	} else {
+		// Generate very light colors (close to white) - 220-255 range
+		val = rand.Intn(35) + 220 // 220-254
 	}
 
 	return fmt.Sprintf("#%02x%02x%02x", val, val, val)
 }
 
-// generateProfessionalColor creates subdued, professional colors suitable for business applications
+// generateProfessionalColor creates distinct, saturated colors like in the examples
 func generateProfessionalColor(colorFamily int) string {
 	switch colorFamily {
-	case 0: // Muted blues (most common in professional palettes)
-		r := rand.Intn(80) + 20  // 20-99
-		g := rand.Intn(100) + 60 // 60-159
-		b := rand.Intn(120) + 80 // 80-199
+	case 0: // Rich blues (oxford_blue, yale_blue, space_cadet style)
+		r := rand.Intn(60) + 3   // 3-62 (dark)
+		g := rand.Intn(80) + 20  // 20-99
+		b := rand.Intn(120) + 60 // 60-179 (blue dominant)
 		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
-	case 1: // Earth tones/browns
-		r := rand.Intn(100) + 60 // 60-159
-		g := rand.Intn(80) + 50  // 50-129
-		b := rand.Intn(60) + 30  // 30-89
+	case 1: // Warm oranges/reds (orange_web, fire_engine_red style)
+		r := rand.Intn(120) + 135 // 135-254 (red dominant)
+		g := rand.Intn(100) + 30  // 30-129
+		b := rand.Intn(60) + 10   // 10-69 (minimal blue)
 		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
-	case 2: // Muted greens
-		r := rand.Intn(80) + 40  // 40-119
-		g := rand.Intn(120) + 70 // 70-189
-		b := rand.Intn(100) + 50 // 50-149
+	case 2: // Rich greens (hooker's_green, cambridge_blue style)
+		r := rand.Intn(100) + 20 // 20-119
+		g := rand.Intn(140) + 80 // 80-219 (green dominant)
+		b := rand.Intn(120) + 40 // 40-159
 		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
-	case 3: // Desaturated teals/cyans
-		r := rand.Intn(60) + 30  // 30-89
-		g := rand.Intn(100) + 80 // 80-179
-		b := rand.Intn(100) + 70 // 70-169
+	case 3: // Deep teals/cyans (caribbean_current, verdigris style)
+		r := rand.Intn(70) + 10  // 10-79 (minimal red)
+		g := rand.Intn(120) + 70 // 70-189 (cyan components)
+		b := rand.Intn(120) + 70 // 70-189
 		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
-	case 4: // Muted warm colors (oranges/reds)
-		r := rand.Intn(120) + 100 // 100-219
-		g := rand.Intn(80) + 60   // 60-139
-		b := rand.Intn(60) + 40   // 40-99
+	case 4: // Earth tones (taupe, walnut_brown, khaki style)
+		base := rand.Intn(100) + 70    // 70-169
+		r := base + rand.Intn(30) - 15 // Slight red bias
+		g := base + rand.Intn(20) - 10 // Neutral green
+		b := base - rand.Intn(40)      // Reduced blue for earth tone
+		if r > 255 {
+			r = 255
+		}
+		if r < 30 {
+			r = 30
+		}
+		if g > 255 {
+			g = 255
+		}
+		if g < 30 {
+			g = 30
+		}
+		if b > 255 {
+			b = 255
+		}
+		if b < 20 {
+			b = 20
+		}
 		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
-	default: // Neutral grays with slight color cast
-		base := rand.Intn(80) + 60 // 60-139
-		cast := rand.Intn(20) - 10 // -10 to +10
-		return fmt.Sprintf("#%02x%02x%02x", base+cast, base, base-cast)
+	case 5: // Purple/violet family (ultra_violet, space_cadet style)
+		r := rand.Intn(100) + 40 // 40-139 (moderate red)
+		g := rand.Intn(80) + 20  // 20-99 (lower green)
+		b := rand.Intn(120) + 60 // 60-179 (blue bias for purple)
+		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	default: // Rich grays with character (gunmetal, charcoal style)
+		base := rand.Intn(60) + 30     // 30-89
+		variation := rand.Intn(15) - 7 // Small variations
+		r := base + variation
+		g := base + variation + rand.Intn(10) - 5
+		b := base + variation + rand.Intn(15) - 7
+		if r > 120 {
+			r = 120
+		}
+		if r < 20 {
+			r = 20
+		}
+		if g > 120 {
+			g = 120
+		}
+		if g < 20 {
+			g = 20
+		}
+		if b > 120 {
+			b = 120
+		}
+		if b < 20 {
+			b = 20
+		}
+		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
 	}
 }
 
@@ -615,15 +646,15 @@ func completePalette(colors []string) []string {
 	attempts = 0
 
 	for neededProfessional > 0 && attempts < maxAttempts {
-		colorFamily := colorFamilyIndex % 6 // Cycle through 6 professional color families
+		colorFamily := colorFamilyIndex % 7 // Cycle through 7 color families (0-6)
 		hex := generateProfessionalColor(colorFamily)
 
 		if !existing[hex] {
 			if newColor, err := NewColor(hex); err == nil {
-				// Check it's different enough from existing
+				// Check it's different enough from existing (higher threshold for more distinct colors)
 				tooSimilar := false
 				for _, existing := range existingColors {
-					if ColorDifference(newColor, existing) < 30 {
+					if ColorDifference(newColor, existing) < 40 {
 						tooSimilar = true
 						break
 					}
@@ -640,9 +671,7 @@ func completePalette(colors []string) []string {
 			}
 		}
 		attempts++
-	}
-
-	// Final fallback: add any remaining colors needed
+	} // Final fallback: add any remaining colors needed
 	for len(colors) < 5 && attempts < maxAttempts*2 {
 		var hex string
 		if rand.Intn(3) == 0 {

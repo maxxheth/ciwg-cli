@@ -324,92 +324,21 @@ func processColorFlag(flagValue string) string {
 	return generateRandomColor()
 }
 
-// generateRandomBasePalette creates a random starting palette following the grayscale + professional pattern
+// generateRandomBasePalette creates a random starting palette with sharp contrast like the examples
 func generateRandomBasePalette() []string {
 	rand.Seed(time.Now().UnixNano())
 
 	palette := make([]string, 0, 3)
 
-	// Always start with 1-2 grayscale colors (for primary/secondary)
-	// Generate dark grayscale
-	darkBase := rand.Intn(50) + 10     // 10-59 range for dark colors
-	darkVariation := rand.Intn(10) - 5 // Small variation for naturalness
-	darkVal := darkBase + darkVariation
-	if darkVal < 0 {
-		darkVal = 0
-	}
-	if darkVal > 60 {
-		darkVal = 60
-	}
+	// Generate very dark grayscale (close to black)
+	darkVal := rand.Intn(30) + 5 // 5-34 range - much darker, closer to black
 	darkColor := fmt.Sprintf("#%02x%02x%02x", darkVal, darkVal, darkVal)
 	palette = append(palette, darkColor)
 
-	// Generate light grayscale (70% chance) or middle gray (30% chance)
-	if rand.Intn(10) < 7 {
-		// Light grayscale
-		lightBase := rand.Intn(50) + 180 // 180-229 range for light colors
-		lightVariation := rand.Intn(10) - 5
-		lightVal := lightBase + lightVariation
-		if lightVal < 150 {
-			lightVal = 150
-		}
-		if lightVal > 255 {
-			lightVal = 255
-		}
-		lightColor := fmt.Sprintf("#%02x%02x%02x", lightVal, lightVal, lightVal)
-		palette = append(palette, lightColor)
-	} else {
-		// Middle gray
-		midBase := rand.Intn(60) + 80 // 80-139 range
-		midVariation := rand.Intn(10) - 5
-		midVal := midBase + midVariation
-		if midVal < 70 {
-			midVal = 70
-		}
-		if midVal > 150 {
-			midVal = 150
-		}
-		midColor := fmt.Sprintf("#%02x%02x%02x", midVal, midVal, midVal)
-		palette = append(palette, midColor)
-	}
-
-	// Optionally add 1 professional color for variety (completePalette will fill the rest)
-	if rand.Intn(2) == 0 {
-		colorFamily := rand.Intn(6)
-		var professionalColor string
-		switch colorFamily {
-		case 0: // Muted blues (most professional)
-			r := rand.Intn(60) + 30  // 30-89
-			g := rand.Intn(80) + 70  // 70-149
-			b := rand.Intn(100) + 90 // 90-189
-			professionalColor = fmt.Sprintf("#%02x%02x%02x", r, g, b)
-		case 1: // Earth tones
-			r := rand.Intn(80) + 70 // 70-149
-			g := rand.Intn(60) + 60 // 60-119
-			b := rand.Intn(50) + 40 // 40-89
-			professionalColor = fmt.Sprintf("#%02x%02x%02x", r, g, b)
-		case 2: // Muted greens
-			r := rand.Intn(60) + 50  // 50-109
-			g := rand.Intn(100) + 80 // 80-179
-			b := rand.Intn(80) + 60  // 60-139
-			professionalColor = fmt.Sprintf("#%02x%02x%02x", r, g, b)
-		case 3: // Desaturated teals
-			r := rand.Intn(50) + 40 // 40-89
-			g := rand.Intn(80) + 90 // 90-169
-			b := rand.Intn(80) + 80 // 80-159
-			professionalColor = fmt.Sprintf("#%02x%02x%02x", r, g, b)
-		case 4: // Muted warm colors
-			r := rand.Intn(100) + 110 // 110-209
-			g := rand.Intn(70) + 70   // 70-139
-			b := rand.Intn(50) + 50   // 50-99
-			professionalColor = fmt.Sprintf("#%02x%02x%02x", r, g, b)
-		default: // Neutral with color cast
-			base := rand.Intn(60) + 70 // 70-129
-			cast := rand.Intn(15) - 7  // -7 to +7
-			professionalColor = fmt.Sprintf("#%02x%02x%02x", base+cast, base, base-cast)
-		}
-		palette = append(palette, professionalColor)
-	}
+	// Generate very light grayscale (close to white)
+	lightVal := rand.Intn(30) + 225 // 225-255 range - much lighter, closer to white
+	lightColor := fmt.Sprintf("#%02x%02x%02x", lightVal, lightVal, lightVal)
+	palette = append(palette, lightColor)
 
 	return palette
 }
