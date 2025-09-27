@@ -2,6 +2,7 @@ package colors
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"time"
@@ -14,6 +15,126 @@ type TailwindColorConfig struct {
 	Accent    string `json:"accent"`
 	Neutral   string `json:"neutral"`
 	Base      string `json:"base"`
+}
+
+// HSL represents the Hue, Saturation, Lightness color model
+type HSL struct {
+	H, S, L float64
+}
+
+// ToHSL converts a Color to HSL representation
+func (c *Color) ToHSL() HSL {
+	r := float64(c.RGB.R) / 255.0
+	g := float64(c.RGB.G) / 255.0
+	b := float64(c.RGB.B) / 255.0
+
+	max := math.Max(r, math.Max(g, b))
+	min := math.Min(r, math.Min(g, b))
+	diff := max - min
+
+	// Lightness
+	l := (max + min) / 2.0
+
+	var h, s float64
+
+	if diff == 0 {
+		h = 0
+		s = 0 // achromatic (gray)
+	} else {
+		// Saturation
+		if l < 0.5 {
+			s = diff / (max + min)
+		} else {
+			s = diff / (2.0 - max - min)
+		}
+
+		// Hue
+		switch max {
+		case r:
+			h = (g - b) / diff
+			if g < b {
+				h += 6
+			}
+		case g:
+			h = (b-r)/diff + 2
+		case b:
+			h = (r-g)/diff + 4
+		}
+		h /= 6.0
+	}
+
+	return HSL{H: h * 360, S: s, L: l}
+}
+
+// isGrayscale determines if a color is grayscale/neutral based on saturation
+func isGrayscale(color *Color) bool {
+	hsl := color.ToHSL()
+	// A color is considered grayscale if saturation is very low (< 0.15)
+	return hsl.S < 0.15
+}
+
+// generateGrayscaleColor creates a grayscale color within specified luminance range
+func generateGrayscaleColor(minLum, maxLum float64) string {
+	// Generate a luminance value within the specified range
+	lum := minLum + rand.Float64()*(maxLum-minLum)
+
+	// Convert luminance to RGB (grayscale)
+	// For grayscale, R=G=B, and luminance ≈ 0.299*R + 0.587*G + 0.114*B
+	// Since R=G=B, luminance = R (approximately, for grayscale)
+	val := int(lum * 255)
+	if val > 255 {
+		val = 255
+	}
+	if val < 0 {
+		val = 0
+	}
+
+	// Add slight variation to make it more natural
+	variation := rand.Intn(10) - 5 // -5 to +5
+	val += variation
+	if val > 255 {
+		val = 255
+	}
+	if val < 0 {
+		val = 0
+	}
+
+	return fmt.Sprintf("#%02x%02x%02x", val, val, val)
+}
+
+// generateProfessionalColor creates subdued, professional colors suitable for business applications
+func generateProfessionalColor(colorFamily int) string {
+	switch colorFamily {
+	case 0: // Muted blues (most common in professional palettes)
+		r := rand.Intn(80) + 20  // 20-99
+		g := rand.Intn(100) + 60 // 60-159
+		b := rand.Intn(120) + 80 // 80-199
+		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	case 1: // Earth tones/browns
+		r := rand.Intn(100) + 60 // 60-159
+		g := rand.Intn(80) + 50  // 50-129
+		b := rand.Intn(60) + 30  // 30-89
+		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	case 2: // Muted greens
+		r := rand.Intn(80) + 40  // 40-119
+		g := rand.Intn(120) + 70 // 70-189
+		b := rand.Intn(100) + 50 // 50-149
+		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	case 3: // Desaturated teals/cyans
+		r := rand.Intn(60) + 30  // 30-89
+		g := rand.Intn(100) + 80 // 80-179
+		b := rand.Intn(100) + 70 // 70-169
+		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	case 4: // Muted warm colors (oranges/reds)
+		r := rand.Intn(120) + 100 // 100-219
+		g := rand.Intn(80) + 60   // 60-139
+		b := rand.Intn(60) + 40   // 40-99
+		return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	default: // Neutral grays with slight color cast
+		base := rand.Intn(80) + 60 // 60-139
+		cast := rand.Intn(20) - 10 // -10 to +10
+		return fmt.Sprintf("#%02x%02x%02x", base+cast, base, base-cast)
+	}
 }
 
 // GeneratePaletteConfig is the main algorithm to generate a Tailwind config and an HTML preview from a list of hex colors.
@@ -37,132 +158,133 @@ func GeneratePaletteConfig(hexColors []string) (*TailwindColorConfig, string, er
 		palette = append(palette, c)
 	}
 
-	// 1. Identify the darkest and lightest colors.
-	sort.Slice(palette, func(i, j int) bool {
-		return palette[i].Luminance() < palette[j].Luminance()
-	})
-
-	darkest := palette[0]
-	lightest := palette[len(palette)-1]
-	remaining := palette[1 : len(palette)-1]
-
 	config := &TailwindColorConfig{}
-
-	// 2. Assign primary/secondary with more variety
 	rand.Seed(time.Now().UnixNano())
 
-	// Sometimes use middle colors instead of just darkest/lightest for more variety
-	assignmentStrategy := rand.Intn(4)
-	switch assignmentStrategy {
-	case 0, 1: // 50% chance: traditional darkest/lightest assignment
-		if rand.Intn(2) == 0 {
-			config.Primary = darkest.Hex
-			config.Secondary = lightest.Hex
+	// 1. Separate grayscale colors from others
+	var grayscaleColors []*Color
+	var coloredColors []*Color
+
+	for _, color := range palette {
+		if isGrayscale(color) {
+			grayscaleColors = append(grayscaleColors, color)
 		} else {
-			config.Primary = lightest.Hex
-			config.Secondary = darkest.Hex
+			coloredColors = append(coloredColors, color)
 		}
-	case 2: // 25% chance: use middle tones for more subtle palettes
-		if len(remaining) >= 2 {
-			config.Primary = remaining[rand.Intn(len(remaining))].Hex
-			config.Secondary = remaining[rand.Intn(len(remaining))].Hex
-			// Ensure they're different
-			for config.Primary == config.Secondary && len(remaining) > 1 {
-				config.Secondary = remaining[rand.Intn(len(remaining))].Hex
-			}
+	}
+
+	// 2. Assign primary and secondary from grayscale colors
+	if len(grayscaleColors) >= 2 {
+		// Sort grayscale colors by luminance
+		sort.Slice(grayscaleColors, func(i, j int) bool {
+			return grayscaleColors[i].Luminance() < grayscaleColors[j].Luminance()
+		})
+
+		// Use darkest and lightest grayscale colors
+		config.Primary = grayscaleColors[0].Hex                        // Darkest
+		config.Secondary = grayscaleColors[len(grayscaleColors)-1].Hex // Lightest
+	} else if len(grayscaleColors) == 1 {
+		// One grayscale color, generate another
+		config.Primary = grayscaleColors[0].Hex
+		if grayscaleColors[0].Luminance() < 0.5 {
+			// Dark color, generate a light one
+			config.Secondary = generateGrayscaleColor(0.7, 0.95)
 		} else {
-			// Fallback to darkest/lightest
-			config.Primary = darkest.Hex
-			config.Secondary = lightest.Hex
+			// Light color, generate a dark one
+			config.Secondary = generateGrayscaleColor(0.05, 0.3)
 		}
-	case 3: // 25% chance: mix extreme with middle
-		if len(remaining) > 0 {
-			if rand.Intn(2) == 0 {
-				config.Primary = darkest.Hex
-				config.Secondary = remaining[rand.Intn(len(remaining))].Hex
-			} else {
-				config.Primary = lightest.Hex
-				config.Secondary = remaining[rand.Intn(len(remaining))].Hex
-			}
-		} else {
-			config.Primary = darkest.Hex
-			config.Secondary = lightest.Hex
-		}
+	} else {
+		// No grayscale colors, generate both
+		config.Primary = generateGrayscaleColor(0.05, 0.3)   // Dark
+		config.Secondary = generateGrayscaleColor(0.7, 0.95) // Light
 	}
 
 	// Get primary/secondary as Color objects for comparison
 	primaryColor, _ := NewColor(config.Primary)
 	secondaryColor, _ := NewColor(config.Secondary)
 
-	// 3. Assign remaining colors with some randomization for variety
-	if len(remaining) >= 3 {
-		// Sort by contrast but with some randomization
-		sort.Slice(remaining, func(i, j int) bool {
-			distI := ColorDifference(remaining[i], primaryColor) + ColorDifference(remaining[i], secondaryColor)
-			distJ := ColorDifference(remaining[j], primaryColor) + ColorDifference(remaining[j], secondaryColor)
+	// 3. Assign accent, neutral, and base from remaining colors (colored + unused grayscale)
+	var remainingColors []*Color
 
-			// Add some randomness: 20% chance to ignore optimal sorting
-			if rand.Intn(5) == 0 {
-				return rand.Intn(2) == 0
+	// Add unused grayscale colors (beyond the 2 used for primary/secondary)
+	if len(grayscaleColors) > 2 {
+		for i := 1; i < len(grayscaleColors)-1; i++ {
+			remainingColors = append(remainingColors, grayscaleColors[i])
+		}
+	}
+
+	// Add all colored (non-grayscale) colors
+	remainingColors = append(remainingColors, coloredColors...)
+
+	// If we don't have enough colors, generate professional ones
+	for len(remainingColors) < 3 {
+		colorFamily := rand.Intn(6) // 0-5 for different professional color families
+		hex := generateProfessionalColor(colorFamily)
+		if color, err := NewColor(hex); err == nil {
+			// Check it's different enough from existing colors
+			tooSimilar := false
+			for _, existing := range remainingColors {
+				if ColorDifference(color, existing) < 30 {
+					tooSimilar = true
+					break
+				}
 			}
-			return distI > distJ // Sort descending by distance
+			for _, existing := range grayscaleColors {
+				if ColorDifference(color, existing) < 30 {
+					tooSimilar = true
+					break
+				}
+			}
+
+			if !tooSimilar {
+				remainingColors = append(remainingColors, color)
+			}
+		}
+	}
+
+	// Assign the remaining 3 colors (accent, neutral, base) with quality prioritization
+	if len(remainingColors) >= 3 {
+		// Sort by contrast to primary/secondary for better accessibility
+		sort.Slice(remainingColors, func(i, j int) bool {
+			distI := ColorDifference(remainingColors[i], primaryColor) + ColorDifference(remainingColors[i], secondaryColor)
+			distJ := ColorDifference(remainingColors[j], primaryColor) + ColorDifference(remainingColors[j], secondaryColor)
+			return distI > distJ // Sort descending by distance for better contrast
 		})
 
-		// Choose accent from top 2 colors (adds variety while maintaining quality)
-		accentChoice := 0
-		if len(remaining) > 1 && rand.Intn(3) == 0 { // 33% chance to use second-best
-			accentChoice = 1
-		}
-		config.Accent = remaining[accentChoice].Hex
+		// Assign with some variation to avoid predictability
+		config.Accent = remainingColors[0].Hex // Best contrast color for accent
 
-		// Assign base and neutral with more variation
-		rem1, rem2 := remaining[1], remaining[2]
-		if accentChoice == 1 && len(remaining) > 2 {
-			rem1, rem2 = remaining[0], remaining[2]
-		}
+		// For base and neutral, consider both contrast and luminance
+		if len(remainingColors) >= 3 {
+			// Assign based on luminance for natural hierarchy
+			baseCandidate := remainingColors[1]
+			neutralCandidate := remainingColors[2]
 
-		// Sometimes prioritize aesthetics over pure contrast
-		assignmentMethod := rand.Intn(3)
-		switch assignmentMethod {
-		case 0: // Traditional contrast-based assignment
-			contrast1 := ColorDifference(rem1, primaryColor)
-			contrast2 := ColorDifference(rem2, primaryColor)
-			if contrast1 > contrast2 {
-				config.Base = rem1.Hex
-				config.Neutral = rem2.Hex
+			// Base should typically be lighter (for content backgrounds)
+			// Neutral should be darker (for subtle elements)
+			if baseCandidate.Luminance() > neutralCandidate.Luminance() {
+				config.Base = baseCandidate.Hex
+				config.Neutral = neutralCandidate.Hex
 			} else {
-				config.Base = rem2.Hex
-				config.Neutral = rem1.Hex
-			}
-		case 1: // Random assignment for more variety
-			if rand.Intn(2) == 0 {
-				config.Base = rem1.Hex
-				config.Neutral = rem2.Hex
-			} else {
-				config.Base = rem2.Hex
-				config.Neutral = rem1.Hex
-			}
-		case 2: // Luminance-based assignment
-			if rem1.Luminance() > rem2.Luminance() {
-				config.Base = rem1.Hex    // Lighter color as base
-				config.Neutral = rem2.Hex // Darker color as neutral
-			} else {
-				config.Base = rem2.Hex
-				config.Neutral = rem1.Hex
+				config.Base = neutralCandidate.Hex
+				config.Neutral = baseCandidate.Hex
 			}
 		}
 	} else {
-		// Fallback for insufficient colors
-		if len(remaining) > 0 {
-			config.Accent = remaining[0].Hex
-		}
-		if len(remaining) > 1 {
-			config.Base = remaining[1].Hex
-			config.Neutral = lightest.Hex
+		// Fallback: generate missing colors
+		if len(remainingColors) >= 1 {
+			config.Accent = remainingColors[0].Hex
 		} else {
-			config.Base = lightest.Hex
-			config.Neutral = darkest.Hex
+			config.Accent = generateProfessionalColor(0) // Muted blue
 		}
+
+		if len(remainingColors) >= 2 {
+			config.Base = remainingColors[1].Hex
+		} else {
+			config.Base = generateProfessionalColor(5) // Neutral gray
+		}
+
+		config.Neutral = generateProfessionalColor(1) // Earth tone
 	}
 
 	// Generate the HTML preview page
@@ -407,7 +529,7 @@ func generateHTMLPreview(config *TailwindColorConfig) (string, error) {
 }
 
 // completePalette generates missing colors if the input palette has fewer than 5.
-// Uses color theory and randomization to create diverse, quality palettes.
+// Follows the principle: primary/secondary must be grayscale, others are professional colors.
 func completePalette(colors []string) []string {
 	fmt.Printf("--- Notice: Less than 5 colors provided. Generating %d additional colors. ---\n", 5-len(colors))
 
@@ -420,95 +542,143 @@ func completePalette(colors []string) []string {
 		existing[c] = true
 	}
 
-	// Parse existing colors to understand their characteristics
+	// Parse existing colors and categorize them
 	var existingColors []*Color
+	var grayscaleCount int
+
 	for _, hex := range colors {
 		if c, err := NewColor(hex); err == nil {
 			existingColors = append(existingColors, c)
+			if isGrayscale(c) {
+				grayscaleCount++
+			}
 		}
 	}
 
-	// Generate colors with more variety and better distribution
-	colorGenerators := []func() string{
-		func() string { // Complementary neutrals
-			base := rand.Intn(40) + 40     // 40-79 range
-			variation := rand.Intn(15) - 7 // -7 to +7 variation
-			return fmt.Sprintf("#%02x%02x%02x", base+variation, base+variation, base+variation)
-		},
-		func() string { // Light accent colors
-			return fmt.Sprintf("#%02x%02x%02x", rand.Intn(60)+180, rand.Intn(60)+180, rand.Intn(60)+180)
-		},
-		func() string { // Medium tones with slight color bias
-			base := rand.Intn(80) + 80 // 80-159 range
-			switch rand.Intn(3) {
-			case 0: // Warm bias
-				return fmt.Sprintf("#%02x%02x%02x", base+rand.Intn(40), base-rand.Intn(20), base-rand.Intn(30))
-			case 1: // Cool bias
-				return fmt.Sprintf("#%02x%02x%02x", base-rand.Intn(30), base-rand.Intn(20), base+rand.Intn(40))
-			default: // Neutral with slight variation
-				return fmt.Sprintf("#%02x%02x%02x", base+rand.Intn(20)-10, base+rand.Intn(20)-10, base+rand.Intn(20)-10)
-			}
-		},
-		func() string { // Dark colors for depth
-			return fmt.Sprintf("#%02x%02x%02x", rand.Intn(60)+20, rand.Intn(60)+20, rand.Intn(60)+20)
-		},
-		func() string { // Saturated accent colors
-			switch rand.Intn(4) {
-			case 0: // Blue family
-				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(80)+20, rand.Intn(100)+80, rand.Intn(100)+120)
-			case 1: // Orange/Red family
-				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(120)+120, rand.Intn(80)+60, rand.Intn(40)+20)
-			case 2: // Green family
-				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(80)+40, rand.Intn(120)+80, rand.Intn(80)+60)
-			default: // Purple family
-				return fmt.Sprintf("#%02x%02x%02x", rand.Intn(100)+80, rand.Intn(60)+40, rand.Intn(100)+100)
-			}
-		},
+	// Determine what types of colors we need to add
+	neededGrayscale := 2 - grayscaleCount
+	if neededGrayscale < 0 {
+		neededGrayscale = 0
 	}
 
-	// Add colors until we have 5, using different generators for variety
-	generatorIndex := 0
-	attempts := 0
-	maxAttempts := 50 // Prevent infinite loops
+	neededProfessional := (5 - len(colors)) - neededGrayscale
 
-	for len(colors) < 5 && attempts < maxAttempts {
-		// Use a different generator each time, cycling through them
-		generator := colorGenerators[generatorIndex%len(colorGenerators)]
-		hex := generator()
+	// Generate needed grayscale colors first (for primary/secondary)
+	attempts := 0
+	maxAttempts := 20
+
+	for neededGrayscale > 0 && attempts < maxAttempts {
+		var hex string
+		if grayscaleCount == 0 {
+			// Need both dark and light grayscale
+			if rand.Intn(2) == 0 {
+				hex = generateGrayscaleColor(0.05, 0.3) // Dark
+			} else {
+				hex = generateGrayscaleColor(0.7, 0.95) // Light
+			}
+		} else {
+			// Generate complement to existing grayscale
+			existingGrayscale := getAverageGrayscaleLuminance(existingColors)
+			if existingGrayscale < 0.5 {
+				hex = generateGrayscaleColor(0.7, 0.95) // Add light
+			} else {
+				hex = generateGrayscaleColor(0.05, 0.3) // Add dark
+			}
+		}
 
 		if !existing[hex] {
-			// Verify the color is different enough from existing ones
-			newColor, err := NewColor(hex)
-			if err == nil {
+			if newColor, err := NewColor(hex); err == nil {
+				// Check it's different enough from existing
 				tooSimilar := false
 				for _, existing := range existingColors {
-					if ColorDifference(newColor, existing) < 30 { // Minimum difference threshold
+					if ColorDifference(newColor, existing) < 25 {
 						tooSimilar = true
 						break
 					}
 				}
 
 				if !tooSimilar {
-					fmt.Printf("--- Added generated color (%s) to complete the palette. ---\n", hex)
+					fmt.Printf("--- Added grayscale color (%s) for primary/secondary use. ---\n", hex)
 					colors = append(colors, hex)
 					existing[hex] = true
 					existingColors = append(existingColors, newColor)
-					generatorIndex++
+					neededGrayscale--
+					grayscaleCount++
 				}
 			}
 		}
 		attempts++
 	}
 
-	// Fallback: if we still don't have enough colors, add truly random ones
-	for len(colors) < 5 {
-		hex := fmt.Sprintf("#%06x", rand.Intn(0xFFFFFF))
+	// Generate needed professional colors (for accent, neutral, base)
+	colorFamilyIndex := 0
+	attempts = 0
+
+	for neededProfessional > 0 && attempts < maxAttempts {
+		colorFamily := colorFamilyIndex % 6 // Cycle through 6 professional color families
+		hex := generateProfessionalColor(colorFamily)
+
 		if !existing[hex] {
-			fmt.Printf("--- Added random fallback color (%s) to complete the palette. ---\n", hex)
+			if newColor, err := NewColor(hex); err == nil {
+				// Check it's different enough from existing
+				tooSimilar := false
+				for _, existing := range existingColors {
+					if ColorDifference(newColor, existing) < 30 {
+						tooSimilar = true
+						break
+					}
+				}
+
+				if !tooSimilar {
+					fmt.Printf("--- Added professional color (%s) for accent/neutral/base use. ---\n", hex)
+					colors = append(colors, hex)
+					existing[hex] = true
+					existingColors = append(existingColors, newColor)
+					neededProfessional--
+					colorFamilyIndex++
+				}
+			}
+		}
+		attempts++
+	}
+
+	// Final fallback: add any remaining colors needed
+	for len(colors) < 5 && attempts < maxAttempts*2 {
+		var hex string
+		if rand.Intn(3) == 0 {
+			// Add grayscale
+			hex = generateGrayscaleColor(0.2, 0.8)
+		} else {
+			// Add professional color
+			hex = generateProfessionalColor(rand.Intn(6))
+		}
+
+		if !existing[hex] {
+			fmt.Printf("--- Added fallback color (%s) to complete the palette. ---\n", hex)
 			colors = append(colors, hex)
 			existing[hex] = true
 		}
+		attempts++
 	}
 
 	return colors
+}
+
+// getAverageGrayscaleLuminance calculates the average luminance of grayscale colors
+func getAverageGrayscaleLuminance(colors []*Color) float64 {
+	var total float64
+	var count int
+
+	for _, color := range colors {
+		if isGrayscale(color) {
+			total += color.Luminance() / 255.0 // Normalize to 0-1
+			count++
+		}
+	}
+
+	if count == 0 {
+		return 0.5 // Default middle luminance
+	}
+
+	return total / float64(count)
 }
