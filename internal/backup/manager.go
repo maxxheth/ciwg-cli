@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,6 +35,8 @@ type BackupOptions struct {
 	ContainerNames []string
 	// Local indicates to run docker and tar commands locally instead of over SSH
 	Local bool
+	// ParentDir is the parent directory where site working directories are located (e.g. /var/opt/sites)
+	ParentDir string
 }
 
 type ContainerInfo struct {
@@ -375,14 +378,21 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 		return nil
 	}
 
-	// Clean old SQL files
-	fmt.Printf("Cleaning old SQL files in %s...\n", container.Name)
-	cleanCmd := fmt.Sprintf(`docker exec -u 0 "%s" find /var/www/html -name "*.sql" -type f -mmin +120 -exec rm -f {} \;`, container.Name)
+	// Clean all SQL files
+	fmt.Printf("Cleaning all SQL files in %s...\n", container.Name)
+	cleanCmd := fmt.Sprintf(`docker exec -u 0 "%s" find /var/www/html -name "*.sql" -type f -exec rm -f {} \;`, container.Name)
 	if _, stderr, err := bm.executeCommand(cleanCmd); err != nil {
 		fmt.Printf("Warning: failed to clean old SQL files: %v (stderr: %s)\n", err, stderr)
 	}
 
 	// Export database
+	fmt.Printf("Removing existing SQL files in %s/www/wp-content...\n", container.WorkingDir)
+	hostWPContent := filepath.Join(container.WorkingDir, "www", "wp-content")
+	cleanHostCmd := fmt.Sprintf(`if [ -d "%s" ]; then find "%s" -name "*.sql" -type f -exec rm -f {} +; fi`, hostWPContent, hostWPContent)
+	if _, stderr, err := bm.executeCommand(cleanHostCmd); err != nil {
+		fmt.Printf("Warning: failed to remove existing SQL files from host wp-content: %v (stderr: %s)\n", err, stderr)
+	}
+
 	fmt.Printf("Exporting DB in %s...\n", container.Name)
 	exportCmd := fmt.Sprintf(`docker exec -u 0 "%s" sh -c 'wp --allow-root db export && mv *.sql /var/www/html/wp-content/'`, container.Name)
 	if _, stderr, err := bm.executeCommand(exportCmd); err != nil {
@@ -391,7 +401,7 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 
 	// Create and stream tarball to Minio
 	fmt.Printf("Creating and streaming tarball to Minio...\n")
-	if err := bm.streamBackupToMinio(container.WorkingDir, backupName); err != nil {
+	if err := bm.streamBackupToMinio(container.WorkingDir, backupName, options.ParentDir); err != nil {
 		return fmt.Errorf("failed to stream backup to Minio: %w", err)
 	}
 
@@ -414,12 +424,25 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 	return nil
 }
 
-func (bm *BackupManager) streamBackupToMinio(workingDir, backupName string) error {
-	// Create tar command that outputs to stdout
-	tarCmd := fmt.Sprintf(`cd /var/opt && tar -czf - --exclude="*.tgz" --exclude="*.tar.gz" --exclude="*.zip" "%s"`, workingDir)
+func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir string) error {
+	// Build a tar command that attempts the provided workingDir first and
+	// falls back to parentDir/<basename> if the first path doesn't exist.
+	// This works for both local and remote execution because we run the
+	// command under a shell (bash -lc).
+	var tarCmd string
+	if parentDir != "" {
+		alt := filepath.Join(parentDir, filepath.Base(workingDir))
+		// Use a shell conditional so remote execution can choose the right path.
+		tarCmd = fmt.Sprintf(`if [ -d "%s" ]; then tar -czf - --exclude="*.tgz" --exclude="*.tar.gz" --exclude="*.zip" "%s"; elif [ -d "%s" ]; then tar -czf - --exclude="*.tgz" --exclude="*.tar.gz" --exclude="*.zip" "%s"; else echo "tar: no such directory: %s" >&2; exit 2; fi`, workingDir, workingDir, alt, alt, workingDir)
+	} else {
+		tarCmd = fmt.Sprintf(`tar -czf - --exclude="*.tgz" --exclude="*.tar.gz" --exclude="*.zip" "%s"`, workingDir)
+	}
+
 	// If running locally (no ssh client) run tar locally and stream stdout to Minio
 	if bm.sshClient == nil {
 		cmd := exec.Command("bash", "-lc", tarCmd)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			return fmt.Errorf("failed to create stdout pipe for local tar: %w", err)
@@ -442,14 +465,24 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName string) erro
 		}
 
 		if err := cmd.Wait(); err != nil {
-			return fmt.Errorf("local tar command failed: %w", err)
+			// Treat tar exit code 1 for "file changed as we read it" as a non-fatal warning
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				if exitErr.ExitCode() == 1 && strings.Contains(stderr.String(), "file changed as we read it") {
+					fmt.Printf("Warning: tar reported non-fatal issue: %s\n", strings.TrimSpace(stderr.String()))
+				} else {
+					return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+				}
+			} else {
+				return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+			}
 		}
 
 		fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", backupName, info.Size)
 		return nil
 	}
 
-	// Remote (ssh) path
+	// Remote (ssh) path - run the tarCmd under bash -lc on the remote side
 	session, err := bm.sshClient.GetSession()
 	if err != nil {
 		return fmt.Errorf("failed to create SSH session: %w", err)
@@ -462,8 +495,20 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName string) erro
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
+	remoteCmd := fmt.Sprintf("bash -lc %q", tarCmd)
+
+	// Prepare to capture remote stderr so we can detect benign tar warnings
+	remoteStderrPipe, err := session.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to get stderr pipe from SSH session: %w", err)
+	}
+	var remoteStderr bytes.Buffer
+	go func() {
+		_, _ = io.Copy(&remoteStderr, remoteStderrPipe)
+	}()
+
 	// Start the tar command
-	if err := session.Start(tarCmd); err != nil {
+	if err := session.Start(remoteCmd); err != nil {
 		return fmt.Errorf("failed to start tar command: %w", err)
 	}
 
@@ -481,7 +526,12 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName string) erro
 
 	// Wait for command to complete
 	if err := session.Wait(); err != nil {
-		return fmt.Errorf("tar command failed: %w", err)
+		// If remote tar printed "file changed as we read it" consider it a warning
+		if strings.Contains(remoteStderr.String(), "file changed as we read it") {
+			fmt.Printf("Warning: remote tar reported non-fatal issue: %s\n", strings.TrimSpace(remoteStderr.String()))
+		} else {
+			return fmt.Errorf("tar command failed: %w (remote stderr: %s)", err, remoteStderr.String())
+		}
 	}
 
 	fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", backupName, info.Size)
@@ -600,4 +650,36 @@ func (bm *BackupManager) GetLatestObject(prefix string) (string, error) {
 	}
 
 	return latest.Key, nil
+}
+
+// DeleteObject removes a single object from the configured Minio bucket.
+func (bm *BackupManager) DeleteObject(objectName string) error {
+	if err := bm.initMinioClient(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	if err := bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, objectName, minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("failed to delete object '%s': %w", objectName, err)
+	}
+	return nil
+}
+
+// DeleteObjects removes multiple objects from the configured Minio bucket.
+// It attempts to delete each object and aggregates any errors into a single error.
+func (bm *BackupManager) DeleteObjects(objectNames []string) error {
+	if err := bm.initMinioClient(); err != nil {
+		return err
+	}
+
+	var errs []string
+	for _, o := range objectNames {
+		if err := bm.DeleteObject(o); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", o, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("errors deleting objects: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
