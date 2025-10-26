@@ -40,3 +40,4 @@ dist/
 *.tgz
 *.md
 vendor
+tarballs
