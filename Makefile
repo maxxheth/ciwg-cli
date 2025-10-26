@@ -14,6 +14,12 @@ build:
 	@tar -czf ./dist/ciwg-cli-utils.tgz -C ./dist ciwg-cli-utils
 	@echo "Build completed: ./dist/ciwg-cli-utils.tgz"
 
+alias:
+	@echo "Creating alias..."
+	@echo 'alias ciwg-cli-dev="$$(pwd)/dist/ciwg-cli-utils/ciwg-cli"' >> ~/.bashrc
+	@echo "Alias added to ~/.bashrc"
+	@echo "Run 'source ~/.bashrc' or restart your terminal to use: ciwg-cli-dev"
+
 # Run the application
 run:
 	@go run cmd/cli/main.go

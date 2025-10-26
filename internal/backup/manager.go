@@ -3,6 +3,8 @@ package backup
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -39,6 +41,13 @@ type BackupManager struct {
 	minioConfig *MinioConfig
 }
 
+// ObjectInfo is a lightweight representation of an object in Minio
+type ObjectInfo struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
+
 func NewBackupManager(sshClient *auth.SSHClient, minioConfig *MinioConfig) *BackupManager {
 	return &BackupManager{
 		sshClient:   sshClient,
@@ -71,6 +80,70 @@ func (bm *BackupManager) initMinioClient() error {
 	if !exists {
 		return fmt.Errorf("bucket %s does not exist", bm.minioConfig.Bucket)
 	}
+
+	return nil
+}
+
+func (bm *BackupManager) TestMinioConnection() error {
+	if err := bm.initMinioClient(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	// Step 1: Test bucket existence
+	fmt.Printf("1. Testing bucket existence...\n")
+	exists, err := bm.minioClient.BucketExists(ctx, bm.minioConfig.Bucket)
+	if err != nil {
+		return fmt.Errorf("failed to check bucket existence: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("bucket '%s' does not exist", bm.minioConfig.Bucket)
+	}
+	fmt.Printf("   ✓ Bucket '%s' exists\n\n", bm.minioConfig.Bucket)
+
+	// Step 2: Test write operation
+	fmt.Printf("2. Testing write operation...\n")
+	testObjectName := fmt.Sprintf(".connection-test-%d.txt", time.Now().Unix())
+	testContent := []byte("This is a connection test file created by ciwg-cli")
+
+	info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, testObjectName,
+		strings.NewReader(string(testContent)), int64(len(testContent)), minio.PutObjectOptions{
+			ContentType: "text/plain",
+		})
+	if err != nil {
+		return fmt.Errorf("failed to write test object: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully wrote test object '%s' (%d bytes)\n\n", testObjectName, info.Size)
+
+	// Step 3: Test read operation
+	fmt.Printf("3. Testing read operation...\n")
+	object, err := bm.minioClient.GetObject(ctx, bm.minioConfig.Bucket, testObjectName, minio.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to read test object: %w", err)
+	}
+	defer object.Close()
+
+	readContent := make([]byte, len(testContent))
+	n, err := object.Read(readContent)
+	if err != nil && err.Error() != "EOF" {
+		return fmt.Errorf("failed to read test object content: %w", err)
+	}
+	if n != len(testContent) {
+		return fmt.Errorf("read size mismatch: expected %d, got %d", len(testContent), n)
+	}
+	if string(readContent) != string(testContent) {
+		return fmt.Errorf("content mismatch: read content doesn't match written content")
+	}
+	fmt.Printf("   ✓ Successfully read test object and verified content\n\n")
+
+	// Step 4: Test delete operation
+	fmt.Printf("4. Testing delete operation...\n")
+	err = bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, testObjectName, minio.RemoveObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to delete test object: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully deleted test object\n")
 
 	return nil
 }
@@ -359,4 +432,100 @@ func (bm *BackupManager) readRemoteFile(filePath string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read file: %w (stderr: %s)", err, stderr)
 	}
 	return []byte(output), nil
+}
+
+// ReadBackup downloads or streams a Minio object. If outputPath is empty it writes to stdout.
+func (bm *BackupManager) ReadBackup(objectName, outputPath string) error {
+	if err := bm.initMinioClient(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	obj, err := bm.minioClient.GetObject(ctx, bm.minioConfig.Bucket, objectName, minio.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get object '%s': %w", objectName, err)
+	}
+	defer obj.Close()
+
+	if outputPath == "" {
+		// Stream to stdout
+		if _, err := io.Copy(os.Stdout, obj); err != nil {
+			return fmt.Errorf("failed to stream object to stdout: %w", err)
+		}
+		return nil
+	}
+
+	// Ensure parent directory exists
+	if dir := filepath.Dir(outputPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create output directory: %w", err)
+		}
+	}
+
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, obj); err != nil {
+		return fmt.Errorf("failed to write object to file: %w", err)
+	}
+
+	fmt.Printf("Successfully downloaded %s to %s\n", objectName, outputPath)
+	return nil
+}
+
+// ListBackups lists objects in the configured bucket filtered by prefix.
+// It returns up to 'limit' objects ordered by whatever the Minio server yields (client-side sorting is not performed).
+func (bm *BackupManager) ListBackups(prefix string, limit int) ([]ObjectInfo, error) {
+	if err := bm.initMinioClient(); err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+	opts := minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	}
+
+	var results []ObjectInfo
+	ch := bm.minioClient.ListObjects(ctx, bm.minioConfig.Bucket, opts)
+	for obj := range ch {
+		if obj.Err != nil {
+			return nil, fmt.Errorf("error listing object: %w", obj.Err)
+		}
+		results = append(results, ObjectInfo{
+			Key:          obj.Key,
+			Size:         obj.Size,
+			LastModified: obj.LastModified,
+		})
+		if limit > 0 && len(results) >= limit {
+			break
+		}
+	}
+
+	return results, nil
+}
+
+// GetLatestObject returns the key of the most recently modified object with the given prefix.
+func (bm *BackupManager) GetLatestObject(prefix string) (string, error) {
+	objs, err := bm.ListBackups(prefix, 0)
+	if err != nil {
+		return "", err
+	}
+	if len(objs) == 0 {
+		return "", fmt.Errorf("no objects found for prefix '%s'", prefix)
+	}
+
+	// Find the latest by LastModified
+	latest := objs[0]
+	for _, o := range objs[1:] {
+		if o.LastModified.After(latest.LastModified) {
+			latest = o
+		}
+	}
+
+	return latest.Key, nil
 }
