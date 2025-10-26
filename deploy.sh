@@ -116,8 +116,22 @@ if [[ -f $tar_path ]]; then
     else
         SKEL_DIR=$(find "/usr/local/bin/ciwg-cli-utils" -name ".skel" -type d 2>/dev/null | head -1)
         if [ -n "$SKEL_DIR" ]; then
-            cp -r "$SKEL_DIR" "/usr/local/bin/ciwg-cli-utils/.skel"
-            echo "Copied skeleton directory."
+            DEST="/usr/local/bin/ciwg-cli-utils/.skel"
+            mkdir -p "$DEST"
+            # If the SKEL_DIR is already under the destination, skip copying to avoid nested .skel
+            case "$SKEL_DIR" in
+                "$DEST"|"$DEST"/*)
+                    echo "SKEL_DIR ($SKEL_DIR) is already inside $DEST; skipping copy."
+                    ;;
+                *)
+                    # Copy contents (not the directory itself) to avoid creating DEST/SKEL_DIR
+                    if cp -r "$SKEL_DIR"/. "$DEST"/ 2>/dev/null; then
+                        echo "Copied skeleton directory contents to $DEST."
+                    else
+                        echo "Failed to copy skeleton contents from $SKEL_DIR to $DEST"
+                    fi
+                    ;;
+            esac
         else
             echo "Warning: .skel directory not found."
         fi
