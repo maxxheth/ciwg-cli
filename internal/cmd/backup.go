@@ -1,12 +1,16 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
+	"ciwg-cli/internal/auth"
 	"ciwg-cli/internal/backup"
 )
 
@@ -47,6 +51,12 @@ var backupListCmd = &cobra.Command{
 }
 
 func init() {
+	// Load .env early so getEnvWithDefault calls used during flag setup
+	// will see values from a local .env file in development.
+	_ = godotenv.Load()
+
+	// Allow explicit env file via --env on the backup command and subcommands
+	backupCmd.PersistentFlags().String("env", "", "Path to .env file to load (overrides defaults)")
 	rootCmd.AddCommand(backupCmd)
 	backupCmd.AddCommand(backupCreateCmd)
 	backupCmd.AddCommand(backupTestMinioCmd)
@@ -57,6 +67,8 @@ func init() {
 	backupCreateCmd.Flags().Bool("dry-run", false, "Print actions without executing them")
 	backupCreateCmd.Flags().Bool("delete", false, "Stop and remove containers, and delete associated directories after backup")
 	backupCreateCmd.Flags().String("container-name", "", "Pipe-delimited container names or working directories to process (e.g. wp_foo|wp_bar|/srv/foo)")
+	backupCreateCmd.Flags().String("container-names", "", "Comma-delimited container names to process (e.g. wp_foo,wp_bar)")
+	backupCreateCmd.Flags().Bool("local", false, "Run backups locally using host's Docker instead of SSH")
 	backupCreateCmd.Flags().String("container-file", "", "File with newline-delimited container names or working directories to process")
 	backupCreateCmd.Flags().String("server-range", "", "Server range pattern (e.g., 'wp%d.example.com:0-41')")
 
@@ -94,6 +106,7 @@ func init() {
 	// List command flags
 	backupListCmd.Flags().String("prefix", "", "Prefix to filter listed objects (e.g. backups/site-)")
 	backupListCmd.Flags().Int("limit", 100, "Maximum number of objects to list")
+	backupListCmd.Flags().Bool("json", false, "Output JSON")
 	backupListCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
 	backupListCmd.Flags().String("minio-access-key", getEnvWithDefault("MINIO_ACCESS_KEY", ""), "Minio access key (env: MINIO_ACCESS_KEY)")
 	backupListCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
@@ -102,6 +115,12 @@ func init() {
 }
 
 func runBackupCreate(cmd *cobra.Command, args []string) error {
+	// If user specified an env file via --env, load it now to override environment
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
 	serverRange, _ := cmd.Flags().GetString("server-range")
 
 	// Validate Minio configuration
@@ -146,20 +165,40 @@ func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, m
 }
 
 func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backup.MinioConfig) error {
-	sshClient, err := createSSHClient(cmd, hostname)
-	if err != nil {
-		return err
+
+	// Determine if running locally
+	localMode := mustGetBoolFlag(cmd, "local")
+
+	var sshClient *auth.SSHClient
+	if !localMode {
+		var err error
+		sshClient, err = createSSHClient(cmd, hostname)
+		if err != nil {
+			return err
+		}
+		defer sshClient.Close()
 	}
-	defer sshClient.Close()
 
 	backupManager := backup.NewBackupManager(sshClient, minioConfig)
 
+	// Parse container-names (comma-delimited)
+	var containerNames []string
+	if v := mustGetStringFlag(cmd, "container-names"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			if s := strings.TrimSpace(p); s != "" {
+				containerNames = append(containerNames, s)
+			}
+		}
+	}
+
 	// Get backup options from flags
 	options := &backup.BackupOptions{
-		DryRun:        mustGetBoolFlag(cmd, "dry-run"),
-		Delete:        mustGetBoolFlag(cmd, "delete"),
-		ContainerName: mustGetStringFlag(cmd, "container-name"),
-		ContainerFile: mustGetStringFlag(cmd, "container-file"),
+		DryRun:         mustGetBoolFlag(cmd, "dry-run"),
+		Delete:         mustGetBoolFlag(cmd, "delete"),
+		ContainerName:  mustGetStringFlag(cmd, "container-name"),
+		ContainerFile:  mustGetStringFlag(cmd, "container-file"),
+		ContainerNames: containerNames,
+		Local:          localMode,
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
@@ -167,6 +206,11 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 }
 
 func runTestMinio(cmd *cobra.Command, args []string) error {
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
 	// Validate Minio configuration
 	minioConfig, err := getMinioConfig(cmd)
 	if err != nil {
@@ -191,6 +235,11 @@ func runTestMinio(cmd *cobra.Command, args []string) error {
 }
 
 func runBackupRead(cmd *cobra.Command, args []string) error {
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
 	var objectName string
 	if len(args) > 0 {
 		objectName = args[0]
@@ -226,6 +275,11 @@ func runBackupRead(cmd *cobra.Command, args []string) error {
 }
 
 func runBackupList(cmd *cobra.Command, args []string) error {
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
 	// Validate Minio configuration
 	minioConfig, err := getMinioConfig(cmd)
 	if err != nil {
@@ -247,6 +301,15 @@ func runBackupList(cmd *cobra.Command, args []string) error {
 
 	if len(objs) == 0 {
 		fmt.Println("No objects found")
+		return nil
+	}
+
+	if jsonOut := mustGetBoolFlag(cmd, "json"); jsonOut {
+		b, err := json.MarshalIndent(objs, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal objects to JSON: %w", err)
+		}
+		fmt.Println(string(b))
 		return nil
 	}
 
