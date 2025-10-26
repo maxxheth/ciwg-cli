@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,10 +51,34 @@ var backupListCmd = &cobra.Command{
 	RunE:  runBackupList,
 }
 
+var backupDeleteCmd = &cobra.Command{
+	Use:   "delete [object]",
+	Short: "Delete backup object(s) from Minio",
+	Long:  `Delete one or more backup objects from the configured Minio bucket. Use --prefix to delete multiple objects matching a prefix or pass a single object key.`,
+	Args:  cobra.MaximumNArgs(1),
+	RunE:  runBackupDelete,
+}
+
 func init() {
 	// Load .env early so getEnvWithDefault calls used during flag setup
 	// will see values from a local .env file in development.
-	_ = godotenv.Load()
+	// If the user passed --env on the command line, pre-load that file
+	// from os.Args before flags are registered so defaults derived
+	// from environment variables will reflect the chosen file.
+	// Prefer a project-level .env at a known path. If that isn't present,
+	// fall back to an explicit --env passed on the command line. If neither
+	// are available, call godotenv.Load() which will attempt to load a .env
+	// from the current working directory.
+	const projectEnv = "/usr/local/bin/ciwg-cli-utils/.env"
+	if err := godotenv.Load(projectEnv); err == nil {
+		// loaded project-level .env successfully
+	} else {
+		if envPath := findEnvArg(os.Args); envPath != "" {
+			_ = godotenv.Load(envPath)
+		} else {
+			_ = godotenv.Load()
+		}
+	}
 
 	// Allow explicit env file via --env on the backup command and subcommands
 	backupCmd.PersistentFlags().String("env", "", "Path to .env file to load (overrides defaults)")
@@ -70,6 +95,7 @@ func init() {
 	backupCreateCmd.Flags().String("container-names", "", "Comma-delimited container names to process (e.g. wp_foo,wp_bar)")
 	backupCreateCmd.Flags().Bool("local", false, "Run backups locally using host's Docker instead of SSH")
 	backupCreateCmd.Flags().String("container-file", "", "File with newline-delimited container names or working directories to process")
+	backupCreateCmd.Flags().String("container-parent-dir", "/var/opt/sites", "Parent directory where site working directories live (default: /var/opt/sites)")
 	backupCreateCmd.Flags().String("server-range", "", "Server range pattern (e.g., 'wp%d.example.com:0-41')")
 
 	// Minio configuration flags with environment variable support
@@ -95,6 +121,7 @@ func init() {
 
 	// Read command flags
 	backupReadCmd.Flags().String("output", "", "Output file path (if empty, writes to stdout)")
+	backupReadCmd.Flags().Bool("save", false, "Save backup object to current working directory (same as --output <basename>)")
 	backupReadCmd.Flags().String("prefix", "", "Prefix to search for when using --latest (e.g. backups/site-)")
 	backupReadCmd.Flags().Bool("latest", false, "If set, resolve the most recent object matching --prefix when object argument is omitted")
 	backupReadCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
@@ -112,6 +139,33 @@ func init() {
 	backupListCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupListCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupListCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+
+	// Delete command registration and flags
+	backupCmd.AddCommand(backupDeleteCmd)
+	backupDeleteCmd.Flags().String("prefix", "", "Prefix to select objects to delete (e.g. backups/site-)")
+	backupDeleteCmd.Flags().Int("limit", 100, "Maximum number of objects to consider when using --prefix")
+	backupDeleteCmd.Flags().Bool("latest", false, "If set with --prefix, delete only the most recent object matching --prefix")
+	backupDeleteCmd.Flags().Bool("skip-confirmation", false, "Skip interactive confirmation prompt")
+	backupDeleteCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
+	backupDeleteCmd.Flags().String("minio-access-key", getEnvWithDefault("MINIO_ACCESS_KEY", ""), "Minio access key (env: MINIO_ACCESS_KEY)")
+	backupDeleteCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
+	backupDeleteCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
+	backupDeleteCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+}
+
+// findEnvArg inspects argv for an explicit --env argument and returns
+// the value if present. Supports `--env=path` and `--env path` forms.
+func findEnvArg(argv []string) string {
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if strings.HasPrefix(a, "--env=") {
+			return strings.TrimPrefix(a, "--env=")
+		}
+		if a == "--env" && i+1 < len(argv) {
+			return argv[i+1]
+		}
+	}
+	return ""
 }
 
 func runBackupCreate(cmd *cobra.Command, args []string) error {
@@ -199,6 +253,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		ContainerFile:  mustGetStringFlag(cmd, "container-file"),
 		ContainerNames: containerNames,
 		Local:          localMode,
+		ParentDir:      mustGetStringFlag(cmd, "container-parent-dir"),
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
@@ -270,6 +325,13 @@ func runBackupRead(cmd *cobra.Command, args []string) error {
 	}
 
 	outputPath := mustGetStringFlag(cmd, "output")
+	// If --save is set and no explicit output path provided, write to cwd using the object's basename
+	if mustGetBoolFlag(cmd, "save") && outputPath == "" {
+		if objectName == "" {
+			return fmt.Errorf("cannot --save when object name is not resolved")
+		}
+		outputPath = filepath.Base(objectName)
+	}
 
 	return backupManager.ReadBackup(objectName, outputPath)
 }
@@ -317,6 +379,88 @@ func runBackupList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s\t%d\t%s\n", o.Key, o.Size, o.LastModified.Format(time.RFC3339))
 	}
 
+	return nil
+}
+
+func runBackupDelete(cmd *cobra.Command, args []string) error {
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
+
+	// Validate Minio configuration
+	minioConfig, err := getMinioConfig(cmd)
+	if err != nil {
+		return err
+	}
+
+	bm := backup.NewBackupManager(nil, minioConfig)
+
+	var objectName string
+	if len(args) > 0 {
+		objectName = args[0]
+	}
+
+	prefix := mustGetStringFlag(cmd, "prefix")
+	latest := mustGetBoolFlag(cmd, "latest")
+	skipConfirm := mustGetBoolFlag(cmd, "skip-confirmation")
+
+	// Resolve object(s) to delete
+	var toDelete []string
+	if objectName != "" {
+		toDelete = append(toDelete, objectName)
+	} else if prefix != "" {
+		limit := 100
+		if v, err := cmd.Flags().GetInt("limit"); err == nil {
+			limit = v
+		}
+		objs, err := bm.ListBackups(prefix, limit)
+		if err != nil {
+			return fmt.Errorf("failed to list objects for prefix '%s': %w", prefix, err)
+		}
+		if len(objs) == 0 {
+			fmt.Println("No objects found for prefix")
+			return nil
+		}
+		if latest {
+			// pick latest
+			latestKey := objs[0].Key
+			for _, o := range objs[1:] {
+				if o.LastModified.After(objs[0].LastModified) {
+					latestKey = o.Key
+				}
+			}
+			toDelete = append(toDelete, latestKey)
+		} else {
+			for _, o := range objs {
+				toDelete = append(toDelete, o.Key)
+			}
+		}
+	} else {
+		return fmt.Errorf("object name argument or --prefix is required")
+	}
+
+	// Confirmation
+	if !skipConfirm {
+		fmt.Printf("About to delete %d object(s). Continue? [y/N]: ", len(toDelete))
+		var resp string
+		if _, err := fmt.Scanln(&resp); err != nil {
+			return fmt.Errorf("confirmation failed: %w", err)
+		}
+		resp = strings.TrimSpace(strings.ToLower(resp))
+		if resp != "y" && resp != "yes" {
+			fmt.Println("Aborted by user")
+			return nil
+		}
+	}
+
+	// Perform deletion
+	if err := bm.DeleteObjects(toDelete); err != nil {
+		return fmt.Errorf("failed to delete objects: %w", err)
+	}
+
+	fmt.Printf("Deleted %d object(s)\n", len(toDelete))
 	return nil
 }
 
