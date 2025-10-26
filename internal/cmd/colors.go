@@ -280,7 +280,7 @@ func runGeneratePaletteLocally(cmd *cobra.Command) error {
 	}
 	fmt.Printf("[local] ✓ Successfully wrote HTML preview to %s\n", htmlPath)
 
-	fmt.Printf("[local] Palette generation and local deployment complete!\n", outputPath)
+	fmt.Printf("[local] Palette generation and local deployment complete!\n")
 	return nil
 }
 
@@ -292,7 +292,7 @@ func isValidHexColor(hexColor string) bool {
 
 // generateRandomColor generates a random color that varies slightly from black (#000000) or white (#ffffff)
 func generateRandomColor() string {
-	rand.Seed(time.Now().UnixNano())
+	// rand.Seed(time.Now().UnixNano())
 
 	// Randomly choose between black and white as base
 	if rand.Intn(2) == 0 {
@@ -326,7 +326,7 @@ func processColorFlag(flagValue string) string {
 
 // generateRandomBasePalette creates a random starting palette with sharp contrast like the examples
 func generateRandomBasePalette() []string {
-	rand.Seed(time.Now().UnixNano())
+	// rand.Seed(time.Now().UnixNano())
 
 	palette := make([]string, 0, 3)
 
