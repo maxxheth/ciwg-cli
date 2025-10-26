@@ -5,10 +5,12 @@ all: build test
 
 build:
 	@echo "Building..."
+	@rm -rf ./dist/ciwg-cli-utils
 	@mkdir -p ./dist/ciwg-cli-utils
 	@go build -o ./dist/ciwg-cli-utils/ciwg-cli ./cmd/cli/main.go 
 	@chmod +x ./dist/ciwg-cli-utils/ciwg-cli
-	@cp -r ./.skel ./dist/ciwg-cli-utils/.skel
+	@mkdir -p ./dist/ciwg-cli-utils/.skel
+	@cp -r ./.skel/. ./dist/ciwg-cli-utils/.skel/
 	@cp .env ./dist/ciwg-cli-utils/
 	@cp docker-compose.yml ./dist/ciwg-cli-utils/
 	@tar -czf ./dist/ciwg-cli-utils.tgz -C ./dist ciwg-cli-utils
