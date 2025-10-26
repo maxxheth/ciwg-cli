@@ -390,7 +390,8 @@ func ValidateCronExpression(expr string) error {
 				}
 			}
 
-			if _, err := strconv.Atoi(stepParts[1]); err != nil {
+			stepVal, err := strconv.Atoi(stepParts[1])
+			if err != nil || stepVal <= 0 {
 				return fmt.Errorf("invalid step value in %s: %s", validators[i].name, stepParts[1])
 			}
 			continue
