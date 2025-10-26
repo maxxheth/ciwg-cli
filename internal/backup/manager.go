@@ -1,10 +1,12 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -28,6 +30,10 @@ type BackupOptions struct {
 	Delete        bool
 	ContainerName string
 	ContainerFile string
+	// ContainerNames is a comma-delimited list provided via CLI and parsed into a slice
+	ContainerNames []string
+	// Local indicates to run docker and tar commands locally instead of over SSH
+	Local bool
 }
 
 type ContainerInfo struct {
@@ -43,9 +49,9 @@ type BackupManager struct {
 
 // ObjectInfo is a lightweight representation of an object in Minio
 type ObjectInfo struct {
-	Key          string
-	Size         int64
-	LastModified time.Time
+	Key          string    `json:"key"`
+	Size         int64     `json:"size"`
+	LastModified time.Time `json:"last_modified"`
 }
 
 func NewBackupManager(sshClient *auth.SSHClient, minioConfig *MinioConfig) *BackupManager {
@@ -53,6 +59,21 @@ func NewBackupManager(sshClient *auth.SSHClient, minioConfig *MinioConfig) *Back
 		sshClient:   sshClient,
 		minioConfig: minioConfig,
 	}
+}
+
+// executeCommand runs a shell command either over SSH (when sshClient is present)
+// or locally (when sshClient is nil). It returns stdout, stderr and any error.
+func (bm *BackupManager) executeCommand(cmd string) (string, string, error) {
+	if bm.sshClient == nil {
+		c := exec.Command("bash", "-lc", cmd)
+		var out bytes.Buffer
+		var stderr bytes.Buffer
+		c.Stdout = &out
+		c.Stderr = &stderr
+		err := c.Run()
+		return out.String(), stderr.String(), err
+	}
+	return bm.sshClient.ExecuteCommand(cmd)
 }
 
 func (bm *BackupManager) initMinioClient() error {
@@ -203,6 +224,16 @@ func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo,
 		}
 	}
 
+	// Add from container-names flag (already parsed into a slice)
+	if len(options.ContainerNames) > 0 {
+		for _, name := range options.ContainerNames {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				containerInputs = append(containerInputs, name)
+			}
+		}
+	}
+
 	// If no inputs, get all wp_ containers
 	if len(containerInputs) == 0 {
 		containers, err := bm.getWPContainers()
@@ -229,7 +260,7 @@ func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo,
 func (bm *BackupManager) getWPContainers() ([]ContainerInfo, error) {
 	// Get all wp_ containers
 	cmd := `docker ps --format '{{.Names}}' | grep '^wp_'`
-	output, stderr, err := bm.sshClient.ExecuteCommand(cmd)
+	output, stderr, err := bm.executeCommand(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list wp containers: %w (stderr: %s)", err, stderr)
 	}
@@ -285,7 +316,7 @@ func (bm *BackupManager) resolveContainer(input string) (ContainerInfo, error) {
 
 func (bm *BackupManager) getContainerWorkingDir(containerName string) (string, error) {
 	cmd := fmt.Sprintf(`docker inspect "%s" | jq -r '.[].Config.Labels."com.docker.compose.project.working_dir"'`, containerName)
-	output, stderr, err := bm.sshClient.ExecuteCommand(cmd)
+	output, stderr, err := bm.executeCommand(cmd)
 	if err != nil {
 		return "", fmt.Errorf("failed to inspect container: %w (stderr: %s)", err, stderr)
 	}
@@ -300,7 +331,7 @@ func (bm *BackupManager) getContainerWorkingDir(containerName string) (string, e
 
 func (bm *BackupManager) findContainerByWorkingDir(workingDir string) (string, error) {
 	cmd := `docker ps --format '{{.Names}}'`
-	output, stderr, err := bm.sshClient.ExecuteCommand(cmd)
+	output, stderr, err := bm.executeCommand(cmd)
 	if err != nil {
 		return "", fmt.Errorf("failed to list containers: %w (stderr: %s)", err, stderr)
 	}
@@ -347,14 +378,14 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 	// Clean old SQL files
 	fmt.Printf("Cleaning old SQL files in %s...\n", container.Name)
 	cleanCmd := fmt.Sprintf(`docker exec -u 0 "%s" find /var/www/html -name "*.sql" -type f -mmin +120 -exec rm -f {} \;`, container.Name)
-	if _, stderr, err := bm.sshClient.ExecuteCommand(cleanCmd); err != nil {
+	if _, stderr, err := bm.executeCommand(cleanCmd); err != nil {
 		fmt.Printf("Warning: failed to clean old SQL files: %v (stderr: %s)\n", err, stderr)
 	}
 
 	// Export database
 	fmt.Printf("Exporting DB in %s...\n", container.Name)
-	exportCmd := fmt.Sprintf(`docker exec -u 0 "%s" wp --allow-root db export`, container.Name)
-	if _, stderr, err := bm.sshClient.ExecuteCommand(exportCmd); err != nil {
+	exportCmd := fmt.Sprintf(`docker exec -u 0 "%s" sh -c 'wp --allow-root db export && mv *.sql /var/www/html/wp-content/'`, container.Name)
+	if _, stderr, err := bm.executeCommand(exportCmd); err != nil {
 		return fmt.Errorf("failed to export database: %w (stderr: %s)", err, stderr)
 	}
 
@@ -367,14 +398,14 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 	if options.Delete {
 		fmt.Printf("Stopping and removing container %s...\n", container.Name)
 		stopCmd := fmt.Sprintf(`docker stop "%s" 2>/dev/null || true`, container.Name)
-		bm.sshClient.ExecuteCommand(stopCmd)
+		bm.executeCommand(stopCmd)
 
 		removeCmd := fmt.Sprintf(`docker rm "%s" 2>/dev/null || true`, container.Name)
-		bm.sshClient.ExecuteCommand(removeCmd)
+		bm.executeCommand(removeCmd)
 
 		fmt.Printf("Removing directory %s...\n", container.WorkingDir)
 		rmCmd := fmt.Sprintf(`rm -rf "%s"`, container.WorkingDir)
-		if _, stderr, err := bm.sshClient.ExecuteCommand(rmCmd); err != nil {
+		if _, stderr, err := bm.executeCommand(rmCmd); err != nil {
 			fmt.Printf("Warning: failed to remove directory: %v (stderr: %s)\n", err, stderr)
 		}
 	}
@@ -386,7 +417,39 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 func (bm *BackupManager) streamBackupToMinio(workingDir, backupName string) error {
 	// Create tar command that outputs to stdout
 	tarCmd := fmt.Sprintf(`cd /var/opt && tar -czf - --exclude="*.tgz" --exclude="*.tar.gz" --exclude="*.zip" "%s"`, workingDir)
+	// If running locally (no ssh client) run tar locally and stream stdout to Minio
+	if bm.sshClient == nil {
+		cmd := exec.Command("bash", "-lc", tarCmd)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stdout pipe for local tar: %w", err)
+		}
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start local tar command: %w", err)
+		}
 
+		ctx := context.Background()
+		objectName := fmt.Sprintf("backups/%s", backupName)
+
+		info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, stdout, -1, minio.PutObjectOptions{
+			ContentType: "application/gzip",
+		})
+		if err != nil {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			return fmt.Errorf("failed to upload to Minio: %w", err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("local tar command failed: %w", err)
+		}
+
+		fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", backupName, info.Size)
+		return nil
+	}
+
+	// Remote (ssh) path
 	session, err := bm.sshClient.GetSession()
 	if err != nil {
 		return fmt.Errorf("failed to create SSH session: %w", err)
@@ -426,8 +489,17 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName string) erro
 }
 
 func (bm *BackupManager) readRemoteFile(filePath string) ([]byte, error) {
+	// If running locally, read the file from disk directly
+	if bm.sshClient == nil {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file: %w", err)
+		}
+		return data, nil
+	}
+
 	cmd := fmt.Sprintf("cat %s", filePath)
-	output, stderr, err := bm.sshClient.ExecuteCommand(cmd)
+	output, stderr, err := bm.executeCommand(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w (stderr: %s)", err, stderr)
 	}
