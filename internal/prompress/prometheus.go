@@ -42,6 +42,13 @@ func (pm *PrometheusManager) SetDirectPaths(ymlPath, dockerComposeYmlPath string
 	pm.prometheusDockerComposeYmlPath = dockerComposeYmlPath
 }
 
+// stripProtocol removes http:// or https:// from a URL for use in Prometheus targets
+func stripProtocol(url string) string {
+	url = strings.TrimPrefix(url, "https://")
+	url = strings.TrimPrefix(url, "http://")
+	return url
+}
+
 // GenerateScrapeConfig generates a Prometheus scrape configuration block
 func (pm *PrometheusManager) GenerateScrapeConfig(config ScrapeConfig) string {
 	var sb strings.Builder
@@ -64,7 +71,9 @@ func (pm *PrometheusManager) GenerateScrapeConfig(config ScrapeConfig) string {
 	}
 
 	sb.WriteString("    static_configs:\n")
-	sb.WriteString(fmt.Sprintf("      - targets: ['%s']\n", config.SiteURL))
+	// Strip protocol from target URL - Prometheus expects host:port format
+	targetURL := stripProtocol(config.SiteURL)
+	sb.WriteString(fmt.Sprintf("      - targets: ['%s']\n", targetURL))
 	sb.WriteString("        labels:\n")
 	sb.WriteString(fmt.Sprintf("          site: '%s'\n", config.JobName))
 	sb.WriteString("          environment: 'production'\n")
