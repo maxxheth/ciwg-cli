@@ -10,9 +10,11 @@ import (
 
 // PrometheusManager handles Prometheus configuration updates
 type PrometheusManager struct {
-	sshClient         *auth.SSHClient
-	prometheusHost    string
-	prometheusManager *compose.Manager
+	sshClient                      *auth.SSHClient
+	prometheusHost                 string
+	prometheusManager              *compose.Manager
+	prometheusYmlPath              string // Direct path to prometheus.yml if provided
+	prometheusDockerComposeYmlPath string // Direct path to docker-compose.yml if provided
 }
 
 // ScrapeConfig represents a Prometheus scrape configuration for a WordPress site
@@ -32,6 +34,12 @@ func NewPrometheusManager(sshClient *auth.SSHClient, prometheusHost string, mana
 		prometheusHost:    prometheusHost,
 		prometheusManager: manager,
 	}
+}
+
+// SetDirectPaths sets direct file paths for Prometheus configuration files
+func (pm *PrometheusManager) SetDirectPaths(ymlPath, dockerComposeYmlPath string) {
+	pm.prometheusYmlPath = ymlPath
+	pm.prometheusDockerComposeYmlPath = dockerComposeYmlPath
 }
 
 // GenerateScrapeConfig generates a Prometheus scrape configuration block
@@ -189,8 +197,39 @@ func (pm *PrometheusManager) ReloadConfig() error {
 	return nil
 }
 
-// BackupConfig creates a backup of prometheus.yml
+// BackupConfig creates a backup of prometheus.yml and optionally docker-compose.yml
 func (pm *PrometheusManager) BackupConfig() (string, error) {
+	timestampCmd, _, _ := pm.sshClient.ExecuteCommand("date +%s")
+	timestamp := strings.TrimSpace(timestampCmd)
+	var backupPaths []string
+
+	// If direct paths are provided, back them up individually
+	if pm.prometheusYmlPath != "" || pm.prometheusDockerComposeYmlPath != "" {
+		if pm.prometheusYmlPath != "" {
+			backupPath := fmt.Sprintf("%s.backup.%s", pm.prometheusYmlPath, timestamp)
+			cmd := fmt.Sprintf("cp -p %s %s", pm.prometheusYmlPath, backupPath)
+			_, stderr, err := pm.sshClient.ExecuteCommand(cmd)
+			if err != nil {
+				return "", fmt.Errorf("failed to backup prometheus.yml: %w (stderr: %s)", err, stderr)
+			}
+			backupPaths = append(backupPaths, backupPath)
+		}
+
+		if pm.prometheusDockerComposeYmlPath != "" {
+			backupPath := fmt.Sprintf("%s.backup.%s", pm.prometheusDockerComposeYmlPath, timestamp)
+			cmd := fmt.Sprintf("cp -p %s %s", pm.prometheusDockerComposeYmlPath, backupPath)
+			_, stderr, err := pm.sshClient.ExecuteCommand(cmd)
+			if err != nil {
+				return "", fmt.Errorf("failed to backup docker-compose.yml: %w (stderr: %s)", err, stderr)
+			}
+			backupPaths = append(backupPaths, backupPath)
+		}
+
+		// Return comma-separated backup paths
+		return strings.Join(backupPaths, ","), nil
+	}
+
+	// Fall back to compose manager backup
 	backup, err := pm.prometheusManager.Backup()
 	if err != nil {
 		return "", err
@@ -205,6 +244,11 @@ func (pm *PrometheusManager) RestoreConfig(backupPath string) error {
 
 // getPrometheusYmlPath returns the path to prometheus.yml
 func (pm *PrometheusManager) getPrometheusYmlPath() string {
+	// Use direct path if provided
+	if pm.prometheusYmlPath != "" {
+		return pm.prometheusYmlPath
+	}
+	// Fall back to inferring from compose path
 	return pm.prometheusManager.GetComposePath() + "/../prometheus.yml"
 }
 
