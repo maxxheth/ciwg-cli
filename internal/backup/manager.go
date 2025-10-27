@@ -39,11 +39,29 @@ type BackupOptions struct {
 	Local bool
 	// ParentDir is the parent directory where site working directories are located (e.g. /var/opt/sites)
 	ParentDir string
+	// ConfigFile is the path to a YAML config file for custom backup configurations
+	ConfigFile string
+	// DatabaseType specifies the database type for custom containers (postgres, mysql, etc.)
+	DatabaseType string
+	// DatabaseExportDir is where database exports should be saved before backup
+	DatabaseExportDir string
+	// CustomAppDir is the application directory for custom containers
+	CustomAppDir string
+	// DatabaseContainer is the name of a separate database container
+	DatabaseContainer string
+	// DatabaseName for custom database exports
+	DatabaseName string
+	// DatabaseUser for custom database exports
+	DatabaseUser string
 }
 
 type ContainerInfo struct {
 	Name       string
 	WorkingDir string
+	// Type indicates the container type: wordpress, custom, postgres, mysql, etc.
+	Type string
+	// Config holds custom configuration from YAML file
+	Config *ContainerConfig
 }
 
 type BackupManager struct {
@@ -208,6 +226,11 @@ func (bm *BackupManager) GetContainersFromOptions(options *BackupOptions) ([]Con
 func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo, error) {
 	var containerInputs []string
 
+	// If config file is provided, load it and return containers from config
+	if options.ConfigFile != "" {
+		return bm.getContainersFromConfig(options.ConfigFile)
+	}
+
 	// Read from file if specified
 	if options.ContainerFile != "" {
 		content, err := bm.readRemoteFile(options.ContainerFile)
@@ -368,15 +391,26 @@ func (bm *BackupManager) findContainerByWorkingDir(workingDir string) (string, e
 }
 
 func (bm *BackupManager) processContainer(container ContainerInfo, options *BackupOptions) error {
-	fmt.Printf("Processing container: %s\n", container.Name)
+	fmt.Printf("Processing container: %s (type: %s)\n", container.Name, container.Type)
 	fmt.Printf("Working directory: %s\n", container.WorkingDir)
 
 	timestamp := time.Now().Format("20060102-150405")
-	backupName := fmt.Sprintf("%s-%s.tgz", filepath.Base(container.WorkingDir), timestamp)
+
+	// Use custom label if provided, otherwise use working dir basename
+	label := filepath.Base(container.WorkingDir)
+	if container.Config != nil && container.Config.Label != "" {
+		label = container.Config.Label
+	}
+	backupName := fmt.Sprintf("%s-%s.tgz", label, timestamp)
 
 	if options.DryRun {
-		fmt.Printf("[DRY RUN] Would clean old SQL files in %s\n", container.Name)
-		fmt.Printf("[DRY RUN] Would export DB in %s\n", container.Name)
+		fmt.Printf("[DRY RUN] Would process container %s\n", container.Name)
+		if container.Type == "wordpress" || container.Type == "" {
+			fmt.Printf("[DRY RUN] Would clean old SQL files in %s\n", container.Name)
+			fmt.Printf("[DRY RUN] Would export WordPress DB in %s\n", container.Name)
+		} else if container.Config != nil && container.Config.Database.Type != "" {
+			fmt.Printf("[DRY RUN] Would export %s database\n", container.Config.Database.Type)
+		}
 		fmt.Printf("[DRY RUN] Would create and stream tarball %s to Minio\n", backupName)
 		if options.Delete {
 			fmt.Printf("[DRY RUN] Would stop and remove container %s\n", container.Name)
@@ -386,6 +420,75 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 		return nil
 	}
 
+	// Run pre-backup commands if specified
+	if container.Config != nil && len(container.Config.PreBackupCommands) > 0 {
+		fmt.Printf("Running pre-backup commands...\n")
+		for _, cmd := range container.Config.PreBackupCommands {
+			fmt.Printf("  Running: %s\n", cmd)
+			if _, stderr, err := bm.executeCommand(cmd); err != nil {
+				return fmt.Errorf("pre-backup command failed: %w (stderr: %s)", err, stderr)
+			}
+		}
+	}
+
+	// Handle database export based on container type
+	if container.Type == "wordpress" || container.Type == "" {
+		// WordPress-specific backup logic
+		if err := bm.exportWordPressDatabase(container); err != nil {
+			return err
+		}
+	} else if container.Config != nil && container.Config.Database.Type != "" {
+		// Custom database export
+		if err := bm.exportDatabase(container, options); err != nil {
+			return err
+		}
+	}
+
+	// Create and stream tarball to Minio
+	fmt.Printf("Creating and streaming tarball to Minio...\n")
+
+	// Determine backup directory - use custom app dir if specified
+	backupDir := container.WorkingDir
+	if container.Config != nil && container.Config.Paths.AppDir != "" {
+		backupDir = container.Config.Paths.AppDir
+	}
+
+	if err := bm.streamBackupToMinio(backupDir, backupName, options.ParentDir); err != nil {
+		return fmt.Errorf("failed to stream backup to Minio: %w", err)
+	}
+
+	// Run post-backup commands if specified
+	if container.Config != nil && len(container.Config.PostBackupCommands) > 0 {
+		fmt.Printf("Running post-backup commands...\n")
+		for _, cmd := range container.Config.PostBackupCommands {
+			fmt.Printf("  Running: %s\n", cmd)
+			if _, stderr, err := bm.executeCommand(cmd); err != nil {
+				fmt.Printf("Warning: post-backup command failed: %v (stderr: %s)\n", err, stderr)
+			}
+		}
+	}
+
+	if options.Delete {
+		fmt.Printf("Stopping and removing container %s...\n", container.Name)
+		stopCmd := fmt.Sprintf(`docker stop "%s" 2>/dev/null || true`, container.Name)
+		bm.executeCommand(stopCmd)
+
+		removeCmd := fmt.Sprintf(`docker rm "%s" 2>/dev/null || true`, container.Name)
+		bm.executeCommand(removeCmd)
+
+		fmt.Printf("Removing directory %s...\n", container.WorkingDir)
+		rmCmd := fmt.Sprintf(`rm -rf "%s"`, container.WorkingDir)
+		if _, stderr, err := bm.executeCommand(rmCmd); err != nil {
+			fmt.Printf("Warning: failed to remove directory: %v (stderr: %s)\n", err, stderr)
+		}
+	}
+
+	fmt.Printf("Done with %s\n\n", container.Name)
+	return nil
+}
+
+// exportWordPressDatabase handles WordPress-specific database export
+func (bm *BackupManager) exportWordPressDatabase(container ContainerInfo) error {
 	// Clean all SQL files
 	fmt.Printf("Cleaning all SQL files in %s...\n", container.Name)
 	cleanCmd := fmt.Sprintf(`docker exec -u 0 "%s" find /var/www/html -name "*.sql" -type f -exec rm -f {} \;`, container.Name)
@@ -407,28 +510,6 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 		return fmt.Errorf("failed to export database: %w (stderr: %s)", err, stderr)
 	}
 
-	// Create and stream tarball to Minio
-	fmt.Printf("Creating and streaming tarball to Minio...\n")
-	if err := bm.streamBackupToMinio(container.WorkingDir, backupName, options.ParentDir); err != nil {
-		return fmt.Errorf("failed to stream backup to Minio: %w", err)
-	}
-
-	if options.Delete {
-		fmt.Printf("Stopping and removing container %s...\n", container.Name)
-		stopCmd := fmt.Sprintf(`docker stop "%s" 2>/dev/null || true`, container.Name)
-		bm.executeCommand(stopCmd)
-
-		removeCmd := fmt.Sprintf(`docker rm "%s" 2>/dev/null || true`, container.Name)
-		bm.executeCommand(removeCmd)
-
-		fmt.Printf("Removing directory %s...\n", container.WorkingDir)
-		rmCmd := fmt.Sprintf(`rm -rf "%s"`, container.WorkingDir)
-		if _, stderr, err := bm.executeCommand(rmCmd); err != nil {
-			fmt.Printf("Warning: failed to remove directory: %v (stderr: %s)\n", err, stderr)
-		}
-	}
-
-	fmt.Printf("Done with %s\n\n", container.Name)
 	return nil
 }
 
@@ -839,4 +920,181 @@ func (bm *BackupManager) SelectObjectsForOverwrite(objs []ObjectInfo, remainder 
 
 	// Return all objects after the first N (remainder) items
 	return sorted[remainder:]
+}
+
+// getContainersFromConfig loads containers from a YAML config file
+func (bm *BackupManager) getContainersFromConfig(configPath string) ([]ContainerInfo, error) {
+	config, err := LoadConfigFromFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config file: %w", err)
+	}
+
+	var containers []ContainerInfo
+	for _, containerCfg := range config.Containers {
+		if containerCfg.Skip {
+			fmt.Printf("Skipping container %s (marked as skip in config)\n", containerCfg.Name)
+			continue
+		}
+
+		// Apply defaults
+		config.ApplyDefaults(&containerCfg)
+
+		// Resolve working directory
+		workingDir := containerCfg.Paths.WorkingDir
+		if workingDir == "" {
+			// Try to get from container inspection
+			if strings.HasPrefix(containerCfg.Name, "/") {
+				workingDir = containerCfg.Name
+			} else {
+				wd, err := bm.getContainerWorkingDir(containerCfg.Name)
+				if err != nil {
+					fmt.Printf("Warning: could not determine working dir for %s: %v\n", containerCfg.Name, err)
+					continue
+				}
+				workingDir = wd
+			}
+		}
+
+		containers = append(containers, ContainerInfo{
+			Name:       containerCfg.Name,
+			WorkingDir: workingDir,
+			Type:       containerCfg.Type,
+			Config:     &containerCfg,
+		})
+	}
+
+	return containers, nil
+}
+
+// exportDatabase exports a database based on the container configuration
+func (bm *BackupManager) exportDatabase(container ContainerInfo, options *BackupOptions) error {
+	if container.Config == nil {
+		return fmt.Errorf("no configuration provided for container")
+	}
+
+	dbConfig := container.Config.Database
+	if dbConfig.Type == "" {
+		return fmt.Errorf("no database type specified")
+	}
+
+	// Use custom export command if provided
+	if dbConfig.ExportCommand != "" {
+		fmt.Printf("Running custom database export command...\n")
+		_, stderr, err := bm.executeCommand(dbConfig.ExportCommand)
+		if err != nil {
+			return fmt.Errorf("custom export command failed: %w (stderr: %s)", err, stderr)
+		}
+		return nil
+	}
+
+	// Auto-generate export command based on database type
+	var exportCmd string
+	var exportPath string
+
+	// Determine export path
+	if dbConfig.ExportPath != "" {
+		exportPath = dbConfig.ExportPath
+	} else if container.Config.Paths.DatabaseExportDir != "" {
+		exportPath = filepath.Join(container.Config.Paths.DatabaseExportDir, fmt.Sprintf("%s-export.sql", dbConfig.Name))
+	} else {
+		exportPath = filepath.Join(container.WorkingDir, fmt.Sprintf("%s-export.sql", dbConfig.Name))
+	}
+
+	switch strings.ToLower(dbConfig.Type) {
+	case "postgres", "postgresql":
+		exportCmd = bm.buildPostgresExportCommand(container, dbConfig, exportPath)
+	case "mysql", "mariadb":
+		exportCmd = bm.buildMySQLExportCommand(container, dbConfig, exportPath)
+	case "mongodb", "mongo":
+		exportCmd = bm.buildMongoExportCommand(container, dbConfig, exportPath)
+	default:
+		return fmt.Errorf("unsupported database type: %s", dbConfig.Type)
+	}
+
+	fmt.Printf("Exporting %s database %s...\n", dbConfig.Type, dbConfig.Name)
+	if options.DryRun {
+		fmt.Printf("[DRY RUN] Would run: %s\n", exportCmd)
+		return nil
+	}
+
+	_, stderr, err := bm.executeCommand(exportCmd)
+	if err != nil {
+		return fmt.Errorf("database export failed: %w (stderr: %s)", err, stderr)
+	}
+
+	fmt.Printf("Database exported to %s\n", exportPath)
+	return nil
+}
+
+// buildPostgresExportCommand builds a pg_dump command for Postgres databases
+func (bm *BackupManager) buildPostgresExportCommand(container ContainerInfo, dbConfig DatabaseConfig, exportPath string) string {
+	if dbConfig.Container != "" {
+		// Database is in a separate container
+		cmd := fmt.Sprintf(`docker exec %s pg_dump -U %s -d %s -f %s`,
+			dbConfig.Container, dbConfig.User, dbConfig.Name, exportPath)
+		if dbConfig.Host != "" {
+			cmd += fmt.Sprintf(` -h %s`, dbConfig.Host)
+		}
+		if dbConfig.Port > 0 {
+			cmd += fmt.Sprintf(` -p %d`, dbConfig.Port)
+		}
+		return cmd
+	}
+
+	// Database is in the same container as the app
+	cmd := fmt.Sprintf(`docker exec %s pg_dump -U %s -d %s -f %s`,
+		container.Name, dbConfig.User, dbConfig.Name, exportPath)
+	return cmd
+}
+
+// buildMySQLExportCommand builds a mysqldump command for MySQL/MariaDB databases
+func (bm *BackupManager) buildMySQLExportCommand(container ContainerInfo, dbConfig DatabaseConfig, exportPath string) string {
+	if dbConfig.Container != "" {
+		cmd := fmt.Sprintf(`docker exec %s mysqldump -u %s %s > %s`,
+			dbConfig.Container, dbConfig.User, dbConfig.Name, exportPath)
+		if dbConfig.Password != "" {
+			cmd = fmt.Sprintf(`docker exec %s mysqldump -u %s -p%s %s > %s`,
+				dbConfig.Container, dbConfig.User, dbConfig.Password, dbConfig.Name, exportPath)
+		}
+		if dbConfig.Host != "" {
+			cmd += fmt.Sprintf(` -h %s`, dbConfig.Host)
+		}
+		if dbConfig.Port > 0 {
+			cmd += fmt.Sprintf(` -P %d`, dbConfig.Port)
+		}
+		return cmd
+	}
+
+	cmd := fmt.Sprintf(`docker exec %s mysqldump -u %s %s > %s`,
+		container.Name, dbConfig.User, dbConfig.Name, exportPath)
+	if dbConfig.Password != "" {
+		cmd = fmt.Sprintf(`docker exec %s mysqldump -u %s -p%s %s > %s`,
+			container.Name, dbConfig.User, dbConfig.Password, dbConfig.Name, exportPath)
+	}
+	return cmd
+}
+
+// buildMongoExportCommand builds a mongodump command for MongoDB databases
+func (bm *BackupManager) buildMongoExportCommand(container ContainerInfo, dbConfig DatabaseConfig, exportPath string) string {
+	if dbConfig.Container != "" {
+		cmd := fmt.Sprintf(`docker exec %s mongodump --db %s --out %s`,
+			dbConfig.Container, dbConfig.Name, exportPath)
+		if dbConfig.User != "" {
+			cmd += fmt.Sprintf(` --username %s`, dbConfig.User)
+		}
+		if dbConfig.Password != "" {
+			cmd += fmt.Sprintf(` --password %s`, dbConfig.Password)
+		}
+		return cmd
+	}
+
+	cmd := fmt.Sprintf(`docker exec %s mongodump --db %s --out %s`,
+		container.Name, dbConfig.Name, exportPath)
+	if dbConfig.User != "" {
+		cmd += fmt.Sprintf(` --username %s`, dbConfig.User)
+	}
+	if dbConfig.Password != "" {
+		cmd += fmt.Sprintf(` --password %s`, dbConfig.Password)
+	}
+	return cmd
 }
