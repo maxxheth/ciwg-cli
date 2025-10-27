@@ -21,21 +21,23 @@ type Orchestrator struct {
 
 // WorkflowConfig contains configuration for the installation workflow
 type WorkflowConfig struct {
-	PluginSlug           string
-	MetricsPath          string
-	MetricsToken         string
-	EnableAuth           bool
-	CollectionInterval   int
-	ScrapeInterval       string
-	ScrapeTimeout        string
-	HealthCheckTimeout   time.Duration
-	PrometheusHost       string
-	PrometheusContainer  string
-	PrometheusWorkingDir string
-	PrometheusSSHUser    string
-	PrometheusSSHPort    string
-	DryRun               bool
-	SkipPrometheus       bool
+	PluginSlug                     string
+	MetricsPath                    string
+	MetricsToken                   string
+	EnableAuth                     bool
+	CollectionInterval             int
+	ScrapeInterval                 string
+	ScrapeTimeout                  string
+	HealthCheckTimeout             time.Duration
+	PrometheusHost                 string
+	PrometheusContainer            string
+	PrometheusWorkingDir           string
+	PrometheusYmlPath              string // Direct path to prometheus.yml
+	PrometheusDockerComposeYmlPath string // Direct path to docker-compose.yml
+	PrometheusSSHUser              string
+	PrometheusSSHPort              string
+	DryRun                         bool
+	SkipPrometheus                 bool
 }
 
 // WorkflowResult contains the results of the installation workflow
@@ -544,7 +546,14 @@ func (o *Orchestrator) createPrometheusManager(sshClient *auth.SSHClient, config
 		return nil, fmt.Errorf("failed to create prometheus manager: %w", err)
 	}
 
-	return NewPrometheusManager(sshClient, o.prometheusHost, promManager), nil
+	pm := NewPrometheusManager(sshClient, o.prometheusHost, promManager)
+
+	// Set direct paths if provided
+	if config.PrometheusYmlPath != "" || config.PrometheusDockerComposeYmlPath != "" {
+		pm.SetDirectPaths(config.PrometheusYmlPath, config.PrometheusDockerComposeYmlPath)
+	}
+
+	return pm, nil
 }
 
 func (o *Orchestrator) generateJobName(siteURL string) string {
