@@ -672,14 +672,27 @@ func (bm *BackupManager) DeleteObjects(objectNames []string) error {
 		return err
 	}
 
-	var errs []string
-	for _, o := range objectNames {
-		if err := bm.DeleteObject(o); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", o, err))
+	// Use Minio batch RemoveObjects API for performance when deleting many objects.
+	ctx := context.Background()
+	objectsCh := make(chan minio.ObjectInfo, len(objectNames))
+	go func() {
+		defer close(objectsCh)
+		for _, k := range objectNames {
+			objectsCh <- minio.ObjectInfo{Key: k}
 		}
+	}()
+
+	errCh := bm.minioClient.RemoveObjects(ctx, bm.minioConfig.Bucket, objectsCh, minio.RemoveObjectsOptions{})
+
+	var errs []string
+	for e := range errCh {
+		// RemoveObjects returns RemoveObjectError with ObjectName and Err
+		errs = append(errs, fmt.Sprintf("%s: %v", e.ObjectName, e.Err))
 	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("errors deleting objects: %s", strings.Join(errs, "; "))
 	}
+
 	return nil
 }
