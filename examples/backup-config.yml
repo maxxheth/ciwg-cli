@@ -1,0 +1,118 @@
+# CIWG CLI Backup Configuration Example
+# This file demonstrates how to configure custom container backups for applications
+# using Postgres, MySQL, MongoDB, or other database systems.
+
+version: "1"
+
+# Default settings applied to all containers unless overridden
+defaults:
+  database_type: postgres
+  database_export_dir: /tmp/db-exports
+  env:
+    PGPASSWORD: "${DB_PASSWORD}"
+    TZ: "America/New_York"
+
+# List of containers to back up
+containers:
+  # Example 1: Node.js app with Postgres in separate container
+  - name: my_nodejs_app
+    label: nodejs-api
+    type: custom
+    database:
+      type: postgres
+      container: my_postgres_db
+      name: app_database
+      user: postgres
+      port: 5432
+      export_path: /app/backups/db-export.sql
+    paths:
+      working_dir: /var/opt/apps/nodejs-app
+      app_dir: /var/opt/apps/nodejs-app
+      database_export_dir: /var/opt/apps/nodejs-app/backups
+    pre_backup_commands:
+      - docker exec my_nodejs_app npm run db:prepare-backup
+    post_backup_commands:
+      - docker exec my_nodejs_app npm run db:cleanup
+    excludes:
+      - node_modules
+      - "*.log"
+      - tmp
+
+  # Example 2: Python Django app with MySQL
+  - name: django_app
+    label: django-backend
+    type: custom
+    database:
+      type: mysql
+      container: django_mysql
+      name: django_db
+      user: django_user
+      password: "${MYSQL_PASSWORD}"
+      export_format: sql
+    paths:
+      working_dir: /var/opt/apps/django-app
+      app_dir: /var/opt/apps/django-app
+    pre_backup_commands:
+      - docker exec django_app python manage.py flush_cache
+    excludes:
+      - "*.pyc"
+      - __pycache__
+      - "*.log"
+
+  # Example 3: MongoDB-based application
+  - name: mongo_app
+    label: mongo-analytics
+    type: custom
+    database:
+      type: mongodb
+      container: mongo_primary
+      name: analytics_db
+      user: admin
+      password: "${MONGO_PASSWORD}"
+      export_path: /var/backups/mongo
+    paths:
+      working_dir: /var/opt/apps/analytics
+    excludes:
+      - temp
+      - cache
+
+  # Example 4: Custom database export with explicit command
+  - name: custom_db_app
+    label: custom-app
+    type: custom
+    database:
+      type: custom
+      export_command: |
+        docker exec my_db_container /opt/scripts/custom-backup.sh --output /backups/export.sql
+    paths:
+      working_dir: /var/opt/apps/custom-app
+
+  # Example 5: WordPress site (uses standard wp-cli backup)
+  - name: wp_mysite
+    label: mysite-com
+    type: wordpress
+    paths:
+      working_dir: /var/opt/sites/mysite.com
+
+  # Example 6: Skip this container during backup
+  - name: staging_app
+    label: staging
+    type: custom
+    skip: true
+    database:
+      type: postgres
+      name: staging_db
+
+# Usage examples:
+# 
+# # Backup using config file:
+# ciwg-cli backup create hostname --config-file backup-config.yml
+#
+# # Backup with server range:
+# ciwg-cli backup create --server-range 'app%d.example.com:0-5' --config-file backup-config.yml
+#
+# # Dry run to preview actions:
+# ciwg-cli backup create hostname --config-file backup-config.yml --dry-run
+#
+# # Backup and delete old containers:
+# ciwg-cli backup create hostname --config-file backup-config.yml --delete
