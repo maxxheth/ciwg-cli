@@ -460,7 +460,9 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir s
 		}
 
 		ctx := context.Background()
-		objectName := fmt.Sprintf("backups/%s", backupName)
+		// Store backups in a directory named after the site (basename of workingDir)
+		siteName := filepath.Base(workingDir)
+		objectName := fmt.Sprintf("backups/%s/%s", siteName, backupName)
 
 		info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, stdout, -1, minio.PutObjectOptions{
 			ContentType: "application/gzip",
@@ -486,7 +488,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir s
 			}
 		}
 
-		fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", backupName, info.Size)
+		fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
 		return nil
 	}
 
@@ -522,7 +524,9 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir s
 
 	// Stream directly to Minio
 	ctx := context.Background()
-	objectName := fmt.Sprintf("backups/%s", backupName)
+	// Store backups in a directory named after the site (basename of workingDir)
+	siteName := filepath.Base(workingDir)
+	objectName := fmt.Sprintf("backups/%s/%s", siteName, backupName)
 
 	info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, stdout, -1, minio.PutObjectOptions{
 		ContentType: "application/gzip",
@@ -542,7 +546,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir s
 		}
 	}
 
-	fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", backupName, info.Size)
+	fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
 	return nil
 }
 

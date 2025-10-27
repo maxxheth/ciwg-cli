@@ -313,7 +313,8 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 
 		for _, container := range containers {
 			siteName := filepath.Base(container.WorkingDir)
-			prefix := fmt.Sprintf("backups/%s-", siteName)
+			// Backups are stored under backups/<siteName>/ so use that directory as the prefix
+			prefix := fmt.Sprintf("backups/%s/", siteName)
 
 			objs, err := backupManager.ListBackups(prefix, 0)
 			if err != nil {
