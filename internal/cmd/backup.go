@@ -54,9 +54,33 @@ var backupListCmd = &cobra.Command{
 var backupDeleteCmd = &cobra.Command{
 	Use:   "delete [object]",
 	Short: "Delete backup object(s) from Minio",
-	Long:  `Delete one or more backup objects from the configured Minio bucket. Use --prefix to delete multiple objects matching a prefix or pass a single object key.`,
-	Args:  cobra.MaximumNArgs(1),
-	RunE:  runBackupDelete,
+	Long: `Delete one or more backup objects from the configured Minio bucket.
+
+Deletion modes (mutually exclusive):
+  - Single object: Pass object key as argument
+  - By prefix: Use --prefix to delete multiple objects matching a prefix
+  - Latest: Use --latest with --prefix to delete only the most recent match
+  - Delete all: Use --delete-all to delete all objects (respects --prefix)
+  - Numeric range: Use --delete-range "1-10" to delete the 1st through 10th most recent backups
+  - Date range: Use --delete-range-by-date "YYYYMMDD-YYYYMMDD" or "YYYYMMDD:HHMMSS-YYYYMMDD:HHMMSS"
+
+Examples:
+  # Delete a specific backup
+  ciwg-cli backup delete backups/site-20240101-120000.tgz
+
+  # Delete all backups for a site (with confirmation)
+  ciwg-cli backup delete --prefix backups/mysite.com- --delete-all
+
+  # Delete the 5 oldest backups for a site
+  ciwg-cli backup delete --prefix backups/mysite.com- --delete-range 1-5
+
+  # Delete backups from January 2024
+  ciwg-cli backup delete --prefix backups/mysite.com- --delete-range-by-date 20240101-20240131
+
+  # Dry run to preview deletions
+  ciwg-cli backup delete --prefix backups/mysite.com- --delete-all --dry-run`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runBackupDelete,
 }
 
 func init() {
@@ -97,6 +121,8 @@ func init() {
 	backupCreateCmd.Flags().String("container-file", "", "File with newline-delimited container names or working directories to process")
 	backupCreateCmd.Flags().String("container-parent-dir", "/var/opt/sites", "Parent directory where site working directories live (default: /var/opt/sites)")
 	backupCreateCmd.Flags().String("server-range", "", "Server range pattern (e.g., 'wp%d.example.com:0-41')")
+	backupCreateCmd.Flags().Bool("overwrite", false, "After creating backup, delete all old backups except the N most recent (configure N with --remainder)")
+	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --overwrite (default: 5)")
 
 	// Minio configuration flags with environment variable support
 	backupCreateCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
@@ -146,6 +172,9 @@ func init() {
 	backupDeleteCmd.Flags().String("prefix", "", "Prefix to select objects to delete (e.g. backups/site-)")
 	backupDeleteCmd.Flags().Int("limit", 100, "Maximum number of objects to consider when using --prefix")
 	backupDeleteCmd.Flags().Bool("latest", false, "If set with --prefix, delete only the most recent object matching --prefix")
+	backupDeleteCmd.Flags().Bool("delete-all", false, "Delete all backups (respects --prefix if provided)")
+	backupDeleteCmd.Flags().String("delete-range", "", "Delete backups by numeric range (e.g., '1-10' for 1st through 10th most recent)")
+	backupDeleteCmd.Flags().String("delete-range-by-date", "", "Delete backups by date range (YYYYMMDD-YYYYMMDD or YYYYMMDD:HHMMSS-YYYYMMDD:HHMMSS)")
 	backupDeleteCmd.Flags().Bool("skip-confirmation", false, "Skip interactive confirmation prompt")
 	backupDeleteCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
 	backupDeleteCmd.Flags().String("minio-access-key", getEnvWithDefault("MINIO_ACCESS_KEY", ""), "Minio access key (env: MINIO_ACCESS_KEY)")
@@ -258,7 +287,67 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
-	return backupManager.CreateBackups(options)
+	err := backupManager.CreateBackups(options)
+	if err != nil {
+		return err
+	}
+
+	// Handle overwrite mode: clean up old backups
+	overwrite := mustGetBoolFlag(cmd, "overwrite")
+	if overwrite {
+		remainder := 5
+		if v, err := cmd.Flags().GetInt("remainder"); err == nil {
+			remainder = v
+		}
+		if remainder < 0 {
+			return fmt.Errorf("--remainder must be >= 0")
+		}
+
+		fmt.Printf("\n--- Cleaning up old backups (keeping %d most recent) ---\n", remainder)
+
+		// For each container that was backed up, clean up old backups
+		containers, err := backupManager.GetContainersFromOptions(options)
+		if err != nil {
+			return fmt.Errorf("failed to get containers for cleanup: %w", err)
+		}
+
+		for _, container := range containers {
+			siteName := filepath.Base(container.WorkingDir)
+			prefix := fmt.Sprintf("backups/%s-", siteName)
+
+			objs, err := backupManager.ListBackups(prefix, 0)
+			if err != nil {
+				fmt.Printf("Warning: failed to list backups for %s: %v\n", siteName, err)
+				continue
+			}
+
+			if len(objs) <= remainder {
+				fmt.Printf("Site %s: Found %d backup(s), keeping all\n", siteName, len(objs))
+				continue
+			}
+
+			toDelete := backupManager.SelectObjectsForOverwrite(objs, remainder)
+			if len(toDelete) == 0 {
+				continue
+			}
+
+			fmt.Printf("Site %s: Found %d backup(s), keeping %d most recent, deleting %d older backup(s)\n",
+				siteName, len(objs), remainder, len(toDelete))
+
+			var deleteKeys []string
+			for _, o := range toDelete {
+				deleteKeys = append(deleteKeys, o.Key)
+			}
+
+			if err := backupManager.DeleteObjects(deleteKeys); err != nil {
+				fmt.Printf("Warning: failed to delete old backups for %s: %v\n", siteName, err)
+			} else {
+				fmt.Printf("Successfully cleaned up old backups for %s\n", siteName)
+			}
+		}
+	}
+
+	return nil
 }
 
 func runTestMinio(cmd *cobra.Command, args []string) error {
@@ -405,16 +494,40 @@ func runBackupDelete(cmd *cobra.Command, args []string) error {
 
 	prefix := mustGetStringFlag(cmd, "prefix")
 	latest := mustGetBoolFlag(cmd, "latest")
+	deleteAll := mustGetBoolFlag(cmd, "delete-all")
+	deleteRange := mustGetStringFlag(cmd, "delete-range")
+	deleteRangeByDate := mustGetStringFlag(cmd, "delete-range-by-date")
 	skipConfirm := mustGetBoolFlag(cmd, "skip-confirmation")
 	dryRun := mustGetBoolFlag(cmd, "dry-run")
+
+	// Validate mutually exclusive flags
+	flagCount := 0
+	if objectName != "" {
+		flagCount++
+	}
+	if latest {
+		flagCount++
+	}
+	if deleteAll {
+		flagCount++
+	}
+	if deleteRange != "" {
+		flagCount++
+	}
+	if deleteRangeByDate != "" {
+		flagCount++
+	}
+	if flagCount > 1 {
+		return fmt.Errorf("only one of: object argument, --latest, --delete-all, --delete-range, or --delete-range-by-date can be specified")
+	}
 
 	// Resolve object(s) to delete
 	var toDelete []string
 	if objectName != "" {
 		toDelete = append(toDelete, objectName)
-	} else if prefix != "" {
-		limit := 100
-		if v, err := cmd.Flags().GetInt("limit"); err == nil {
+	} else if prefix != "" || deleteAll || deleteRange != "" || deleteRangeByDate != "" {
+		limit := 0 // Get all objects for these operations
+		if v, err := cmd.Flags().GetInt("limit"); err == nil && !deleteAll && deleteRange == "" && deleteRangeByDate == "" {
 			limit = v
 		}
 		objs, err := bm.ListBackups(prefix, limit)
@@ -425,15 +538,45 @@ func runBackupDelete(cmd *cobra.Command, args []string) error {
 			fmt.Println("No objects found for prefix")
 			return nil
 		}
+
 		if latest {
 			// pick latest
 			latestKey := objs[0].Key
+			latestTime := objs[0].LastModified
 			for _, o := range objs[1:] {
-				if o.LastModified.After(objs[0].LastModified) {
+				if o.LastModified.After(latestTime) {
 					latestKey = o.Key
+					latestTime = o.LastModified
 				}
 			}
 			toDelete = append(toDelete, latestKey)
+		} else if deleteAll {
+			for _, o := range objs {
+				toDelete = append(toDelete, o.Key)
+			}
+		} else if deleteRange != "" {
+			// Parse numeric range and select objects
+			start, end, err := bm.ParseNumericRange(deleteRange)
+			if err != nil {
+				return fmt.Errorf("invalid --delete-range format: %w", err)
+			}
+			selected, err := bm.SelectObjectsByNumericRange(objs, start, end)
+			if err != nil {
+				return fmt.Errorf("failed to select objects by range: %w", err)
+			}
+			for _, o := range selected {
+				toDelete = append(toDelete, o.Key)
+			}
+		} else if deleteRangeByDate != "" {
+			// Parse date range and filter objects
+			startTime, endTime, err := bm.ParseDateRange(deleteRangeByDate)
+			if err != nil {
+				return fmt.Errorf("invalid --delete-range-by-date format: %w", err)
+			}
+			filtered := bm.FilterObjectsByDateRange(objs, startTime, endTime)
+			for _, o := range filtered {
+				toDelete = append(toDelete, o.Key)
+			}
 		} else {
 			for _, o := range objs {
 				toDelete = append(toDelete, o.Key)
