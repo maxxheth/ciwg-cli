@@ -97,13 +97,15 @@ func (i *Installer) ConfigurePlugin(config InstallConfig) error {
 
 // VerifyMetricsEndpoint checks if the metrics endpoint is accessible
 func (i *Installer) VerifyMetricsEndpoint(siteURL, metricsPath, token string) error {
+	// Build metrics URL
+	metricsURL := strings.TrimRight(siteURL, "/") + "/" + strings.TrimLeft(metricsPath, "/")
+
 	// Build curl command with optional authentication
 	curlCmd := fmt.Sprintf(`curl -s -o /dev/null -w "%%{http_code}"`)
 	if token != "" {
 		curlCmd = fmt.Sprintf(`curl -s -o /dev/null -w "%%{http_code}" -H "Authorization: Bearer %s"`, token)
 	}
 
-	metricsURL := strings.TrimRight(siteURL, "/") + "/" + strings.TrimLeft(metricsPath, "/")
 	cmd := fmt.Sprintf(`%s %s`, curlCmd, metricsURL)
 
 	stdout, stderr, err := i.sshClient.ExecuteCommand(cmd)
@@ -113,7 +115,16 @@ func (i *Installer) VerifyMetricsEndpoint(siteURL, metricsPath, token string) er
 
 	statusCode := strings.TrimSpace(stdout)
 	if statusCode != "200" {
-		return fmt.Errorf("metrics endpoint returned status %s", statusCode)
+		// Provide detailed troubleshooting information
+		return fmt.Errorf("metrics endpoint returned status %s\n"+
+			"  URL tested: %s\n"+
+			"  Troubleshooting:\n"+
+			"    1. Check if PromPress plugin is active: wp plugin is-active prompress --allow-root\n"+
+			"    2. Check WordPress rewrite rules: wp rewrite flush --allow-root\n"+
+			"    3. Test endpoint manually: curl -I %s\n"+
+			"    4. Check .htaccess or nginx config for URL rewrite issues\n"+
+			"    5. Verify metrics path in PromPress settings matches '%s'",
+			statusCode, metricsURL, metricsURL, metricsPath)
 	}
 
 	return nil
