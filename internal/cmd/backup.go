@@ -124,6 +124,15 @@ func init() {
 	backupCreateCmd.Flags().Bool("overwrite", false, "After creating backup, delete all old backups except the N most recent (configure N with --remainder)")
 	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --overwrite (default: 5)")
 
+	// Custom container / config file flags
+	backupCreateCmd.Flags().String("config-file", "", "Path to YAML configuration file for custom backup configurations")
+	backupCreateCmd.Flags().String("database-type", "", "Database type for custom containers (postgres, mysql, mongodb)")
+	backupCreateCmd.Flags().String("database-export-dir", "", "Directory where database exports should be saved")
+	backupCreateCmd.Flags().String("custom-app-dir", "", "Application directory for custom containers (if different from working dir)")
+	backupCreateCmd.Flags().String("database-container", "", "Name of separate database container")
+	backupCreateCmd.Flags().String("database-name", "", "Database name for custom exports")
+	backupCreateCmd.Flags().String("database-user", "", "Database user for custom exports")
+
 	// Minio configuration flags with environment variable support
 	backupCreateCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
 	backupCreateCmd.Flags().String("minio-access-key", getEnvWithDefault("MINIO_ACCESS_KEY", ""), "Minio access key (env: MINIO_ACCESS_KEY)")
@@ -277,13 +286,20 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 
 	// Get backup options from flags
 	options := &backup.BackupOptions{
-		DryRun:         mustGetBoolFlag(cmd, "dry-run"),
-		Delete:         mustGetBoolFlag(cmd, "delete"),
-		ContainerName:  mustGetStringFlag(cmd, "container-name"),
-		ContainerFile:  mustGetStringFlag(cmd, "container-file"),
-		ContainerNames: containerNames,
-		Local:          localMode,
-		ParentDir:      mustGetStringFlag(cmd, "container-parent-dir"),
+		DryRun:            mustGetBoolFlag(cmd, "dry-run"),
+		Delete:            mustGetBoolFlag(cmd, "delete"),
+		ContainerName:     mustGetStringFlag(cmd, "container-name"),
+		ContainerFile:     mustGetStringFlag(cmd, "container-file"),
+		ContainerNames:    containerNames,
+		Local:             localMode,
+		ParentDir:         mustGetStringFlag(cmd, "container-parent-dir"),
+		ConfigFile:        mustGetStringFlag(cmd, "config-file"),
+		DatabaseType:      mustGetStringFlag(cmd, "database-type"),
+		DatabaseExportDir: mustGetStringFlag(cmd, "database-export-dir"),
+		CustomAppDir:      mustGetStringFlag(cmd, "custom-app-dir"),
+		DatabaseContainer: mustGetStringFlag(cmd, "database-container"),
+		DatabaseName:      mustGetStringFlag(cmd, "database-name"),
+		DatabaseUser:      mustGetStringFlag(cmd, "database-user"),
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
