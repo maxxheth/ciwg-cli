@@ -142,6 +142,7 @@ func init() {
 
 	// Delete command registration and flags
 	backupCmd.AddCommand(backupDeleteCmd)
+	backupDeleteCmd.Flags().Bool("dry-run", false, "Preview deletions without performing them")
 	backupDeleteCmd.Flags().String("prefix", "", "Prefix to select objects to delete (e.g. backups/site-)")
 	backupDeleteCmd.Flags().Int("limit", 100, "Maximum number of objects to consider when using --prefix")
 	backupDeleteCmd.Flags().Bool("latest", false, "If set with --prefix, delete only the most recent object matching --prefix")
@@ -405,6 +406,7 @@ func runBackupDelete(cmd *cobra.Command, args []string) error {
 	prefix := mustGetStringFlag(cmd, "prefix")
 	latest := mustGetBoolFlag(cmd, "latest")
 	skipConfirm := mustGetBoolFlag(cmd, "skip-confirmation")
+	dryRun := mustGetBoolFlag(cmd, "dry-run")
 
 	// Resolve object(s) to delete
 	var toDelete []string
@@ -442,6 +444,15 @@ func runBackupDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	// Confirmation
+	// If dry-run requested, just preview and exit
+	if dryRun {
+		fmt.Printf("Dry run: %d object(s) would be deleted:\n", len(toDelete))
+		for _, k := range toDelete {
+			fmt.Println(" - ", k)
+		}
+		return nil
+	}
+
 	if !skipConfirm {
 		fmt.Printf("About to delete %d object(s). Continue? [y/N]: ", len(toDelete))
 		var resp string
