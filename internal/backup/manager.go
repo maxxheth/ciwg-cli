@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -195,6 +197,12 @@ func (bm *BackupManager) CreateBackups(options *BackupOptions) error {
 	}
 
 	return nil
+}
+
+// GetContainersFromOptions returns the list of containers that would be processed
+// based on the provided options. This is useful for determining which backups to clean up.
+func (bm *BackupManager) GetContainersFromOptions(options *BackupOptions) ([]ContainerInfo, error) {
+	return bm.getContainers(options)
 }
 
 func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo, error) {
@@ -695,4 +703,136 @@ func (bm *BackupManager) DeleteObjects(objectNames []string) error {
 	}
 
 	return nil
+}
+
+// ParseNumericRange parses a numeric range string like "1-10" and returns start and end indices.
+// The range is 1-based (1 means the first/most recent backup).
+func (bm *BackupManager) ParseNumericRange(rangeStr string) (int, int, error) {
+	parts := strings.Split(rangeStr, "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("range must be in format 'N-M' (e.g., '1-10')")
+	}
+
+	start, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid start value: %w", err)
+	}
+
+	end, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid end value: %w", err)
+	}
+
+	if start < 1 {
+		return 0, 0, fmt.Errorf("start must be >= 1")
+	}
+
+	if end < start {
+		return 0, 0, fmt.Errorf("end must be >= start")
+	}
+
+	return start, end, nil
+}
+
+// SelectObjectsByNumericRange selects objects by numeric range (1-based, where 1 is most recent).
+// Objects are sorted by LastModified in descending order before selection.
+func (bm *BackupManager) SelectObjectsByNumericRange(objs []ObjectInfo, start, end int) ([]ObjectInfo, error) {
+	if len(objs) == 0 {
+		return nil, fmt.Errorf("no objects available")
+	}
+
+	// Sort by LastModified descending (most recent first)
+	sorted := make([]ObjectInfo, len(objs))
+	copy(sorted, objs)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].LastModified.After(sorted[j].LastModified)
+	})
+
+	// Convert 1-based indices to 0-based
+	startIdx := start - 1
+	endIdx := end - 1
+
+	if startIdx >= len(sorted) {
+		return nil, fmt.Errorf("start index %d exceeds number of objects (%d)", start, len(sorted))
+	}
+
+	if endIdx >= len(sorted) {
+		endIdx = len(sorted) - 1
+	}
+
+	return sorted[startIdx : endIdx+1], nil
+}
+
+// ParseDateRange parses a date range string in format YYYYMMDD-YYYYMMDD or YYYYMMDD:HHMMSS-YYYYMMDD:HHMMSS
+func (bm *BackupManager) ParseDateRange(rangeStr string) (time.Time, time.Time, error) {
+	parts := strings.Split(rangeStr, "-")
+	if len(parts) != 2 {
+		return time.Time{}, time.Time{}, fmt.Errorf("range must be in format 'YYYYMMDD-YYYYMMDD' or 'YYYYMMDD:HHMMSS-YYYYMMDD:HHMMSS'")
+	}
+
+	startStr := strings.TrimSpace(parts[0])
+	endStr := strings.TrimSpace(parts[1])
+
+	// Determine format based on presence of colon
+	var layout string
+	if strings.Contains(startStr, ":") {
+		layout = "20060102:150405"
+	} else {
+		layout = "20060102"
+	}
+
+	startTime, err := time.Parse(layout, startStr)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid start date: %w", err)
+	}
+
+	endTime, err := time.Parse(layout, endStr)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid end date: %w", err)
+	}
+
+	// If using date-only format, set end time to end of day
+	if layout == "20060102" {
+		endTime = endTime.Add(24*time.Hour - time.Second)
+	}
+
+	if endTime.Before(startTime) {
+		return time.Time{}, time.Time{}, fmt.Errorf("end date must be after start date")
+	}
+
+	return startTime, endTime, nil
+}
+
+// FilterObjectsByDateRange filters objects to only include those with LastModified between start and end times (inclusive).
+func (bm *BackupManager) FilterObjectsByDateRange(objs []ObjectInfo, start, end time.Time) []ObjectInfo {
+	var filtered []ObjectInfo
+	for _, o := range objs {
+		if (o.LastModified.Equal(start) || o.LastModified.After(start)) &&
+			(o.LastModified.Equal(end) || o.LastModified.Before(end)) {
+			filtered = append(filtered, o)
+		}
+	}
+	return filtered
+}
+
+// SelectObjectsForOverwrite selects objects for deletion when using the overwrite mode.
+// It sorts objects by LastModified descending (most recent first) and returns all objects
+// except the N most recent ones (where N is the remainder parameter).
+// If remainder is 0, all objects are selected for deletion.
+// If remainder >= total objects, an empty slice is returned (nothing to delete).
+func (bm *BackupManager) SelectObjectsForOverwrite(objs []ObjectInfo, remainder int) []ObjectInfo {
+	if len(objs) <= remainder {
+		// Keep all objects if we have fewer or equal to the remainder
+		return []ObjectInfo{}
+	}
+
+	// Sort by LastModified descending (most recent first)
+	sorted := make([]ObjectInfo, len(objs))
+	copy(sorted, objs)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].LastModified.After(sorted[j].LastModified)
+	})
+
+	// Return all objects after the first N (remainder) items
+	return sorted[remainder:]
 }
