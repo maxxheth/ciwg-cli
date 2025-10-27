@@ -72,6 +72,10 @@ func TestBackupInfo(t *testing.T) {
 	if backup.Container != "wp_testsite" {
 		t.Errorf("Expected container wp_testsite, got %s", backup.Container)
 	}
+
+	if backup.Timestamp.IsZero() {
+		t.Error("Backup timestamp should not be zero")
+	}
 }
 
 func TestServiceStructure(t *testing.T) {
@@ -110,6 +114,46 @@ func TestServiceStructure(t *testing.T) {
 	if len(service.Volumes) != 1 {
 		t.Errorf("Expected 1 volume, got %d", len(service.Volumes))
 	}
+
+	if service.ContainerName != "wp_container" {
+		t.Errorf("Expected container_name wp_container, got %s", service.ContainerName)
+	}
+
+	labels, ok := service.Labels.(map[string]string)
+	if !ok {
+		t.Fatal("Labels should be a map[string]string")
+	}
+
+	if val, exists := labels["com.example.description"]; !exists || val != "WordPress container" {
+		t.Errorf("Expected label com.example.description to be 'WordPress container', got '%s'", val)
+	}
+
+	environment, ok := service.Environment.(map[string]string)
+	if !ok {
+		t.Fatal("Environment should be a map[string]string")
+	}
+
+	if dbHost, exists := environment["WORDPRESS_DB_HOST"]; !exists || dbHost != "db:3306" {
+		t.Errorf("Expected WORDPRESS_DB_HOST to be 'db:3306', got '%s'", dbHost)
+	}
+
+	if dbName, exists := environment["WORDPRESS_DB_NAME"]; !exists || dbName != "wordpress" {
+		t.Errorf("Expected WORDPRESS_DB_NAME to be 'wordpress', got '%s'", dbName)
+	}
+
+	network, ok := service.Networks.([]string)
+	if !ok {
+		t.Fatal("Networks should be a []string")
+	}
+
+	if len(network) != 1 || network[0] != "backend" {
+		t.Errorf("Expected Networks to contain 'backend', got %v", network)
+	}
+
+	// if desc, ok := service.Labels["com.example.description"]; !ok || desc != "WordPress container" {
+	// 	t.Errorf("Expected label com.example.description to be 'WordPress container', got '%s'", desc)
+	// }
+
 }
 
 func TestComplexServiceEnvironment(t *testing.T) {
@@ -158,6 +202,10 @@ func TestComposeConfigWithNetworks(t *testing.T) {
 		},
 	}
 
+	if config.Version != "3.8" {
+		t.Errorf("Expected version 3.8, got %s", config.Version)
+	}
+
 	if len(config.Networks) != 2 {
 		t.Errorf("Expected 2 networks, got %d", len(config.Networks))
 	}
@@ -183,6 +231,10 @@ func TestComposeConfigWithVolumes(t *testing.T) {
 				"driver": "local",
 			},
 		},
+	}
+
+	if config.Version != "3.8" {
+		t.Errorf("Expected version 3.8, got %s", config.Version)
 	}
 
 	if len(config.Volumes) != 1 {
