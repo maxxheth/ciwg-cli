@@ -217,7 +217,7 @@ func discoverContainers(sshClient *auth.SSHClient, prefix string) ([]string, err
 func validateContainerFlags(cmd *cobra.Command) error {
 	allContainers, _ := cmd.Flags().GetBool("all-containers")
 	container, _ := cmd.Flags().GetString("container")
-	
+
 	if !allContainers && container == "" {
 		return fmt.Errorf("either --container or --all-containers is required")
 	}
@@ -252,7 +252,7 @@ func processForAllContainers(cmd *cobra.Command, hostname string, processFn func
 	var lastErr error
 	successCount := 0
 	failCount := 0
-	
+
 	for _, container := range containers {
 		fmt.Printf("\n=== Container: %s ===\n", container)
 		// Temporarily set container flag for processing
@@ -280,7 +280,7 @@ func runComposeRead(cmd *cobra.Command, args []string) error {
 
 	allContainers, _ := cmd.Flags().GetBool("all-containers")
 	serverRange, _ := cmd.Flags().GetString("server-range")
-	
+
 	if serverRange != "" {
 		return processComposeReadForServerRange(cmd, serverRange)
 	}
@@ -335,7 +335,7 @@ func processComposeRead(cmd *cobra.Command, hostname string) error {
 
 func processComposeReadForServerRange(cmd *cobra.Command, serverRange string) error {
 	allContainers, _ := cmd.Flags().GetBool("all-containers")
-	
+
 	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return err
@@ -944,7 +944,7 @@ func runComposeList(cmd *cobra.Command, args []string) error {
 
 	allContainers, _ := cmd.Flags().GetBool("all-containers")
 	serverRange, _ := cmd.Flags().GetString("server-range")
-	
+
 	if serverRange != "" {
 		return processComposeListForServerRange(cmd, serverRange)
 	}
@@ -999,7 +999,7 @@ func processComposeList(cmd *cobra.Command, hostname string) error {
 
 func processComposeListForServerRange(cmd *cobra.Command, serverRange string) error {
 	allContainers, _ := cmd.Flags().GetBool("all-containers")
-	
+
 	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return err
