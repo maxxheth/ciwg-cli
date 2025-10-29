@@ -12,6 +12,6 @@ HOSTNAME="$(hostname)"
 LOGDIR="/root/logs"
 mkdir -p "$LOGDIR"
 
-ciwg-cli backup create "$HOSTNAME" --overwrite --remainder 2 --bucket-path backups/api.ciwebgroup.com --config-file ./api.ciwebgroup.com.yml --local >> "$LOGDIR/minio-backup.log" 2>&1 &
+ciwg-cli backup create "$HOSTNAME" --prune --remainder 2 --bucket-path backups/api.ciwebgroup.com --config-file ./api.ciwebgroup.com.yml --local >> "$LOGDIR/minio-backup.log" 2>&1 &
 
 exit 0
