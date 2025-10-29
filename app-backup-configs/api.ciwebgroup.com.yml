@@ -1,0 +1,40 @@
+# CIWG CLI Backup Configuration Example
+# This file demonstrates how to configure custom container backups for applications
+# using Postgres, MySQL, MongoDB, or other database systems.
+
+version: "1"
+
+# Default settings applied to all containers unless overridden
+defaults:
+  database_type: postgres
+  database_export_dir: /tmp/db-exports
+  env:
+    PGPASSWORD: "${POSTGRES_PASSWORD}"
+    TZ: "America/Chicago"
+
+# List of containers to back up
+containers:
+  # Example 1: Node.js app with Postgres in separate container
+  - name: postgres_api_ciwebgroup_com
+    label: postgres-api-ciwebgroup-com
+    bucket_path: backups/api.ciwebgroup.com/postgres
+    type: custom
+    database:
+      type: postgres
+      container: postgres
+      name: webservices
+      user: postgres
+      port: 5432
+      export_path: /var/opt/web-services/backups/db-export.sql
+    paths:
+      working_dir: /var/opt/web-services
+      app_dir: /var/opt/postgres
+    #   database_export_dir: /var/opt/postgres/backups
+    # pre_backup_commands:
+    #   - docker exec my_nodejs_app npm run db:prepare-backup
+    # post_backup_commands:
+    #   - docker exec my_nodejs_app npm run db:cleanup
+    excludes:
+      - node_modules
+      - "*.log"
+      - tmp
