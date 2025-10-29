@@ -42,3 +42,6 @@ dist/
 vendor
 tarballs
 backups
+
+*.swp
+*.json
