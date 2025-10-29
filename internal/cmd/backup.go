@@ -35,6 +35,13 @@ var backupTestMinioCmd = &cobra.Command{
 	RunE:  runTestMinio,
 }
 
+var backupTestAWSCmd = &cobra.Command{
+	Use:   "test-aws",
+	Short: "Test AWS S3 connection and perform read/write test",
+	Long:  `Test the connection to AWS S3 storage and perform a basic read/write test to verify bucket access.`,
+	RunE:  runTestAWS,
+}
+
 var backupReadCmd = &cobra.Command{
 	Use:   "read [object]",
 	Short: "Read/download a backup object from Minio",
@@ -109,6 +116,7 @@ func init() {
 	rootCmd.AddCommand(backupCmd)
 	backupCmd.AddCommand(backupCreateCmd)
 	backupCmd.AddCommand(backupTestMinioCmd)
+	backupCmd.AddCommand(backupTestAWSCmd)
 	backupCmd.AddCommand(backupReadCmd)
 	backupCmd.AddCommand(backupListCmd)
 
@@ -139,6 +147,13 @@ func init() {
 	backupCreateCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupCreateCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupCreateCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupCreateCmd.Flags().String("bucket-path", getEnvWithDefault("MINIO_BUCKET_PATH", ""), "Path prefix within Minio bucket (e.g., 'production/backups', env: MINIO_BUCKET_PATH)")
+
+	// AWS S3 configuration flags with environment variable support
+	backupCreateCmd.Flags().String("aws-bucket", getEnvWithDefault("AWS_BUCKET", ""), "AWS S3 bucket name (env: AWS_BUCKET)")
+	backupCreateCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
+	backupCreateCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
+	backupCreateCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION)")
 
 	// SSH connection flags with environment variable support
 	backupCreateCmd.Flags().StringP("user", "u", getEnvWithDefault("SSH_USER", ""), "SSH username (env: SSH_USER, default: current user)")
@@ -153,6 +168,12 @@ func init() {
 	backupTestMinioCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupTestMinioCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupTestMinioCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+
+	// AWS test command flags
+	backupTestAWSCmd.Flags().String("aws-bucket", getEnvWithDefault("AWS_BUCKET", ""), "AWS S3 bucket name (env: AWS_BUCKET)")
+	backupTestAWSCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
+	backupTestAWSCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
+	backupTestAWSCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION)")
 
 	// Read command flags
 	backupReadCmd.Flags().String("output", "", "Output file path (if empty, writes to stdout)")
@@ -222,8 +243,14 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Get AWS configuration (optional)
+	awsConfig, err := getAWSConfig(cmd)
+	if err != nil {
+		return err
+	}
+
 	if serverRange != "" {
-		return processBackupCreateForServerRange(cmd, serverRange, minioConfig)
+		return processBackupCreateForServerRange(cmd, serverRange, minioConfig, awsConfig)
 	}
 
 	if len(args) < 1 {
@@ -231,10 +258,10 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	hostname := args[0]
-	return createBackupForHost(cmd, hostname, minioConfig)
+	return createBackupForHost(cmd, hostname, minioConfig, awsConfig)
 }
 
-func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, minioConfig *backup.MinioConfig) error {
+func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, minioConfig *backup.MinioConfig, awsConfig *backup.AWSConfig) error {
 	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return fmt.Errorf("error parsing server range: %w", err)
@@ -247,7 +274,7 @@ func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, m
 		}
 		hostname := fmt.Sprintf(pattern, i)
 		fmt.Printf("--- Processing server: %s ---\n", hostname)
-		err := createBackupForHost(cmd, hostname, minioConfig)
+		err := createBackupForHost(cmd, hostname, minioConfig, awsConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", hostname, err)
 		}
@@ -257,7 +284,7 @@ func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, m
 	return nil
 }
 
-func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backup.MinioConfig) error {
+func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backup.MinioConfig, awsConfig *backup.AWSConfig) error {
 
 	// Determine if running locally
 	localMode := mustGetBoolFlag(cmd, "local")
@@ -272,7 +299,13 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		defer sshClient.Close()
 	}
 
-	backupManager := backup.NewBackupManager(sshClient, minioConfig)
+	// Create backup manager with AWS config if available
+	var backupManager *backup.BackupManager
+	if awsConfig != nil {
+		backupManager = backup.NewBackupManagerWithAWS(sshClient, minioConfig, awsConfig)
+	} else {
+		backupManager = backup.NewBackupManager(sshClient, minioConfig)
+	}
 
 	// Parse container-names (comma-delimited)
 	var containerNames []string
@@ -329,8 +362,17 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 
 		for _, container := range containers {
 			siteName := filepath.Base(container.WorkingDir)
-			// Backups are stored under backups/<siteName>/ so use that directory as the prefix
-			prefix := fmt.Sprintf("backups/%s/", siteName)
+			// If the container has a configured bucket_path, it supersedes the
+			// default backups/<siteName>/ prefix. Otherwise prefer global
+			// MinioConfig.BucketPath. If neither is set, use the default.
+			var prefix string
+			if container.Config != nil && container.Config.BucketPath != "" {
+				prefix = filepath.Clean(container.Config.BucketPath) + "/"
+			} else if backupManager.GetBucketPath() != "" {
+				prefix = filepath.Clean(backupManager.GetBucketPath()) + "/"
+			} else {
+				prefix = fmt.Sprintf("backups/%s/", siteName)
+			}
 
 			objs, err := backupManager.ListBackups(prefix, 0)
 			if err != nil {
@@ -356,10 +398,32 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 				deleteKeys = append(deleteKeys, o.Key)
 			}
 
+			// Delete from Minio
 			if err := backupManager.DeleteObjects(deleteKeys); err != nil {
-				fmt.Printf("Warning: failed to delete old backups for %s: %v\n", siteName, err)
+				fmt.Printf("Warning: failed to delete old Minio backups for %s: %v\n", siteName, err)
 			} else {
-				fmt.Printf("Successfully cleaned up old backups for %s\n", siteName)
+				fmt.Printf("Successfully cleaned up old Minio backups for %s\n", siteName)
+			}
+
+			// If AWS is configured, also clean up AWS backups
+			if awsConfig != nil && awsConfig.Bucket != "" {
+				awsObjs, err := backupManager.ListAWSBackups(prefix, 0)
+				if err != nil {
+					fmt.Printf("Warning: failed to list AWS backups for %s: %v\n", siteName, err)
+				} else if len(awsObjs) > remainder {
+					awsToDelete := backupManager.SelectObjectsForOverwrite(awsObjs, remainder)
+					if len(awsToDelete) > 0 {
+						var awsDeleteKeys []string
+						for _, o := range awsToDelete {
+							awsDeleteKeys = append(awsDeleteKeys, o.Key)
+						}
+						if err := backupManager.DeleteAWSObjects(awsDeleteKeys); err != nil {
+							fmt.Printf("Warning: failed to delete old AWS backups for %s: %v\n", siteName, err)
+						} else {
+							fmt.Printf("Successfully cleaned up old AWS backups for %s\n", siteName)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -393,6 +457,38 @@ func runTestMinio(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("\n✓ Minio connection test successful!")
+	return nil
+}
+
+func runTestAWS(cmd *cobra.Command, args []string) error {
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
+	// Validate AWS configuration
+	awsConfig, err := getAWSConfig(cmd)
+	if err != nil {
+		return err
+	}
+
+	if awsConfig == nil {
+		return fmt.Errorf("AWS bucket not configured (set AWS_BUCKET environment variable or --aws-bucket flag)")
+	}
+
+	fmt.Println("Testing AWS S3 connection...")
+	fmt.Printf("Bucket: %s\n", awsConfig.Bucket)
+	fmt.Printf("Region: %s\n\n", awsConfig.Region)
+
+	// Create a temporary backup manager without SSH client for testing
+	backupManager := backup.NewBackupManagerWithAWS(nil, nil, awsConfig)
+
+	// Test connection and perform read/write test
+	if err := backupManager.TestAWSConnection(); err != nil {
+		return fmt.Errorf("AWS S3 connection test failed: %w", err)
+	}
+
+	fmt.Println("\n✓ AWS S3 connection test successful!")
 	return nil
 }
 
@@ -641,6 +737,7 @@ func getMinioConfig(cmd *cobra.Command) (*backup.MinioConfig, error) {
 	secretKey := mustGetStringFlag(cmd, "minio-secret-key")
 	bucket := mustGetStringFlag(cmd, "minio-bucket")
 	useSSL := mustGetBoolFlag(cmd, "minio-ssl")
+	bucketPath := mustGetStringFlag(cmd, "bucket-path")
 
 	if endpoint == "" {
 		return nil, fmt.Errorf("minio-endpoint is required (can be set via MINIO_ENDPOINT environment variable)")
@@ -653,11 +750,41 @@ func getMinioConfig(cmd *cobra.Command) (*backup.MinioConfig, error) {
 	}
 
 	return &backup.MinioConfig{
-		Endpoint:  endpoint,
+		Endpoint:   endpoint,
+		AccessKey:  accessKey,
+		SecretKey:  secretKey,
+		Bucket:     bucket,
+		UseSSL:     useSSL,
+		BucketPath: bucketPath,
+	}, nil
+}
+
+func getAWSConfig(cmd *cobra.Command) (*backup.AWSConfig, error) {
+	bucket := mustGetStringFlag(cmd, "aws-bucket")
+	accessKey := mustGetStringFlag(cmd, "aws-access-key")
+	secretKey := mustGetStringFlag(cmd, "aws-secret-access-key")
+	region := mustGetStringFlag(cmd, "aws-region")
+
+	// AWS is optional, so only validate if bucket is provided
+	if bucket == "" {
+		return nil, nil
+	}
+
+	if accessKey == "" {
+		return nil, fmt.Errorf("aws-access-key is required when aws-bucket is set (can be set via AWS_ACCESS_KEY environment variable)")
+	}
+	if secretKey == "" {
+		return nil, fmt.Errorf("aws-secret-access-key is required when aws-bucket is set (can be set via AWS_SECRET_ACCESS_KEY environment variable)")
+	}
+	if region == "" {
+		return nil, fmt.Errorf("aws-region is required when aws-bucket is set (can be set via AWS_REGION environment variable)")
+	}
+
+	return &backup.AWSConfig{
+		Bucket:    bucket,
 		AccessKey: accessKey,
 		SecretKey: secretKey,
-		Bucket:    bucket,
-		UseSSL:    useSSL,
+		Region:    region,
 	}, nil
 }
 
