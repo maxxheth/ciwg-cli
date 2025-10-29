@@ -21,12 +21,16 @@ type BackupConfig struct {
 
 // ConfigDefaults contains default settings for all containers
 type ConfigDefaults struct {
-	DatabaseType      string            `yaml:"database_type,omitempty"`
-	ExportDir         string            `yaml:"export_dir,omitempty"`
-	DatabaseExportDir string            `yaml:"database_export_dir,omitempty"`
-	DatabaseName      string            `yaml:"database_name,omitempty"`
-	DatabaseUser      string            `yaml:"database_user,omitempty"`
-	Env               map[string]string `yaml:"env,omitempty"`
+	DatabaseType      string `yaml:"database_type,omitempty"`
+	ExportDir         string `yaml:"export_dir,omitempty"`
+	DatabaseExportDir string `yaml:"database_export_dir,omitempty"`
+	DatabaseName      string `yaml:"database_name,omitempty"`
+	DatabaseUser      string `yaml:"database_user,omitempty"`
+	// BucketPath is an optional prefix to use inside the Minio bucket
+	// (e.g. "production/backups"). When set it will be applied to all
+	// containers unless a container explicitly overrides it.
+	BucketPath string            `yaml:"bucket_path,omitempty"`
+	Env        map[string]string `yaml:"env,omitempty"`
 }
 
 // ContainerConfig defines the backup configuration for a single container or app
@@ -60,6 +64,11 @@ type ContainerConfig struct {
 
 	// Skip this container if true
 	Skip bool `yaml:"skip,omitempty"`
+
+	// Optional bucket path prefix for this container. If set this overrides
+	// the top-level defaults.bucket_path value and will be used as the
+	// prefix within the Minio bucket (e.g. "customer-a/backups").
+	BucketPath string `yaml:"bucket_path,omitempty"`
 }
 
 // DatabaseConfig defines database-specific configuration
@@ -172,6 +181,11 @@ func (c *BackupConfig) ApplyDefaults(container *ContainerConfig) {
 	}
 	if container.Paths.DatabaseExportDir == "" && c.Defaults.DatabaseExportDir != "" {
 		container.Paths.DatabaseExportDir = c.Defaults.DatabaseExportDir
+	}
+
+	// Apply bucket path default
+	if container.BucketPath == "" && c.Defaults.BucketPath != "" {
+		container.BucketPath = c.Defaults.BucketPath
 	}
 
 	// Merge environment variables
