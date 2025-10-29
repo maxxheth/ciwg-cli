@@ -129,8 +129,9 @@ func init() {
 	backupCreateCmd.Flags().String("container-file", "", "File with newline-delimited container names or working directories to process")
 	backupCreateCmd.Flags().String("container-parent-dir", "/var/opt/sites", "Parent directory where site working directories live (default: /var/opt/sites)")
 	backupCreateCmd.Flags().String("server-range", "", "Server range pattern (e.g., 'wp%d.example.com:0-41')")
-	backupCreateCmd.Flags().Bool("overwrite", false, "After creating backup, delete all old backups except the N most recent (configure N with --remainder)")
-	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --overwrite (default: 5)")
+	backupCreateCmd.Flags().Bool("prune", false, "After creating backup, delete all old backups except the N most recent (configure N with --remainder)")
+	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --prune (default: 5)")
+	backupCreateCmd.Flags().Bool("clean-aws", false, "Also clean up old backups from AWS S3 when using --prune (default: false, only cleans Minio)")
 
 	// Custom container / config file flags
 	backupCreateCmd.Flags().String("config-file", "", "Path to YAML configuration file for custom backup configurations")
@@ -341,9 +342,9 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		return err
 	}
 
-	// Handle overwrite mode: clean up old backups
-	overwrite := mustGetBoolFlag(cmd, "overwrite")
-	if overwrite {
+	// Handle prune mode: clean up old backups
+	prune := mustGetBoolFlag(cmd, "prune")
+	if prune {
 		remainder := 5
 		if v, err := cmd.Flags().GetInt("remainder"); err == nil {
 			remainder = v
@@ -352,7 +353,13 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 			return fmt.Errorf("--remainder must be >= 0")
 		}
 
-		fmt.Printf("\n--- Cleaning up old backups (keeping %d most recent) ---\n", remainder)
+		cleanAWS := mustGetBoolFlag(cmd, "clean-aws")
+
+		if cleanAWS && awsConfig != nil && awsConfig.Bucket != "" {
+			fmt.Printf("\n--- Pruning old backups from Minio and AWS S3 (keeping %d most recent) ---\n", remainder)
+		} else {
+			fmt.Printf("\n--- Pruning old backups from Minio (keeping %d most recent) ---\n", remainder)
+		}
 
 		// For each container that was backed up, clean up old backups
 		containers, err := backupManager.GetContainersFromOptions(options)
@@ -405,8 +412,8 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 				fmt.Printf("Successfully cleaned up old Minio backups for %s\n", siteName)
 			}
 
-			// If AWS is configured, also clean up AWS backups
-			if awsConfig != nil && awsConfig.Bucket != "" {
+			// If AWS cleanup is enabled and AWS is configured, also clean up AWS backups
+			if cleanAWS && awsConfig != nil && awsConfig.Bucket != "" {
 				awsObjs, err := backupManager.ListAWSBackups(prefix, 0)
 				if err != nil {
 					fmt.Printf("Warning: failed to list AWS backups for %s: %v\n", siteName, err)
