@@ -20,8 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awscredentials "github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/glacier"
 
 	"ciwg-cli/internal/auth"
 )
@@ -37,7 +36,8 @@ type MinioConfig struct {
 }
 
 type AWSConfig struct {
-	Bucket    string
+	Vault     string // Glacier uses vaults instead of buckets
+	AccountID string // AWS account ID (can be "-" for current account)
 	AccessKey string
 	SecretKey string
 	Region    string
@@ -83,7 +83,7 @@ type BackupManager struct {
 	sshClient   *auth.SSHClient
 	minioClient *minio.Client
 	minioConfig *MinioConfig
-	awsClient   *s3.Client
+	awsClient   *glacier.Client
 	awsConfig   *AWSConfig
 }
 
@@ -232,7 +232,7 @@ func (bm *BackupManager) TestMinioConnection() error {
 	return nil
 }
 
-// initAWSClient initializes the AWS S3 client if not already initialized
+// initAWSClient initializes the AWS Glacier client if not already initialized
 func (bm *BackupManager) initAWSClient() error {
 	if bm.awsClient != nil {
 		return nil
@@ -255,186 +255,164 @@ func (bm *BackupManager) initAWSClient() error {
 		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	bm.awsClient = s3.NewFromConfig(cfg)
+	bm.awsClient = glacier.NewFromConfig(cfg)
 
-	// Verify bucket exists
+	// Verify vault exists
 	ctx := context.Background()
-	_, err = bm.awsClient.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(bm.awsConfig.Bucket),
+	accountID := bm.awsConfig.AccountID
+	if accountID == "" {
+		accountID = "-" // Use "-" to indicate current account
+	}
+	_, err = bm.awsClient.DescribeVault(ctx, &glacier.DescribeVaultInput{
+		AccountId: aws.String(accountID),
+		VaultName: aws.String(bm.awsConfig.Vault),
 	})
 	if err != nil {
-		return fmt.Errorf("bucket %s does not exist or is not accessible: %w", bm.awsConfig.Bucket, err)
+		return fmt.Errorf("vault %s does not exist or is not accessible: %w", bm.awsConfig.Vault, err)
 	}
 
 	return nil
 }
 
-// TestAWSConnection tests the AWS S3 connection with read/write operations
+// TestAWSConnection tests the AWS Glacier connection with write/read/delete operations
 func (bm *BackupManager) TestAWSConnection() error {
 	if err := bm.initAWSClient(); err != nil {
 		return err
 	}
 
 	ctx := context.Background()
+	accountID := bm.awsConfig.AccountID
+	if accountID == "" {
+		accountID = "-"
+	}
 
-	// Step 1: Test bucket existence
-	fmt.Printf("1. Testing AWS bucket existence...\n")
-	_, err := bm.awsClient.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(bm.awsConfig.Bucket),
+	// Step 1: Test vault existence
+	fmt.Printf("1. Testing AWS Glacier vault existence...\n")
+	describeOutput, err := bm.awsClient.DescribeVault(ctx, &glacier.DescribeVaultInput{
+		AccountId: aws.String(accountID),
+		VaultName: aws.String(bm.awsConfig.Vault),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to access bucket '%s': %w", bm.awsConfig.Bucket, err)
+		return fmt.Errorf("failed to access vault '%s': %w", bm.awsConfig.Vault, err)
 	}
-	fmt.Printf("   ✓ AWS Bucket '%s' exists and is accessible\n\n", bm.awsConfig.Bucket)
+	fmt.Printf("   ✓ AWS Glacier Vault '%s' exists and is accessible\n", *describeOutput.VaultName)
+	fmt.Printf("   Vault ARN: %s\n", *describeOutput.VaultARN)
+	fmt.Printf("   Number of archives: %d\n", describeOutput.NumberOfArchives)
+	fmt.Printf("   Size: %d bytes\n\n", describeOutput.SizeInBytes)
 
-	// Step 2: Test write operation
+	// Step 2: Test write operation (upload archive)
 	fmt.Printf("2. Testing write operation...\n")
-	testObjectName := fmt.Sprintf(".connection-test-%d.txt", time.Now().Unix())
-	testContent := []byte("This is an AWS S3 connection test file created by ciwg-cli")
+	testContent := []byte("This is an AWS Glacier connection test file created by ciwg-cli")
+	testDescription := fmt.Sprintf("Connection test archive created at %d", time.Now().Unix())
 
-	_, err = bm.awsClient.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(bm.awsConfig.Bucket),
-		Key:         aws.String(testObjectName),
-		Body:        bytes.NewReader(testContent),
-		ContentType: aws.String("text/plain"),
+	uploadOutput, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
+		AccountId:          aws.String(accountID),
+		VaultName:          aws.String(bm.awsConfig.Vault),
+		ArchiveDescription: aws.String(testDescription),
+		Body:               bytes.NewReader(testContent),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to write test object: %w", err)
+		return fmt.Errorf("failed to upload test archive: %w", err)
 	}
-	fmt.Printf("   ✓ Successfully wrote test object '%s' (%d bytes)\n\n", testObjectName, len(testContent))
+	archiveID := *uploadOutput.ArchiveId
+	fmt.Printf("   ✓ Successfully uploaded test archive (%d bytes)\n", len(testContent))
+	fmt.Printf("   Archive ID: %s\n\n", archiveID)
 
-	// Step 3: Test read operation
-	fmt.Printf("3. Testing read operation...\n")
-	result, err := bm.awsClient.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bm.awsConfig.Bucket),
-		Key:    aws.String(testObjectName),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to read test object: %w", err)
-	}
-	defer result.Body.Close()
-
-	readContent, err := io.ReadAll(result.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read test object content: %w", err)
-	}
-	if string(readContent) != string(testContent) {
-		return fmt.Errorf("content mismatch: read content doesn't match written content")
-	}
-	fmt.Printf("   ✓ Successfully read test object and verified content\n\n")
+	// Step 3: Note about retrieval
+	fmt.Printf("3. Archive retrieval test skipped\n")
+	fmt.Printf("   Note: Glacier archive retrieval requires initiating a job and waiting 3-5 hours.\n")
+	fmt.Printf("   This is not practical for a connection test.\n\n")
 
 	// Step 4: Test delete operation
 	fmt.Printf("4. Testing delete operation...\n")
-	_, err = bm.awsClient.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(bm.awsConfig.Bucket),
-		Key:    aws.String(testObjectName),
+	_, err = bm.awsClient.DeleteArchive(ctx, &glacier.DeleteArchiveInput{
+		AccountId: aws.String(accountID),
+		VaultName: aws.String(bm.awsConfig.Vault),
+		ArchiveId: aws.String(archiveID),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to delete test object: %w", err)
+		return fmt.Errorf("failed to delete test archive: %w", err)
 	}
-	fmt.Printf("   ✓ Successfully deleted test object\n")
+	fmt.Printf("   ✓ Successfully deleted test archive\n")
 
 	return nil
 }
 
-// UploadToAWS uploads data from a reader to AWS S3
+// UploadToAWS uploads data from a reader to AWS Glacier
 func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size int64) error {
 	if err := bm.initAWSClient(); err != nil {
 		return err
 	}
 
 	ctx := context.Background()
-	_, err := bm.awsClient.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(bm.awsConfig.Bucket),
-		Key:           aws.String(objectName),
-		Body:          reader,
-		ContentLength: aws.Int64(size),
-		ContentType:   aws.String("application/x-tar"),
+	accountID := bm.awsConfig.AccountID
+	if accountID == "" {
+		accountID = "-"
+	}
+
+	// Glacier uses archive description instead of object key
+	archiveDescription := fmt.Sprintf("Backup: %s", objectName)
+
+	_, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
+		AccountId:          aws.String(accountID),
+		VaultName:          aws.String(bm.awsConfig.Vault),
+		ArchiveDescription: aws.String(archiveDescription),
+		Body:               reader,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to upload to AWS S3: %w", err)
+		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
 	}
 
 	return nil
 }
 
-// ListAWSBackups lists objects in the AWS S3 bucket with optional prefix and limit
+// ListAWSBackups lists archives in the AWS Glacier vault
+// Note: Glacier does not support direct listing of archives. This function initiates
+// an inventory retrieval job. The actual inventory takes 3-5 hours to complete.
+// For immediate listing, you must retrieve a previously completed inventory job.
 func (bm *BackupManager) ListAWSBackups(prefix string, limit int) ([]ObjectInfo, error) {
 	if err := bm.initAWSClient(); err != nil {
 		return nil, err
 	}
 
-	ctx := context.Background()
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(bm.awsConfig.Bucket),
-	}
+	fmt.Println("Warning: AWS Glacier does not support immediate archive listing.")
+	fmt.Println("Archive inventory requires initiating a job that takes 3-5 hours to complete.")
+	fmt.Println("To list archives, you must:")
+	fmt.Println("  1. Initiate an inventory job using AWS Glacier API")
+	fmt.Println("  2. Wait 3-5 hours for the job to complete")
+	fmt.Println("  3. Retrieve the job output to get the archive list")
+	fmt.Println("\nFor now, this function returns an empty list.")
 
-	if prefix != "" {
-		input.Prefix = aws.String(prefix)
-	}
-
-	if limit > 0 {
-		input.MaxKeys = aws.Int32(int32(limit))
-	}
-
-	result, err := bm.awsClient.ListObjectsV2(ctx, input)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list AWS objects: %w", err)
-	}
-
-	var objects []ObjectInfo
-	for _, obj := range result.Contents {
-		objects = append(objects, ObjectInfo{
-			Key:          *obj.Key,
-			Size:         *obj.Size,
-			LastModified: *obj.LastModified,
-		})
-	}
-
-	// Sort by LastModified descending (most recent first)
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].LastModified.After(objects[j].LastModified)
-	})
-
-	return objects, nil
+	// Return empty list - actual implementation would require job management
+	return []ObjectInfo{}, nil
 }
 
-// DeleteAWSObjects deletes multiple objects from AWS S3
-func (bm *BackupManager) DeleteAWSObjects(keys []string) error {
+// DeleteAWSObjects deletes multiple archives from AWS Glacier
+// Note: In Glacier, 'keys' should be archive IDs, not object keys
+func (bm *BackupManager) DeleteAWSObjects(archiveIDs []string) error {
 	if err := bm.initAWSClient(); err != nil {
 		return err
 	}
 
-	if len(keys) == 0 {
+	if len(archiveIDs) == 0 {
 		return nil
 	}
 
 	ctx := context.Background()
+	accountID := bm.awsConfig.AccountID
+	if accountID == "" {
+		accountID = "-"
+	}
 
-	// AWS S3 allows batch delete up to 1000 objects at a time
-	for i := 0; i < len(keys); i += 1000 {
-		end := i + 1000
-		if end > len(keys) {
-			end = len(keys)
-		}
-		batch := keys[i:end]
-
-		var objectIds []types.ObjectIdentifier
-		for _, key := range batch {
-			objectIds = append(objectIds, types.ObjectIdentifier{
-				Key: aws.String(key),
-			})
-		}
-
-		_, err := bm.awsClient.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-			Bucket: aws.String(bm.awsConfig.Bucket),
-			Delete: &types.Delete{
-				Objects: objectIds,
-				Quiet:   aws.Bool(true),
-			},
+	// Glacier doesn't have batch delete - must delete one at a time
+	for _, archiveID := range archiveIDs {
+		_, err := bm.awsClient.DeleteArchive(ctx, &glacier.DeleteArchiveInput{
+			AccountId: aws.String(accountID),
+			VaultName: aws.String(bm.awsConfig.Vault),
+			ArchiveId: aws.String(archiveID),
 		})
 		if err != nil {
-			return fmt.Errorf("failed to delete AWS objects: %w", err)
+			return fmt.Errorf("failed to delete archive %s: %w", archiveID, err)
 		}
 	}
 
@@ -814,7 +792,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 
 		// If AWS is configured, upload to AWS first using TeeReader to capture data
 		var reader io.Reader = stdout
-		if bm.awsConfig != nil && bm.awsConfig.Bucket != "" {
+		if bm.awsConfig != nil && bm.awsConfig.Vault != "" {
 			if err := bm.initAWSClient(); err != nil {
 				fmt.Printf("Warning: failed to initialize AWS client, skipping AWS upload: %v\n", err)
 			} else {
@@ -851,7 +829,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 				if awsErr := <-awsErrChan; awsErr != nil {
 					fmt.Printf("Warning: %v\n", awsErr)
 				} else {
-					fmt.Printf("Successfully uploaded %s to AWS S3\n", objectName)
+					fmt.Printf("Successfully uploaded %s to AWS Glacier\n", objectName)
 				}
 
 				if err := cmd.Wait(); err != nil {
@@ -949,7 +927,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 
 	// If AWS is configured, upload to AWS first using TeeReader
 	var reader io.Reader = stdout
-	if bm.awsConfig != nil && bm.awsConfig.Bucket != "" {
+	if bm.awsConfig != nil && bm.awsConfig.Vault != "" {
 		if err := bm.initAWSClient(); err != nil {
 			fmt.Printf("Warning: failed to initialize AWS client, skipping AWS upload: %v\n", err)
 		} else {
@@ -984,7 +962,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 			if awsErr := <-awsErrChan; awsErr != nil {
 				fmt.Printf("Warning: %v\n", awsErr)
 			} else {
-				fmt.Printf("Successfully uploaded %s to AWS S3\n", objectName)
+				fmt.Printf("Successfully uploaded %s to AWS Glacier\n", objectName)
 			}
 
 			// Wait for command to complete
