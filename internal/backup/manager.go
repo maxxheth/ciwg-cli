@@ -17,6 +17,12 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awscredentials "github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+
 	"ciwg-cli/internal/auth"
 )
 
@@ -26,6 +32,15 @@ type MinioConfig struct {
 	SecretKey string
 	Bucket    string
 	UseSSL    bool
+	// BucketPath is an optional path prefix within the bucket (e.g., "production/backups")
+	BucketPath string
+}
+
+type AWSConfig struct {
+	Bucket    string
+	AccessKey string
+	SecretKey string
+	Region    string
 }
 
 type BackupOptions struct {
@@ -68,6 +83,8 @@ type BackupManager struct {
 	sshClient   *auth.SSHClient
 	minioClient *minio.Client
 	minioConfig *MinioConfig
+	awsClient   *s3.Client
+	awsConfig   *AWSConfig
 }
 
 // ObjectInfo is a lightweight representation of an object in Minio
@@ -82,6 +99,23 @@ func NewBackupManager(sshClient *auth.SSHClient, minioConfig *MinioConfig) *Back
 		sshClient:   sshClient,
 		minioConfig: minioConfig,
 	}
+}
+
+// NewBackupManagerWithAWS creates a BackupManager with both Minio and AWS configurations
+func NewBackupManagerWithAWS(sshClient *auth.SSHClient, minioConfig *MinioConfig, awsConfig *AWSConfig) *BackupManager {
+	return &BackupManager{
+		sshClient:   sshClient,
+		minioConfig: minioConfig,
+		awsConfig:   awsConfig,
+	}
+}
+
+// GetBucketPath returns the configured bucket path prefix
+func (bm *BackupManager) GetBucketPath() string {
+	if bm.minioConfig == nil {
+		return ""
+	}
+	return bm.minioConfig.BucketPath
 }
 
 // executeCommand runs a shell command either over SSH (when sshClient is present)
@@ -149,6 +183,12 @@ func (bm *BackupManager) TestMinioConnection() error {
 	// Step 2: Test write operation
 	fmt.Printf("2. Testing write operation...\n")
 	testObjectName := fmt.Sprintf(".connection-test-%d.txt", time.Now().Unix())
+
+	// Apply bucket path prefix if configured
+	if bm.minioConfig.BucketPath != "" {
+		testObjectName = filepath.Join(bm.minioConfig.BucketPath, testObjectName)
+	}
+
 	testContent := []byte("This is a connection test file created by ciwg-cli")
 
 	info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, testObjectName,
@@ -188,6 +228,215 @@ func (bm *BackupManager) TestMinioConnection() error {
 		return fmt.Errorf("failed to delete test object: %w", err)
 	}
 	fmt.Printf("   ✓ Successfully deleted test object\n")
+
+	return nil
+}
+
+// initAWSClient initializes the AWS S3 client if not already initialized
+func (bm *BackupManager) initAWSClient() error {
+	if bm.awsClient != nil {
+		return nil
+	}
+
+	if bm.awsConfig == nil {
+		return fmt.Errorf("AWS configuration is not set")
+	}
+
+	// Create AWS config with static credentials
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+		awsconfig.WithRegion(bm.awsConfig.Region),
+		awsconfig.WithCredentialsProvider(awscredentials.NewStaticCredentialsProvider(
+			bm.awsConfig.AccessKey,
+			bm.awsConfig.SecretKey,
+			"",
+		)),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	bm.awsClient = s3.NewFromConfig(cfg)
+
+	// Verify bucket exists
+	ctx := context.Background()
+	_, err = bm.awsClient.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(bm.awsConfig.Bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("bucket %s does not exist or is not accessible: %w", bm.awsConfig.Bucket, err)
+	}
+
+	return nil
+}
+
+// TestAWSConnection tests the AWS S3 connection with read/write operations
+func (bm *BackupManager) TestAWSConnection() error {
+	if err := bm.initAWSClient(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	// Step 1: Test bucket existence
+	fmt.Printf("1. Testing AWS bucket existence...\n")
+	_, err := bm.awsClient.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(bm.awsConfig.Bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to access bucket '%s': %w", bm.awsConfig.Bucket, err)
+	}
+	fmt.Printf("   ✓ AWS Bucket '%s' exists and is accessible\n\n", bm.awsConfig.Bucket)
+
+	// Step 2: Test write operation
+	fmt.Printf("2. Testing write operation...\n")
+	testObjectName := fmt.Sprintf(".connection-test-%d.txt", time.Now().Unix())
+	testContent := []byte("This is an AWS S3 connection test file created by ciwg-cli")
+
+	_, err = bm.awsClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bm.awsConfig.Bucket),
+		Key:         aws.String(testObjectName),
+		Body:        bytes.NewReader(testContent),
+		ContentType: aws.String("text/plain"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write test object: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully wrote test object '%s' (%d bytes)\n\n", testObjectName, len(testContent))
+
+	// Step 3: Test read operation
+	fmt.Printf("3. Testing read operation...\n")
+	result, err := bm.awsClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bm.awsConfig.Bucket),
+		Key:    aws.String(testObjectName),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to read test object: %w", err)
+	}
+	defer result.Body.Close()
+
+	readContent, err := io.ReadAll(result.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read test object content: %w", err)
+	}
+	if string(readContent) != string(testContent) {
+		return fmt.Errorf("content mismatch: read content doesn't match written content")
+	}
+	fmt.Printf("   ✓ Successfully read test object and verified content\n\n")
+
+	// Step 4: Test delete operation
+	fmt.Printf("4. Testing delete operation...\n")
+	_, err = bm.awsClient.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bm.awsConfig.Bucket),
+		Key:    aws.String(testObjectName),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete test object: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully deleted test object\n")
+
+	return nil
+}
+
+// UploadToAWS uploads data from a reader to AWS S3
+func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size int64) error {
+	if err := bm.initAWSClient(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	_, err := bm.awsClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(bm.awsConfig.Bucket),
+		Key:           aws.String(objectName),
+		Body:          reader,
+		ContentLength: aws.Int64(size),
+		ContentType:   aws.String("application/x-tar"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload to AWS S3: %w", err)
+	}
+
+	return nil
+}
+
+// ListAWSBackups lists objects in the AWS S3 bucket with optional prefix and limit
+func (bm *BackupManager) ListAWSBackups(prefix string, limit int) ([]ObjectInfo, error) {
+	if err := bm.initAWSClient(); err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(bm.awsConfig.Bucket),
+	}
+
+	if prefix != "" {
+		input.Prefix = aws.String(prefix)
+	}
+
+	if limit > 0 {
+		input.MaxKeys = aws.Int32(int32(limit))
+	}
+
+	result, err := bm.awsClient.ListObjectsV2(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list AWS objects: %w", err)
+	}
+
+	var objects []ObjectInfo
+	for _, obj := range result.Contents {
+		objects = append(objects, ObjectInfo{
+			Key:          *obj.Key,
+			Size:         *obj.Size,
+			LastModified: *obj.LastModified,
+		})
+	}
+
+	// Sort by LastModified descending (most recent first)
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].LastModified.After(objects[j].LastModified)
+	})
+
+	return objects, nil
+}
+
+// DeleteAWSObjects deletes multiple objects from AWS S3
+func (bm *BackupManager) DeleteAWSObjects(keys []string) error {
+	if err := bm.initAWSClient(); err != nil {
+		return err
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	ctx := context.Background()
+
+	// AWS S3 allows batch delete up to 1000 objects at a time
+	for i := 0; i < len(keys); i += 1000 {
+		end := i + 1000
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[i:end]
+
+		var objectIds []types.ObjectIdentifier
+		for _, key := range batch {
+			objectIds = append(objectIds, types.ObjectIdentifier{
+				Key: aws.String(key),
+			})
+		}
+
+		_, err := bm.awsClient.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(bm.awsConfig.Bucket),
+			Delete: &types.Delete{
+				Objects: objectIds,
+				Quiet:   aws.Bool(true),
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to delete AWS objects: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -453,7 +702,12 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 		backupDir = container.Config.Paths.AppDir
 	}
 
-	if err := bm.streamBackupToMinio(backupDir, backupName, options.ParentDir); err != nil {
+	var containerBucketPath string
+	if container.Config != nil {
+		containerBucketPath = container.Config.BucketPath
+	}
+
+	if err := bm.streamBackupToMinio(backupDir, backupName, options.ParentDir, containerBucketPath); err != nil {
 		return fmt.Errorf("failed to stream backup to Minio: %w", err)
 	}
 
@@ -513,7 +767,7 @@ func (bm *BackupManager) exportWordPressDatabase(container ContainerInfo) error 
 	return nil
 }
 
-func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir string) error {
+func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, containerBucketPath string) error {
 	// Build a tar command that attempts the provided workingDir first and
 	// falls back to parentDir/<basename> if the first path doesn't exist.
 	// This works for both local and remote execution because we run the
@@ -543,9 +797,84 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir s
 		ctx := context.Background()
 		// Store backups in a directory named after the site (basename of workingDir)
 		siteName := filepath.Base(workingDir)
-		objectName := fmt.Sprintf("backups/%s/%s", siteName, backupName)
 
-		info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, stdout, -1, minio.PutObjectOptions{
+		// If a container-specific bucket path is configured, it supersedes the
+		// default `backups/<siteName>/...` structure. In that case place the
+		// backup directly under the configured prefix. Otherwise if a global
+		// MinioConfig.BucketPath is set use that. If neither is set, fall back
+		// to the default backups/<siteName>/<backupName> layout.
+		var objectName string
+		if containerBucketPath != "" {
+			objectName = filepath.Join(containerBucketPath, backupName)
+		} else if bm.minioConfig != nil && bm.minioConfig.BucketPath != "" {
+			objectName = filepath.Join(bm.minioConfig.BucketPath, backupName)
+		} else {
+			objectName = fmt.Sprintf("backups/%s/%s", siteName, backupName)
+		}
+
+		// If AWS is configured, upload to AWS first using TeeReader to capture data
+		var reader io.Reader = stdout
+		if bm.awsConfig != nil && bm.awsConfig.Bucket != "" {
+			if err := bm.initAWSClient(); err != nil {
+				fmt.Printf("Warning: failed to initialize AWS client, skipping AWS upload: %v\n", err)
+			} else {
+				// Create a pipe to capture the tar output for AWS
+				pr, pw := io.Pipe()
+
+				// Use TeeReader to duplicate the stream
+				reader = io.TeeReader(stdout, pw)
+
+				// Upload to AWS in a goroutine
+				awsErrChan := make(chan error, 1)
+				go func() {
+					defer pw.Close()
+					err := bm.UploadToAWS(objectName, pr, -1)
+					if err != nil {
+						awsErrChan <- fmt.Errorf("AWS upload failed: %w", err)
+					} else {
+						awsErrChan <- nil
+					}
+				}()
+
+				// Continue with Minio upload using the TeeReader
+				info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, reader, -1, minio.PutObjectOptions{
+					ContentType: "application/gzip",
+				})
+				if err != nil {
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
+					return fmt.Errorf("failed to upload to Minio: %w", err)
+				}
+
+				// Wait for AWS upload to complete
+				if awsErr := <-awsErrChan; awsErr != nil {
+					fmt.Printf("Warning: %v\n", awsErr)
+				} else {
+					fmt.Printf("Successfully uploaded %s to AWS S3\n", objectName)
+				}
+
+				if err := cmd.Wait(); err != nil {
+					// Treat tar exit code 1 for "file changed as we read it" as a non-fatal warning
+					var exitErr *exec.ExitError
+					if errors.As(err, &exitErr) {
+						if exitErr.ExitCode() == 1 && strings.Contains(stderr.String(), "file changed as we read it") {
+							fmt.Printf("Warning: tar reported non-fatal issue: %s\n", strings.TrimSpace(stderr.String()))
+						} else {
+							return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+						}
+					} else {
+						return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+					}
+				}
+
+				fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
+				return nil
+			}
+		}
+
+		// Standard Minio-only upload (no AWS configured or AWS init failed)
+		info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, reader, -1, minio.PutObjectOptions{
 			ContentType: "application/gzip",
 		})
 		if err != nil {
@@ -607,9 +936,74 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir s
 	ctx := context.Background()
 	// Store backups in a directory named after the site (basename of workingDir)
 	siteName := filepath.Base(workingDir)
-	objectName := fmt.Sprintf("backups/%s/%s", siteName, backupName)
 
-	info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, stdout, -1, minio.PutObjectOptions{
+	// Build objectName with same supersede semantics as local branch
+	var objectName string
+	if containerBucketPath != "" {
+		objectName = filepath.Join(containerBucketPath, backupName)
+	} else if bm.minioConfig != nil && bm.minioConfig.BucketPath != "" {
+		objectName = filepath.Join(bm.minioConfig.BucketPath, backupName)
+	} else {
+		objectName = fmt.Sprintf("backups/%s/%s", siteName, backupName)
+	}
+
+	// If AWS is configured, upload to AWS first using TeeReader
+	var reader io.Reader = stdout
+	if bm.awsConfig != nil && bm.awsConfig.Bucket != "" {
+		if err := bm.initAWSClient(); err != nil {
+			fmt.Printf("Warning: failed to initialize AWS client, skipping AWS upload: %v\n", err)
+		} else {
+			// Create a pipe to capture the tar output for AWS
+			pr, pw := io.Pipe()
+
+			// Use TeeReader to duplicate the stream
+			reader = io.TeeReader(stdout, pw)
+
+			// Upload to AWS in a goroutine
+			awsErrChan := make(chan error, 1)
+			go func() {
+				defer pw.Close()
+				err := bm.UploadToAWS(objectName, pr, -1)
+				if err != nil {
+					awsErrChan <- fmt.Errorf("AWS upload failed: %w", err)
+				} else {
+					awsErrChan <- nil
+				}
+			}()
+
+			// Continue with Minio upload using the TeeReader
+			info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, reader, -1, minio.PutObjectOptions{
+				ContentType: "application/gzip",
+			})
+			if err != nil {
+				session.Signal("KILL") // Kill the session if upload fails
+				return fmt.Errorf("failed to upload to Minio: %w", err)
+			}
+
+			// Wait for AWS upload to complete
+			if awsErr := <-awsErrChan; awsErr != nil {
+				fmt.Printf("Warning: %v\n", awsErr)
+			} else {
+				fmt.Printf("Successfully uploaded %s to AWS S3\n", objectName)
+			}
+
+			// Wait for command to complete
+			if err := session.Wait(); err != nil {
+				// If remote tar printed "file changed as we read it" consider it a warning
+				if strings.Contains(remoteStderr.String(), "file changed as we read it") {
+					fmt.Printf("Warning: remote tar reported non-fatal issue: %s\n", strings.TrimSpace(remoteStderr.String()))
+				} else {
+					return fmt.Errorf("tar command failed: %w (remote stderr: %s)", err, remoteStderr.String())
+				}
+			}
+
+			fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
+			return nil
+		}
+	}
+
+	// Standard Minio-only upload (no AWS configured or AWS init failed)
+	info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, reader, -1, minio.PutObjectOptions{
 		ContentType: "application/gzip",
 	})
 	if err != nil {
@@ -1017,6 +1411,49 @@ func (bm *BackupManager) exportDatabase(container ContainerInfo, options *Backup
 		return nil
 	}
 
+	// Ensure the export directory exists in the correct place before running export.
+	// For Postgres and MongoDB we create the directory inside the target container
+	// (dbConfig.Container if set, otherwise the app container). For MySQL/MariaDB
+	// the command uses host-side redirection (">"), so create the directory on
+	// the host (remote when using SSH, or local when running locally).
+	exportDir := filepath.Dir(exportPath)
+	if exportDir != "" && exportDir != "." {
+		swt := strings.ToLower(dbConfig.Type)
+		// For Postgres exports we will redirect pg_dump output to the host path
+		// (docker exec ... pg_dump ... > /host/path). Therefore ensure the
+		// host-side directory exists. For MongoDB we keep creating the directory
+		// inside the container since mongodump produces a directory tree.
+		switch swt {
+		case "mysql", "mariadb", "postgres", "postgresql":
+			// Ensure directory exists on host (local or remote via SSH)
+			mkdirCmd := fmt.Sprintf(`mkdir -p %s`, exportDir)
+			fmt.Printf("Ensuring export directory exists on host: %s\n", mkdirCmd)
+			if _, stderr, err := bm.executeCommand(mkdirCmd); err != nil {
+				return fmt.Errorf("failed to create export directory on host: %w (stderr: %s)", err, stderr)
+			}
+
+		case "mongodb", "mongo":
+			// Directory must exist inside the DB container
+			targetContainer := dbConfig.Container
+			if targetContainer == "" {
+				targetContainer = container.Name
+			}
+			mkdirCmd := fmt.Sprintf(`docker exec %s mkdir -p %s`, targetContainer, exportDir)
+			fmt.Printf("Ensuring export directory exists inside container: %s\n", mkdirCmd)
+			if _, stderr, err := bm.executeCommand(mkdirCmd); err != nil {
+				return fmt.Errorf("failed to create export directory inside container: %w (stderr: %s)", err, stderr)
+			}
+
+		default:
+			// Fallback: create on host
+			mkdirCmd := fmt.Sprintf(`mkdir -p %s`, exportDir)
+			fmt.Printf("Ensuring export directory exists on host (fallback): %s\n", mkdirCmd)
+			if _, stderr, err := bm.executeCommand(mkdirCmd); err != nil {
+				return fmt.Errorf("failed to create export directory on host: %w (stderr: %s)", err, stderr)
+			}
+		}
+	}
+
 	_, stderr, err := bm.executeCommand(exportCmd)
 	if err != nil {
 		return fmt.Errorf("database export failed: %w (stderr: %s)", err, stderr)
@@ -1028,22 +1465,25 @@ func (bm *BackupManager) exportDatabase(container ContainerInfo, options *Backup
 
 // buildPostgresExportCommand builds a pg_dump command for Postgres databases
 func (bm *BackupManager) buildPostgresExportCommand(container ContainerInfo, dbConfig DatabaseConfig, exportPath string) string {
+	// Use stdout redirection so the dump is written to the host path
+	// (docker exec ... pg_dump ... > /host/path). This mirrors the
+	// approach used for MySQL and avoids requiring the target path to
+	// exist inside the container.
+	var baseCmd string
 	if dbConfig.Container != "" {
-		// Database is in a separate container
-		cmd := fmt.Sprintf(`docker exec %s pg_dump -U %s -d %s -f %s`,
-			dbConfig.Container, dbConfig.User, dbConfig.Name, exportPath)
+		baseCmd = fmt.Sprintf(`docker exec %s pg_dump -U %s -d %s`, dbConfig.Container, dbConfig.User, dbConfig.Name)
 		if dbConfig.Host != "" {
-			cmd += fmt.Sprintf(` -h %s`, dbConfig.Host)
+			baseCmd += fmt.Sprintf(` -h %s`, dbConfig.Host)
 		}
 		if dbConfig.Port > 0 {
-			cmd += fmt.Sprintf(` -p %d`, dbConfig.Port)
+			baseCmd += fmt.Sprintf(` -p %d`, dbConfig.Port)
 		}
-		return cmd
+	} else {
+		baseCmd = fmt.Sprintf(`docker exec %s pg_dump -U %s -d %s`, container.Name, dbConfig.User, dbConfig.Name)
 	}
 
-	// Database is in the same container as the app
-	cmd := fmt.Sprintf(`docker exec %s pg_dump -U %s -d %s -f %s`,
-		container.Name, dbConfig.User, dbConfig.Name, exportPath)
+	// Redirect stdout to the desired exportPath on the host (or remote host when using SSH)
+	cmd := fmt.Sprintf(`%s > %s`, baseCmd, exportPath)
 	return cmd
 }
 
