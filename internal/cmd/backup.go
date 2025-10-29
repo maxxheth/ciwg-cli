@@ -37,8 +37,8 @@ var backupTestMinioCmd = &cobra.Command{
 
 var backupTestAWSCmd = &cobra.Command{
 	Use:   "test-aws",
-	Short: "Test AWS S3 connection and perform read/write test",
-	Long:  `Test the connection to AWS S3 storage and perform a basic read/write test to verify bucket access.`,
+	Short: "Test AWS Glacier connection and perform read/write test",
+	Long:  `Test the connection to AWS Glacier storage and perform a basic read/write test to verify vault access.`,
 	RunE:  runTestAWS,
 }
 
@@ -151,10 +151,11 @@ func init() {
 	backupCreateCmd.Flags().String("bucket-path", getEnvWithDefault("MINIO_BUCKET_PATH", ""), "Path prefix within Minio bucket (e.g., 'production/backups', env: MINIO_BUCKET_PATH)")
 
 	// AWS S3 configuration flags with environment variable support
-	backupCreateCmd.Flags().String("aws-bucket", getEnvWithDefault("AWS_BUCKET", ""), "AWS S3 bucket name (env: AWS_BUCKET)")
+	backupCreateCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
+	backupCreateCmd.Flags().String("aws-account-id", getEnvWithDefault("AWS_ACCOUNT_ID", "-"), "AWS account ID or '-' for current account (env: AWS_ACCOUNT_ID, default: -)")
 	backupCreateCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
 	backupCreateCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
-	backupCreateCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION)")
+	backupCreateCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
 
 	// SSH connection flags with environment variable support
 	backupCreateCmd.Flags().StringP("user", "u", getEnvWithDefault("SSH_USER", ""), "SSH username (env: SSH_USER, default: current user)")
@@ -171,10 +172,11 @@ func init() {
 	backupTestMinioCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
 
 	// AWS test command flags
-	backupTestAWSCmd.Flags().String("aws-bucket", getEnvWithDefault("AWS_BUCKET", ""), "AWS S3 bucket name (env: AWS_BUCKET)")
+	backupTestAWSCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
+	backupTestAWSCmd.Flags().String("aws-account-id", getEnvWithDefault("AWS_ACCOUNT_ID", "-"), "AWS account ID or '-' for current account (env: AWS_ACCOUNT_ID, default: -)")
 	backupTestAWSCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
 	backupTestAWSCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
-	backupTestAWSCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION)")
+	backupTestAWSCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
 
 	// Read command flags
 	backupReadCmd.Flags().String("output", "", "Output file path (if empty, writes to stdout)")
@@ -355,8 +357,8 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 
 		cleanAWS := mustGetBoolFlag(cmd, "clean-aws")
 
-		if cleanAWS && awsConfig != nil && awsConfig.Bucket != "" {
-			fmt.Printf("\n--- Pruning old backups from Minio and AWS S3 (keeping %d most recent) ---\n", remainder)
+		if cleanAWS && awsConfig != nil && awsConfig.Vault != "" {
+			fmt.Printf("\n--- Pruning old backups from Minio and AWS Glacier (keeping %d most recent) ---\n", remainder)
 		} else {
 			fmt.Printf("\n--- Pruning old backups from Minio (keeping %d most recent) ---\n", remainder)
 		}
@@ -413,7 +415,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 			}
 
 			// If AWS cleanup is enabled and AWS is configured, also clean up AWS backups
-			if cleanAWS && awsConfig != nil && awsConfig.Bucket != "" {
+			if cleanAWS && awsConfig != nil && awsConfig.Vault != "" {
 				awsObjs, err := backupManager.ListAWSBackups(prefix, 0)
 				if err != nil {
 					fmt.Printf("Warning: failed to list AWS backups for %s: %v\n", siteName, err)
@@ -480,11 +482,12 @@ func runTestAWS(cmd *cobra.Command, args []string) error {
 	}
 
 	if awsConfig == nil {
-		return fmt.Errorf("AWS bucket not configured (set AWS_BUCKET environment variable or --aws-bucket flag)")
+		return fmt.Errorf("AWS Glacier vault not configured (set AWS_VAULT environment variable or --aws-vault flag)")
 	}
 
-	fmt.Println("Testing AWS S3 connection...")
-	fmt.Printf("Bucket: %s\n", awsConfig.Bucket)
+	fmt.Println("Testing AWS Glacier connection...")
+	fmt.Printf("Vault: %s\n", awsConfig.Vault)
+	fmt.Printf("Account ID: %s\n", awsConfig.AccountID)
 	fmt.Printf("Region: %s\n\n", awsConfig.Region)
 
 	// Create a temporary backup manager without SSH client for testing
@@ -492,10 +495,10 @@ func runTestAWS(cmd *cobra.Command, args []string) error {
 
 	// Test connection and perform read/write test
 	if err := backupManager.TestAWSConnection(); err != nil {
-		return fmt.Errorf("AWS S3 connection test failed: %w", err)
+		return fmt.Errorf("AWS Glacier connection test failed: %w", err)
 	}
 
-	fmt.Println("\n✓ AWS S3 connection test successful!")
+	fmt.Println("\n✓ AWS Glacier connection test successful!")
 	return nil
 }
 
@@ -767,28 +770,33 @@ func getMinioConfig(cmd *cobra.Command) (*backup.MinioConfig, error) {
 }
 
 func getAWSConfig(cmd *cobra.Command) (*backup.AWSConfig, error) {
-	bucket := mustGetStringFlag(cmd, "aws-bucket")
+	vault := mustGetStringFlag(cmd, "aws-vault")
+	accountID := mustGetStringFlag(cmd, "aws-account-id")
 	accessKey := mustGetStringFlag(cmd, "aws-access-key")
 	secretKey := mustGetStringFlag(cmd, "aws-secret-access-key")
 	region := mustGetStringFlag(cmd, "aws-region")
 
-	// AWS is optional, so only validate if bucket is provided
-	if bucket == "" {
+	// AWS is optional, so only validate if vault is provided
+	if vault == "" {
 		return nil, nil
 	}
 
 	if accessKey == "" {
-		return nil, fmt.Errorf("aws-access-key is required when aws-bucket is set (can be set via AWS_ACCESS_KEY environment variable)")
+		return nil, fmt.Errorf("aws-access-key is required when aws-vault is set (can be set via AWS_ACCESS_KEY environment variable)")
 	}
 	if secretKey == "" {
-		return nil, fmt.Errorf("aws-secret-access-key is required when aws-bucket is set (can be set via AWS_SECRET_ACCESS_KEY environment variable)")
+		return nil, fmt.Errorf("aws-secret-access-key is required when aws-vault is set (can be set via AWS_SECRET_ACCESS_KEY environment variable)")
 	}
 	if region == "" {
-		return nil, fmt.Errorf("aws-region is required when aws-bucket is set (can be set via AWS_REGION environment variable)")
+		return nil, fmt.Errorf("aws-region is required when aws-vault is set (can be set via AWS_REGION environment variable)")
+	}
+	if accountID == "" {
+		accountID = "-" // Default to current account
 	}
 
 	return &backup.AWSConfig{
-		Bucket:    bucket,
+		Vault:     vault,
+		AccountID: accountID,
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		Region:    region,
