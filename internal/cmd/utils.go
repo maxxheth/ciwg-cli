@@ -111,3 +111,12 @@ func getEnvDurationWithDefault(key string, defaultValue time.Duration) time.Dura
 	}
 	return defaultValue
 }
+
+func getEnvFloat64WithDefault(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatVal
+		}
+	}
+	return defaultValue
+}
