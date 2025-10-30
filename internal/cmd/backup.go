@@ -90,6 +90,48 @@ Examples:
 	RunE: runBackupDelete,
 }
 
+var backupMonitorCmd = &cobra.Command{
+	Use:   "monitor",
+	Short: "Monitor storage capacity and auto-migrate backups to AWS Glacier",
+	Long: `Monitor the storage capacity of the Minio storage server and automatically migrate
+the oldest backups to AWS Glacier when usage exceeds a threshold.
+
+This command can be run via cron to maintain storage capacity. When capacity exceeds
+the threshold (default 95%), it will:
+  1. Select the oldest N% of backups (default 10%)
+  2. Upload them to AWS Glacier
+  3. Delete them from Minio
+  4. Repeat until capacity falls below threshold
+
+Example:
+  # Monitor and migrate if capacity exceeds 95%
+  ciwg-cli backup monitor
+
+  # Use custom threshold and migration percentage
+  ciwg-cli backup monitor --threshold 90 --migrate-percent 15
+
+  # Use specific storage path
+  ciwg-cli backup monitor --storage-path /mnt/minio-data`,
+	Args: cobra.NoArgs,
+	RunE: runBackupMonitor,
+}
+
+var backupConnCmd = &cobra.Command{
+	Use:   "conn",
+	Short: "Test connections to both Minio and AWS Glacier",
+	Long: `Test connectivity and perform read/write tests for both Minio storage and AWS Glacier.
+This is a convenience command that tests both services at once.
+
+Example:
+  # Test both connections
+  ciwg-cli backup conn
+
+  # Test with custom configurations
+  ciwg-cli backup conn --minio-endpoint minio.example.com:9000 --aws-vault my-vault`,
+	Args: cobra.NoArgs,
+	RunE: runBackupConn,
+}
+
 func init() {
 	// Load .env early so getEnvWithDefault calls used during flag setup
 	// will see values from a local .env file in development.
@@ -119,6 +161,9 @@ func init() {
 	backupCmd.AddCommand(backupTestAWSCmd)
 	backupCmd.AddCommand(backupReadCmd)
 	backupCmd.AddCommand(backupListCmd)
+	backupCmd.AddCommand(backupDeleteCmd)
+	backupCmd.AddCommand(backupMonitorCmd)
+	backupCmd.AddCommand(backupConnCmd)
 
 	// Backup creation flags
 	backupCreateCmd.Flags().Bool("dry-run", false, "Print actions without executing them")
@@ -132,6 +177,7 @@ func init() {
 	backupCreateCmd.Flags().Bool("prune", false, "After creating backup, delete all old backups except the N most recent (configure N with --remainder)")
 	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --prune (default: 5)")
 	backupCreateCmd.Flags().Bool("clean-aws", false, "Also clean up old backups from AWS S3 when using --prune (default: false, only cleans Minio)")
+	backupCreateCmd.Flags().Bool("respect-capacity-limit", getEnvBoolWithDefault("BACKUP_RESPECT_CAPACITY_LIMIT", false), "Check storage capacity before creating backup, fail if >95% (env: BACKUP_RESPECT_CAPACITY_LIMIT)")
 
 	// Custom container / config file flags
 	backupCreateCmd.Flags().String("config-file", "", "Path to YAML configuration file for custom backup configurations")
@@ -214,6 +260,43 @@ func init() {
 	backupDeleteCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupDeleteCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupDeleteCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+
+	// Monitor command flags
+	backupMonitorCmd.Flags().Bool("dry-run", false, "Preview what would be migrated without making changes")
+	backupMonitorCmd.Flags().Bool("show-mounts", false, "Display all filesystem mount points and exit (helpful for finding storage-path)")
+	backupMonitorCmd.Flags().String("storage-server", getEnvWithDefault("STORAGE_SERVER_ADDR", ""), "Remote storage server address for SSH capacity checking (env: STORAGE_SERVER_ADDR)")
+	backupMonitorCmd.Flags().String("storage-path", getEnvWithDefault("STORAGE_PATH", "/mnt/minio_nyc2"), "Path to monitor for storage capacity (env: STORAGE_PATH, default: /mnt/minio_nyc2)")
+	backupMonitorCmd.Flags().Float64("threshold", getEnvFloat64WithDefault("STORAGE_THRESHOLD", 95.0), "Storage usage threshold percentage to trigger migration (env: STORAGE_THRESHOLD, default: 95.0)")
+	backupMonitorCmd.Flags().Float64("migrate-percent", getEnvFloat64WithDefault("MIGRATE_PERCENT", 10.0), "Percentage of oldest backups to migrate when threshold exceeded (env: MIGRATE_PERCENT, default: 10.0)")
+	backupMonitorCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
+	backupMonitorCmd.Flags().String("minio-access-key", getEnvWithDefault("MINIO_ACCESS_KEY", ""), "Minio access key (env: MINIO_ACCESS_KEY)")
+	backupMonitorCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
+	backupMonitorCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
+	backupMonitorCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupMonitorCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
+	backupMonitorCmd.Flags().String("aws-account-id", getEnvWithDefault("AWS_ACCOUNT_ID", "-"), "AWS account ID or '-' for current account (env: AWS_ACCOUNT_ID, default: -)")
+	backupMonitorCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
+	backupMonitorCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
+	backupMonitorCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
+
+	// SSH connection flags for remote storage server
+	backupMonitorCmd.Flags().StringP("user", "u", getEnvWithDefault("SSH_USER", ""), "SSH username for storage server (env: SSH_USER, default: current user)")
+	backupMonitorCmd.Flags().StringP("port", "p", getEnvWithDefault("SSH_PORT", "22"), "SSH port (env: SSH_PORT)")
+	backupMonitorCmd.Flags().StringP("key", "k", getEnvWithDefault("SSH_KEY", ""), "Path to SSH private key (env: SSH_KEY)")
+	backupMonitorCmd.Flags().BoolP("agent", "a", getEnvBoolWithDefault("SSH_AGENT", true), "Use SSH agent (env: SSH_AGENT)")
+	backupMonitorCmd.Flags().DurationP("timeout", "t", getEnvDurationWithDefault("SSH_TIMEOUT", 30*time.Second), "Connection timeout (env: SSH_TIMEOUT)")
+
+	// Conn command flags (test both Minio and AWS Glacier)
+	backupConnCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
+	backupConnCmd.Flags().String("minio-access-key", getEnvWithDefault("MINIO_ACCESS_KEY", ""), "Minio access key (env: MINIO_ACCESS_KEY)")
+	backupConnCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
+	backupConnCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
+	backupConnCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupConnCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
+	backupConnCmd.Flags().String("aws-account-id", getEnvWithDefault("AWS_ACCOUNT_ID", "-"), "AWS account ID or '-' for current account (env: AWS_ACCOUNT_ID, default: -)")
+	backupConnCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
+	backupConnCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
+	backupConnCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
 }
 
 // findEnvArg inspects argv for an explicit --env argument and returns
@@ -322,20 +405,21 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 
 	// Get backup options from flags
 	options := &backup.BackupOptions{
-		DryRun:            mustGetBoolFlag(cmd, "dry-run"),
-		Delete:            mustGetBoolFlag(cmd, "delete"),
-		ContainerName:     mustGetStringFlag(cmd, "container-name"),
-		ContainerFile:     mustGetStringFlag(cmd, "container-file"),
-		ContainerNames:    containerNames,
-		Local:             localMode,
-		ParentDir:         mustGetStringFlag(cmd, "container-parent-dir"),
-		ConfigFile:        mustGetStringFlag(cmd, "config-file"),
-		DatabaseType:      mustGetStringFlag(cmd, "database-type"),
-		DatabaseExportDir: mustGetStringFlag(cmd, "database-export-dir"),
-		CustomAppDir:      mustGetStringFlag(cmd, "custom-app-dir"),
-		DatabaseContainer: mustGetStringFlag(cmd, "database-container"),
-		DatabaseName:      mustGetStringFlag(cmd, "database-name"),
-		DatabaseUser:      mustGetStringFlag(cmd, "database-user"),
+		DryRun:               mustGetBoolFlag(cmd, "dry-run"),
+		Delete:               mustGetBoolFlag(cmd, "delete"),
+		ContainerName:        mustGetStringFlag(cmd, "container-name"),
+		ContainerFile:        mustGetStringFlag(cmd, "container-file"),
+		ContainerNames:       containerNames,
+		Local:                localMode,
+		ParentDir:            mustGetStringFlag(cmd, "container-parent-dir"),
+		ConfigFile:           mustGetStringFlag(cmd, "config-file"),
+		DatabaseType:         mustGetStringFlag(cmd, "database-type"),
+		DatabaseExportDir:    mustGetStringFlag(cmd, "database-export-dir"),
+		CustomAppDir:         mustGetStringFlag(cmd, "custom-app-dir"),
+		DatabaseContainer:    mustGetStringFlag(cmd, "database-container"),
+		DatabaseName:         mustGetStringFlag(cmd, "database-name"),
+		DatabaseUser:         mustGetStringFlag(cmd, "database-user"),
+		RespectCapacityLimit: mustGetBoolFlag(cmd, "respect-capacity-limit"),
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
@@ -811,4 +895,193 @@ func mustGetStringFlag(cmd *cobra.Command, name string) string {
 func mustGetBoolFlag(cmd *cobra.Command, name string) bool {
 	value, _ := cmd.Flags().GetBool(name)
 	return value
+}
+
+func runBackupMonitor(cmd *cobra.Command, args []string) error {
+	// Parse flags
+	storageServer, _ := cmd.Flags().GetString("storage-server")
+	storagePath, _ := cmd.Flags().GetString("storage-path")
+	threshold, _ := cmd.Flags().GetFloat64("threshold")
+	migratePercent, _ := cmd.Flags().GetFloat64("migrate-percent")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	showMounts, _ := cmd.Flags().GetBool("show-mounts")
+
+	// Create SSH client if storage server specified
+	var sshClient *auth.SSHClient
+	var err error
+	if storageServer != "" {
+		sshClient, err = createSSHClient(cmd, storageServer)
+		if err != nil {
+			return fmt.Errorf("failed to connect to storage server %s: %w", storageServer, err)
+		}
+		defer sshClient.Close()
+		fmt.Printf("✓ Connected to storage server: %s\n\n", storageServer)
+	}
+
+	// Check if user just wants to see mount points
+	if showMounts {
+		fmt.Println("===========================================")
+		fmt.Println("Filesystem Mount Points")
+		fmt.Println("===========================================\n")
+
+		if sshClient != nil {
+			// Remote mount points via SSH
+			stdout, stderr, err := sshClient.ExecuteCommand("df -h")
+			if err != nil {
+				return fmt.Errorf("failed to list mount points on remote server: %w (stderr: %s)", err, stderr)
+			}
+			fmt.Println(stdout)
+		} else {
+			// Local mount points
+			mounts, err := backup.ListMountPoints()
+			if err != nil {
+				return fmt.Errorf("failed to list mount points: %w", err)
+			}
+			fmt.Println(mounts)
+		}
+
+		fmt.Println("\n💡 TIP: Look for your Minio data mount (e.g., /mnt/minio_nyc2)")
+		fmt.Println("   Then use: --storage-path /mnt/minio_nyc2")
+		return nil
+	}
+
+	// Validate storage server is provided
+	if storageServer == "" {
+		return fmt.Errorf("storage-server is required (use --storage-server or set STORAGE_SERVER_ADDR environment variable)")
+	}
+
+	// Get Minio configuration
+	minioConfig := backup.MinioConfig{
+		Endpoint:  mustGetStringFlag(cmd, "minio-endpoint"),
+		AccessKey: mustGetStringFlag(cmd, "minio-access-key"),
+		SecretKey: mustGetStringFlag(cmd, "minio-secret-key"),
+		Bucket:    mustGetStringFlag(cmd, "minio-bucket"),
+		UseSSL:    mustGetBoolFlag(cmd, "minio-ssl"),
+	}
+
+	// Get AWS configuration (skip if dry-run for validation purposes)
+	awsConfig, err := getAWSConfig(cmd)
+	if err != nil && !dryRun {
+		return err
+	}
+	if err != nil && dryRun {
+		// Allow dry-run without full AWS config for preview purposes
+		awsConfig = &backup.AWSConfig{
+			Vault:     mustGetStringFlag(cmd, "aws-vault"),
+			AccountID: mustGetStringFlag(cmd, "aws-account-id"),
+		}
+	}
+
+	// Validate required configuration
+	if minioConfig.Endpoint == "" {
+		return fmt.Errorf("minio-endpoint is required")
+	}
+	if minioConfig.AccessKey == "" {
+		return fmt.Errorf("minio-access-key is required")
+	}
+	if minioConfig.SecretKey == "" {
+		return fmt.Errorf("minio-secret-key is required")
+	}
+	if awsConfig.Vault == "" {
+		return fmt.Errorf("aws-vault is required for migration")
+	}
+	if !dryRun {
+		if awsConfig.AccessKey == "" {
+			return fmt.Errorf("aws-access-key is required for migration")
+		}
+		if awsConfig.SecretKey == "" {
+			return fmt.Errorf("aws-secret-access-key is required for migration")
+		}
+	}
+
+	// Create backup manager with SSH client for remote storage capacity checking
+	manager := backup.NewBackupManagerWithAWS(sshClient, &minioConfig, awsConfig)
+
+	// Run monitoring and migration
+	fmt.Println("===========================================")
+	fmt.Println("CIWG Backup Storage Capacity Monitor")
+	fmt.Println("===========================================")
+	if dryRun {
+		fmt.Println("Mode:              🔍 DRY RUN (preview only)")
+	} else {
+		fmt.Println("Mode:              🚀 LIVE (will perform migrations)")
+	}
+	fmt.Printf("Storage Server:    %s\n", storageServer)
+	fmt.Printf("Storage Path:      %s\n", storagePath)
+	// Run monitoring and migration
+	fmt.Println("===========================================")
+	fmt.Println("CIWG Backup Storage Capacity Monitor")
+	fmt.Println("===========================================")
+	if dryRun {
+		fmt.Println("Mode:              🔍 DRY RUN (preview only)")
+	} else {
+		fmt.Println("Mode:              🚀 LIVE (will perform migrations)")
+	}
+	fmt.Printf("Storage Path:      %s\n", storagePath)
+	fmt.Printf("Threshold:         %.1f%%\n", threshold)
+	fmt.Printf("Migrate Percent:   %.1f%%\n", migratePercent)
+	fmt.Printf("Minio Bucket:      %s\n", minioConfig.Bucket)
+	fmt.Printf("AWS Glacier Vault: %s\n", awsConfig.Vault)
+	fmt.Println("===========================================\n")
+
+	return manager.MonitorAndMigrateIfNeeded(storagePath, threshold, migratePercent, dryRun)
+}
+
+func runBackupConn(cmd *cobra.Command, args []string) error {
+	// Load .env if specified
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
+
+	fmt.Println("===========================================")
+	fmt.Println("Testing Backup System Connections")
+	fmt.Println("===========================================\n")
+
+	// Test Minio
+	minioConfig, err := getMinioConfig(cmd)
+	if err != nil {
+		fmt.Printf("❌ Minio Configuration Error: %v\n\n", err)
+	} else {
+		fmt.Println("📦 Testing Minio Connection...")
+		fmt.Printf("   Endpoint: %s\n", minioConfig.Endpoint)
+		fmt.Printf("   Bucket:   %s\n", minioConfig.Bucket)
+		fmt.Printf("   Use SSL:  %v\n\n", minioConfig.UseSSL)
+
+		backupManager := backup.NewBackupManager(nil, minioConfig)
+		if err := backupManager.TestMinioConnection(); err != nil {
+			fmt.Printf("   ❌ Minio test failed: %v\n\n", err)
+		} else {
+			fmt.Println("   ✓ Minio connection successful!\n")
+		}
+	}
+
+	// Test AWS Glacier
+	awsConfig, err := getAWSConfig(cmd)
+	if err != nil {
+		fmt.Printf("⚠️  AWS Glacier Configuration: %v\n", err)
+		fmt.Println("   Skipping AWS Glacier test.\n")
+	} else if awsConfig == nil {
+		fmt.Println("⚠️  AWS Glacier not configured.")
+		fmt.Println("   Skipping AWS Glacier test.\n")
+	} else {
+		fmt.Println("☁️  Testing AWS Glacier Connection...")
+		fmt.Printf("   Vault:      %s\n", awsConfig.Vault)
+		fmt.Printf("   Account ID: %s\n", awsConfig.AccountID)
+		fmt.Printf("   Region:     %s\n\n", awsConfig.Region)
+
+		backupManager := backup.NewBackupManagerWithAWS(nil, nil, awsConfig)
+		if err := backupManager.TestAWSConnection(); err != nil {
+			fmt.Printf("   ❌ AWS Glacier test failed: %v\n\n", err)
+		} else {
+			fmt.Println("   ✓ AWS Glacier connection successful!\n")
+		}
+	}
+
+	fmt.Println("===========================================")
+	fmt.Println("Connection Tests Complete")
+	fmt.Println("===========================================")
+
+	return nil
 }
