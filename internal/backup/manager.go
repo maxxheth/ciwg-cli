@@ -3,15 +3,19 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -68,6 +72,17 @@ type BackupOptions struct {
 	DatabaseName string
 	// DatabaseUser for custom database exports
 	DatabaseUser string
+	// RespectCapacityLimit checks storage capacity before creating backups
+	RespectCapacityLimit bool
+}
+
+// StorageCapacity represents disk usage statistics
+type StorageCapacity struct {
+	Total       uint64  // Total disk space in bytes
+	Used        uint64  // Used disk space in bytes
+	Available   uint64  // Available disk space in bytes
+	UsedPercent float64 // Usage percentage (0-100)
+	Path        string  // Mount point or path checked
 }
 
 type ContainerInfo struct {
@@ -338,7 +353,53 @@ func (bm *BackupManager) TestAWSConnection() error {
 	return nil
 }
 
+// computeTreeHash calculates the AWS Glacier tree hash for data
+// The tree hash is computed by splitting the data into 1MB chunks,
+// hashing each chunk, then building a binary tree of hashes
+func computeTreeHash(data []byte) string {
+	const chunkSize = 1024 * 1024 // 1 MB
+
+	// Calculate hashes for all 1MB chunks
+	var hashes [][]byte
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[i:end]
+		hash := sha256.Sum256(chunk)
+		hashes = append(hashes, hash[:])
+	}
+
+	// Build the hash tree by repeatedly hashing pairs until we have one hash
+	for len(hashes) > 1 {
+		var newHashes [][]byte
+		for i := 0; i < len(hashes); i += 2 {
+			if i+1 < len(hashes) {
+				// Hash the concatenation of two hashes
+				combined := append(hashes[i], hashes[i+1]...)
+				hash := sha256.Sum256(combined)
+				newHashes = append(newHashes, hash[:])
+			} else {
+				// Odd one out, just carry it forward
+				newHashes = append(newHashes, hashes[i])
+			}
+		}
+		hashes = newHashes
+	}
+
+	// Return the final hash as hex string
+	if len(hashes) == 0 {
+		// Empty data case
+		hash := sha256.Sum256([]byte{})
+		return hex.EncodeToString(hash[:])
+	}
+	return hex.EncodeToString(hashes[0])
+}
+
 // UploadToAWS uploads data from a reader to AWS Glacier
+// For streaming data, we need to buffer it first because Glacier requires
+// calculating a tree-hash checksum which needs seekable data
 func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size int64) error {
 	if err := bm.initAWSClient(); err != nil {
 		return err
@@ -353,15 +414,58 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	// Glacier uses archive description instead of object key
 	archiveDescription := fmt.Sprintf("Backup: %s", objectName)
 
-	_, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
+	// Create a temporary file to buffer the data
+	// This is necessary because Glacier needs to calculate tree-hash which requires seekable data
+	tmpFile, err := os.CreateTemp("", "glacier-upload-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Copy data from reader to temp file and calculate checksums
+	written, err := io.Copy(tmpFile, reader)
+	if err != nil {
+		return fmt.Errorf("failed to buffer data to temporary file: %w", err)
+	}
+
+	// Read the file content for checksum calculation
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return fmt.Errorf("failed to seek temporary file for checksum: %w", err)
+	}
+
+	data, err := io.ReadAll(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to read temporary file for checksum: %w", err)
+	}
+
+	// Calculate the required checksums
+	treeHash := computeTreeHash(data)
+	linearHash := sha256.Sum256(data)
+	linearHashHex := hex.EncodeToString(linearHash[:])
+
+	// Seek back to beginning for upload
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return fmt.Errorf("failed to seek temporary file for upload: %w", err)
+	}
+
+	fmt.Printf("  ℹ️  Uploading %d bytes to Glacier (archive description: %s)...\n", written, archiveDescription)
+	fmt.Printf("  ℹ️  Tree hash: %s\n", treeHash)
+	fmt.Printf("  ℹ️  Linear hash: %s\n", linearHashHex)
+
+	// Upload with explicitly calculated checksums
+	uploadResult, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
 		AccountId:          aws.String(accountID),
 		VaultName:          aws.String(bm.awsConfig.Vault),
 		ArchiveDescription: aws.String(archiveDescription),
-		Body:               reader,
+		Body:               tmpFile,
+		Checksum:           aws.String(treeHash),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
 	}
+
+	fmt.Printf("  ✓ Successfully uploaded to Glacier (Archive ID: %s...)\n", (*uploadResult.ArchiveId)[:40])
 
 	return nil
 }
@@ -419,7 +523,392 @@ func (bm *BackupManager) DeleteAWSObjects(archiveIDs []string) error {
 	return nil
 }
 
+// GetStorageCapacity checks the disk usage of the Minio storage path
+func (bm *BackupManager) GetStorageCapacity(path string) (*StorageCapacity, error) {
+	if path == "" {
+		path = "/" // Default to root filesystem
+	}
+
+	// Check if we have an SSH client (remote check)
+	if bm.sshClient != nil {
+		return bm.getRemoteStorageCapacity(path)
+	}
+
+	// Local check using syscall
+	var stat syscall.Statfs_t
+	err := syscall.Statfs(path, &stat)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get filesystem stats for %s: %w", path, err)
+	}
+
+	// Calculate capacity
+	total := stat.Blocks * uint64(stat.Bsize)
+	available := stat.Bavail * uint64(stat.Bsize)
+	used := total - available
+	usedPercent := (float64(used) / float64(total)) * 100
+
+	capacity := &StorageCapacity{
+		Total:       total,
+		Used:        used,
+		Available:   available,
+		UsedPercent: usedPercent,
+		Path:        path,
+	}
+
+	// Warning if checking root filesystem - likely wrong for dedicated Minio mounts
+	if path == "/" {
+		fmt.Println("\n⚠️  WARNING: Checking root filesystem capacity (/).")
+		fmt.Println("   If Minio data is on a separate mount (e.g., /mnt/minio_nyc2),")
+		fmt.Println("   use --storage-path flag to specify the correct mount point.")
+		fmt.Println("   Example: --storage-path /mnt/minio_nyc2")
+		fmt.Println("\n   To see all mount points, run: df -h | grep -E 'Filesystem|minio'")
+		fmt.Println()
+	}
+
+	return capacity, nil
+}
+
+// getRemoteStorageCapacity checks disk usage on a remote server via SSH
+func (bm *BackupManager) getRemoteStorageCapacity(path string) (*StorageCapacity, error) {
+	// Use df command to get disk usage for the path
+	cmd := fmt.Sprintf("df -B1 %s | tail -n 1", path)
+	stdout, stderr, err := bm.sshClient.ExecuteCommand(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute df command on remote server: %w (stderr: %s)", err, stderr)
+	}
+
+	// Parse df output: Filesystem 1B-blocks Used Available Use% Mounted
+	// Example: /dev/sda 532575944704 532575166464 0 100% /mnt/minio_nyc2
+	fields := strings.Fields(strings.TrimSpace(stdout))
+	if len(fields) < 6 {
+		return nil, fmt.Errorf("unexpected df output format: %s", stdout)
+	}
+
+	// Parse the numeric fields
+	total, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse total size: %w", err)
+	}
+
+	used, err := strconv.ParseUint(fields[2], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse used size: %w", err)
+	}
+
+	available, err := strconv.ParseUint(fields[3], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse available size: %w", err)
+	}
+
+	// Parse percentage (remove % sign)
+	percentStr := strings.TrimSuffix(fields[4], "%")
+	usedPercent, err := strconv.ParseFloat(percentStr, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse usage percentage: %w", err)
+	}
+
+	mountPoint := fields[5]
+
+	return &StorageCapacity{
+		Total:       total,
+		Used:        used,
+		Available:   available,
+		UsedPercent: usedPercent,
+		Path:        mountPoint,
+	}, nil
+}
+
+// ListMountPoints returns information about filesystem mount points (helper for debugging)
+func ListMountPoints() (string, error) {
+	cmd := exec.Command("df", "-h")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to list mount points: %w", err)
+	}
+	return string(output), nil
+}
+
+// MigrateOldestBackupsToGlacier migrates the oldest N% of backups from Minio to Glacier
+func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun bool) error {
+	if err := bm.initMinioClient(); err != nil {
+		return fmt.Errorf("failed to initialize Minio client: %w", err)
+	}
+
+	if dryRun {
+		fmt.Println("🔍 DRY RUN MODE: No backups will be migrated or deleted")
+		fmt.Println()
+	}
+
+	if !dryRun {
+		if err := bm.initAWSClient(); err != nil {
+			return fmt.Errorf("failed to initialize AWS Glacier client: %w", err)
+		}
+	}
+
+	ctx := context.Background()
+
+	// List all backups from Minio
+	type BackupInfo struct {
+		Name         string
+		LastModified time.Time
+		Size         int64
+	}
+
+	var backups []BackupInfo
+	objectCh := bm.minioClient.ListObjects(ctx, bm.minioConfig.Bucket, minio.ListObjectsOptions{
+		Recursive: true,
+	})
+
+	for object := range objectCh {
+		if object.Err != nil {
+			return fmt.Errorf("error listing objects: %w", object.Err)
+		}
+		backups = append(backups, BackupInfo{
+			Name:         object.Key,
+			LastModified: object.LastModified,
+			Size:         object.Size,
+		})
+	}
+
+	if len(backups) == 0 {
+		fmt.Println("No backups found in Minio to migrate.")
+		return nil
+	}
+
+	// Sort backups by date (oldest first)
+	sort.Slice(backups, func(i, j int) bool {
+		return backups[i].LastModified.Before(backups[j].LastModified)
+	})
+
+	// Calculate how many backups to migrate
+	numToMigrate := int(math.Ceil(float64(len(backups)) * percent / 100.0))
+	if numToMigrate == 0 {
+		fmt.Println("No backups to migrate based on the specified percentage.")
+		return nil
+	}
+
+	fmt.Printf("Migrating %d oldest backups (%.1f%%) from Minio to AWS Glacier...\n", numToMigrate, percent)
+	if dryRun {
+		fmt.Println("\n📋 MIGRATION PLAN (no changes will be made):\n")
+	}
+
+	// Migrate each backup
+	migratedCount := 0
+	var totalFreed int64
+
+	for i := 0; i < numToMigrate; i++ {
+		backup := backups[i]
+
+		// Format timestamps in both international (ISO 8601) and US formats
+		intlDate := backup.LastModified.Format("2006-01-02 15:04:05 MST")  // International: YYYY-MM-DD
+		usDate := backup.LastModified.Format("01/02/2006 03:04:05 PM MST") // US: MM/DD/YYYY
+
+		if dryRun {
+			fmt.Printf("\n[%d/%d] WOULD MIGRATE: %s\n", i+1, numToMigrate, backup.Name)
+			fmt.Printf("  📦 Size:           %.2f MB (%.2f GB)\n",
+				float64(backup.Size)/(1024*1024),
+				float64(backup.Size)/(1024*1024*1024))
+			fmt.Printf("  📅 Modified (Intl): %s\n", intlDate)
+			fmt.Printf("  📅 Modified (US):   %s\n", usDate)
+			fmt.Printf("  📤 Would upload to: AWS Glacier vault '%s'\n", bm.awsConfig.Vault)
+			fmt.Printf("  🗑️  Would delete from: Minio bucket '%s'\n", bm.minioConfig.Bucket)
+			totalFreed += backup.Size
+			migratedCount++
+			continue
+		}
+
+		fmt.Printf("Migrating backup %d/%d: %s (%.2f MB)\n",
+			i+1, numToMigrate, backup.Name,
+			float64(backup.Size)/(1024*1024))
+		fmt.Printf("  📅 Modified (Intl): %s\n", intlDate)
+		fmt.Printf("  📅 Modified (US):   %s\n", usDate)
+
+		// Download from Minio
+		object, err := bm.minioClient.GetObject(ctx, bm.minioConfig.Bucket, backup.Name, minio.GetObjectOptions{})
+		if err != nil {
+			fmt.Printf("  ⚠ Failed to download %s from Minio: %v\n", backup.Name, err)
+			continue
+		}
+
+		// Buffer to temporary file (memory-efficient and provides seekable handle for AWS SDK)
+		// This mimics the robust logic from UploadToAWS and allows the SDK to calculate
+		// both x-amz-content-sha256 (linear hash) and x-amz-sha256-tree-hash (tree hash)
+		tmpFile, err := os.CreateTemp("", "glacier-migrate-*.tmp")
+		if err != nil {
+			fmt.Printf("  ⚠ Failed to create temporary file: %v\n", err)
+			object.Close()
+			continue
+		}
+		// Ensure we close and remove the temp file when done
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		// Copy data from Minio stream to the temporary file
+		if _, err := io.Copy(tmpFile, object); err != nil {
+			fmt.Printf("  ⚠ Failed to buffer data to temporary file: %v\n", err)
+			object.Close()
+			continue
+		}
+		object.Close() // Done with the Minio stream
+
+		// Read the temp file into memory for checksum calculation
+		// Seek to the beginning first
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			fmt.Printf("  ⚠ Failed to seek temporary file for checksum: %v\n", err)
+			continue
+		}
+
+		data, err := io.ReadAll(tmpFile)
+		if err != nil {
+			fmt.Printf("  ⚠ Failed to read temporary file for checksum: %v\n", err)
+			continue
+		}
+
+		// Calculate the AWS Glacier tree hash checksum (required for upload)
+		fmt.Printf("  ℹ️  Calculating tree hash for %s...\n", backup.Name)
+		treeHash := computeTreeHash(data)
+
+		// Seek back to beginning for the upload
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			fmt.Printf("  ⚠ Failed to seek temporary file for upload: %v\n", err)
+			continue
+		}
+
+		accountID := bm.awsConfig.AccountID
+		if accountID == "" || accountID == "-" {
+			accountID = "-"
+		}
+
+		uploadInput := &glacier.UploadArchiveInput{
+			VaultName:          aws.String(bm.awsConfig.Vault),
+			AccountId:          aws.String(accountID),
+			ArchiveDescription: aws.String(fmt.Sprintf("Migrated from Minio: %s", backup.Name)),
+			Body:               tmpFile,              // Use seekable *os.File handle
+			Checksum:           aws.String(treeHash), // Provide the mandatory tree hash
+		}
+		uploadResult, err := bm.awsClient.UploadArchive(ctx, uploadInput)
+		if err != nil {
+			fmt.Printf("  ⚠ Failed to upload %s to Glacier: %v\n", backup.Name, err)
+			continue
+		}
+
+		fmt.Printf("  ✓ Uploaded to Glacier (Archive ID: %s...)\n", (*uploadResult.ArchiveId)[:40])
+
+		// Delete from Minio
+		err = bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, backup.Name, minio.RemoveObjectOptions{})
+		if err != nil {
+			fmt.Printf("  ⚠ Failed to delete %s from Minio after migration: %v\n", backup.Name, err)
+			// Continue anyway - backup is already in Glacier
+		} else {
+			fmt.Printf("  ✓ Deleted from Minio\n")
+			totalFreed += backup.Size
+			migratedCount++
+		}
+	}
+
+	if dryRun {
+		fmt.Printf("\n" + strings.Repeat("=", 70) + "\n")
+		fmt.Printf("📊 DRY RUN SUMMARY\n")
+		fmt.Printf(strings.Repeat("=", 70) + "\n")
+		fmt.Printf("Would migrate:     %d backups\n", migratedCount)
+		fmt.Printf("Would free:        %.2f MB (%.2f GB)\n",
+			float64(totalFreed)/(1024*1024),
+			float64(totalFreed)/(1024*1024*1024))
+		fmt.Printf("Source:            Minio bucket '%s'\n", bm.minioConfig.Bucket)
+		fmt.Printf("Destination:       AWS Glacier vault '%s'\n", bm.awsConfig.Vault)
+		fmt.Printf("\nℹ️  No changes were made. Run without --dry-run to perform migration.\n")
+		fmt.Printf(strings.Repeat("=", 70) + "\n")
+	} else {
+		fmt.Printf("\n✓ Migration complete: %d/%d backups migrated, %.2f MB (%.2f GB) freed\n",
+			migratedCount, numToMigrate,
+			float64(totalFreed)/(1024*1024),
+			float64(totalFreed)/(1024*1024*1024))
+	}
+
+	return nil
+}
+
+// MonitorAndMigrateIfNeeded checks storage capacity and migrates backups if threshold exceeded
+func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold float64, migratePercent float64, dryRun bool) error {
+	fmt.Printf("Monitoring storage capacity at %s (threshold: %.1f%%)\n", storagePath, threshold)
+	if dryRun {
+		fmt.Println("🔍 DRY RUN MODE: No actual migrations will be performed")
+	}
+
+	maxIterations := 10 // Prevent infinite loops
+	iteration := 0
+
+	for iteration < maxIterations {
+		iteration++
+
+		capacity, err := bm.GetStorageCapacity(storagePath)
+		if err != nil {
+			return fmt.Errorf("failed to get storage capacity: %w", err)
+		}
+
+		fmt.Printf("\nIteration %d - Storage Status:\n", iteration)
+		fmt.Printf("  Total:     %.2f GB\n", float64(capacity.Total)/(1024*1024*1024))
+		fmt.Printf("  Used:      %.2f GB (%.1f%%)\n",
+			float64(capacity.Used)/(1024*1024*1024), capacity.UsedPercent)
+		fmt.Printf("  Available: %.2f GB\n", float64(capacity.Available)/(1024*1024*1024))
+
+		if capacity.UsedPercent <= threshold {
+			fmt.Printf("\n✓ Storage usage (%.1f%%) is within threshold (%.1f%%)\n",
+				capacity.UsedPercent, threshold)
+			if dryRun {
+				fmt.Println("ℹ️  No migration needed in this dry run")
+			}
+			return nil
+		}
+
+		fmt.Printf("\n⚠ Storage usage (%.1f%%) exceeds threshold (%.1f%%)\n",
+			capacity.UsedPercent, threshold)
+		if dryRun {
+			fmt.Printf("  Would start migration of %.1f%% oldest backups to AWS Glacier...\n", migratePercent)
+		} else {
+			fmt.Printf("  Starting migration of %.1f%% oldest backups to AWS Glacier...\n", migratePercent)
+		}
+
+		err = bm.MigrateOldestBackupsToGlacier(migratePercent, dryRun)
+		if err != nil {
+			return fmt.Errorf("migration failed: %w", err)
+		}
+
+		if dryRun {
+			// In dry run mode, don't iterate - just show what would happen once
+			fmt.Println("\nℹ️  Dry run complete. Only one iteration performed for preview.")
+			return nil
+		}
+
+		// Wait a moment for filesystem to update
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("storage capacity still exceeds threshold after %d iterations", maxIterations)
+}
+
 func (bm *BackupManager) CreateBackups(options *BackupOptions) error {
+	// Check capacity if RespectCapacityLimit is enabled
+	if options.RespectCapacityLimit {
+		storagePath := "/" // Default to root filesystem
+		if bm.minioConfig.Endpoint != "" {
+			// Try to infer storage path from Minio endpoint if it's a local path
+			// In most cases, Minio will be on the same server
+			storagePath = "/"
+		}
+
+		capacity, err := bm.GetStorageCapacity(storagePath)
+		if err != nil {
+			return fmt.Errorf("failed to check storage capacity: %w", err)
+		}
+
+		if capacity.UsedPercent > 95.0 {
+			return fmt.Errorf("storage capacity exceeds 95%% (current: %.1f%%). Cannot create backup. Please run 'backup monitor' to free up space", capacity.UsedPercent)
+		}
+
+		fmt.Printf("Storage capacity check passed: %.1f%% used (threshold: 95%%)\n", capacity.UsedPercent)
+	}
+
 	if err := bm.initMinioClient(); err != nil {
 		return err
 	}
