@@ -22,9 +22,12 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awscredentials "github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/glacier"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"ciwg-cli/internal/auth"
 )
@@ -444,6 +447,9 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	linearHash := sha256.Sum256(data)
 	linearHashHex := hex.EncodeToString(linearHash[:])
 
+	// Get the file size for Content-Length
+	fileSize := int64(len(data))
+
 	// Seek back to beginning for upload
 	if _, err := tmpFile.Seek(0, 0); err != nil {
 		return fmt.Errorf("failed to seek temporary file for upload: %w", err)
@@ -453,13 +459,39 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	fmt.Printf("  ℹ️  Tree hash: %s\n", treeHash)
 	fmt.Printf("  ℹ️  Linear hash: %s\n", linearHashHex)
 
+	// Set the payload hash in the context for the AWS signer to use in signature calculation
+	ctx = v4.SetPayloadHash(ctx, linearHashHex)
+
+	// Capture values for closure to avoid variable capture issues
+	contentHash := linearHashHex
+	contentLength := fileSize
+
 	// Upload with explicitly calculated checksums
+	// We need to add the x-amz-content-sha256 header explicitly via middleware
 	uploadResult, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
 		AccountId:          aws.String(accountID),
 		VaultName:          aws.String(bm.awsConfig.Vault),
 		ArchiveDescription: aws.String(archiveDescription),
 		Body:               tmpFile,
 		Checksum:           aws.String(treeHash),
+	}, func(o *glacier.Options) {
+		// Add middleware to set x-amz-content-sha256 header and Content-Length
+		// This is required by Glacier and must match the hash used in signature calculation
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Build.Add(middleware.BuildMiddlewareFunc(
+				"AddContentSHA256Header",
+				func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
+					middleware.BuildOutput, middleware.Metadata, error,
+				) {
+					req, ok := in.Request.(*smithyhttp.Request)
+					if ok {
+						req.Header.Set("x-amz-content-sha256", contentHash)
+						req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
+					}
+					return next.HandleBuild(ctx, in)
+				},
+			), middleware.Before)
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
@@ -768,6 +800,22 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 		fmt.Printf("  ℹ️  Calculating tree hash for %s...\n", backup.Name)
 		treeHash := computeTreeHash(data)
 
+		// Calculate the linear hash (x-amz-content-sha256)
+		linearHash := sha256.Sum256(data)
+		linearHashHex := hex.EncodeToString(linearHash[:])
+
+		// Get the file size for Content-Length
+		fileSize := int64(len(data))
+
+		// Debug: Show actual file size
+		fmt.Printf("  ℹ️  File size: %d bytes (%.2f MB)\n", fileSize, float64(fileSize)/(1024*1024))
+
+		// Skip empty files
+		if fileSize == 0 {
+			fmt.Printf("  ⚠ Skipping empty file: %s\n", backup.Name)
+			continue
+		}
+
 		// Seek back to beginning for the upload
 		if _, err := tmpFile.Seek(0, 0); err != nil {
 			fmt.Printf("  ⚠ Failed to seek temporary file for upload: %v\n", err)
@@ -779,14 +827,40 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 			accountID = "-"
 		}
 
-		uploadInput := &glacier.UploadArchiveInput{
+		// Set the payload hash in the context for the AWS signer to use in signature calculation
+		ctx = v4.SetPayloadHash(ctx, linearHashHex)
+
+		// Capture values for closure to avoid variable capture issues
+		contentHash := linearHashHex
+		contentLength := fileSize
+
+		// Upload with explicitly calculated checksums
+		// We need to add the x-amz-content-sha256 header explicitly via middleware
+		uploadResult, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
 			VaultName:          aws.String(bm.awsConfig.Vault),
 			AccountId:          aws.String(accountID),
 			ArchiveDescription: aws.String(fmt.Sprintf("Migrated from Minio: %s", backup.Name)),
-			Body:               tmpFile,              // Use seekable *os.File handle
-			Checksum:           aws.String(treeHash), // Provide the mandatory tree hash
-		}
-		uploadResult, err := bm.awsClient.UploadArchive(ctx, uploadInput)
+			Body:               tmpFile,
+			Checksum:           aws.String(treeHash),
+		}, func(o *glacier.Options) {
+			// Add middleware to set x-amz-content-sha256 header and Content-Length
+			// This is required by Glacier and must match the hash used in signature calculation
+			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Build.Add(middleware.BuildMiddlewareFunc(
+					"AddContentSHA256Header",
+					func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
+						middleware.BuildOutput, middleware.Metadata, error,
+					) {
+						req, ok := in.Request.(*smithyhttp.Request)
+						if ok {
+							req.Header.Set("x-amz-content-sha256", contentHash)
+							req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
+						}
+						return next.HandleBuild(ctx, in)
+					},
+				), middleware.Before)
+			})
+		})
 		if err != nil {
 			fmt.Printf("  ⚠ Failed to upload %s to Glacier: %v\n", backup.Name, err)
 			continue
