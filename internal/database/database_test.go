@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"log"
+	"os"
 	"testing"
 	"time"
 
@@ -60,6 +61,7 @@ func TestMain(m *testing.M) {
 	if teardown != nil && teardown(context.Background()) != nil {
 		log.Fatalf("could not teardown mysql container: %v", err)
 	}
+	os.Exit(0)
 }
 
 func TestNew(t *testing.T) {
