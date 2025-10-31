@@ -192,10 +192,10 @@ func init() {
 	backupCmd.AddCommand(backupTestAWSCmd)
 	backupCmd.AddCommand(backupReadCmd)
 	backupCmd.AddCommand(backupListCmd)
-	backupCmd.AddCommand(backupDeleteCmd)
 	backupCmd.AddCommand(backupMonitorCmd)
 	backupCmd.AddCommand(backupConnCmd)
 	backupCmd.AddCommand(backupSanitizeCmd)
+	backupCmd.AddCommand(backupDeleteCmd)
 
 	// Backup creation flags
 	backupCreateCmd.Flags().Bool("dry-run", false, "Print actions without executing them")
@@ -277,8 +277,7 @@ func init() {
 	backupListCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupListCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
 
-	// Delete command registration and flags
-	backupCmd.AddCommand(backupDeleteCmd)
+	// Delete command flags
 	backupDeleteCmd.Flags().Bool("dry-run", false, "Preview deletions without performing them")
 	backupDeleteCmd.Flags().String("prefix", "", "Prefix to select objects to delete (e.g. backups/site-)")
 	backupDeleteCmd.Flags().Int("limit", 100, "Maximum number of objects to consider when using --prefix")
