@@ -106,6 +106,21 @@ type ContainerInfo struct {
 	Config *ContainerConfig
 }
 
+// DefaultLicenseKeysToRemove is the default list of WordPress option names
+// that contain license keys or sensitive licensing information.
+// These are removed during backup sanitization to create client-safe backups.
+var DefaultLicenseKeysToRemove = []string{
+	"license_number",
+	"_elementor_pro_license_data",
+	"_elementor_pro_license_data_fallback",
+	"_elementor_pro_license_v2_data_fallback",
+	"_elementor_pro_license_v2_data",
+	"_transient_timeout_rg_gforms_license",
+	"_transient_rg_gforms_license",
+	"_transient_timeout_uael_license_status",
+	"_transient_timeout_astra-addon_license_status",
+}
+
 type BackupManager struct {
 	sshClient   *auth.SSHClient
 	minioClient *minio.Client
@@ -2182,10 +2197,15 @@ func (bm *BackupManager) filterAndCopyContent(srcDir, destDir string, options *S
 		shouldExtractDir := false
 		for _, extractDir := range options.ExtractDirs {
 			// Check if this path is within one of the extract directories
-			// We check both prefix match and contains to handle nested structures
-			if strings.HasPrefix(relPath, extractDir) || 
-			   strings.Contains(relPath, "/"+extractDir+"/") ||
-			   strings.Contains(relPath, "/"+extractDir) {
+			// We use filepath.Split to handle path matching correctly and avoid false positives
+			// For example, if extractDir is "wp-content", we want to match:
+			//   - "wp-content/themes/..."
+			//   - "site/www/wp-content/themes/..."
+			// But not:
+			//   - "my-wp-content-backup/..."
+			if strings.HasPrefix(relPath, extractDir+"/") || 
+			   strings.HasPrefix(relPath, extractDir) && relPath == extractDir ||
+			   strings.Contains(relPath, "/"+extractDir+"/") {
 				shouldExtractDir = true
 				break
 			}
@@ -2248,18 +2268,9 @@ func (bm *BackupManager) copyFile(src, dst string, mode os.FileMode) error {
 
 // sanitizeSQLFiles removes license keys from SQL files
 func (bm *BackupManager) sanitizeSQLFiles(dir string) error {
-	// Options to remove - same as in cancel.sh
-	optionsToRemove := []string{
-		"license_number",
-		"_elementor_pro_license_data",
-		"_elementor_pro_license_data_fallback",
-		"_elementor_pro_license_v2_data_fallback",
-		"_elementor_pro_license_v2_data",
-		"_transient_timeout_rg_gforms_license",
-		"_transient_rg_gforms_license",
-		"_transient_timeout_uael_license_status",
-		"_transient_timeout_astra-addon_license_status",
-	}
+	// Use the default list of license keys to remove
+	// This list can be extended or customized as needed
+	optionsToRemove := DefaultLicenseKeysToRemove
 
 	// Find all SQL files
 	var sqlFiles []string
@@ -2306,9 +2317,21 @@ func (bm *BackupManager) removeLicenseKeysFromSQL(sqlFile string, optionsToRemov
 	modified := false
 
 	// For each option to remove, delete SQL statements that insert or update it
+	// NOTE: This is a simplified line-based approach that works for most WordPress database dumps.
+	// Potential edge cases this approach might miss:
+	// - Multi-line SQL statements (e.g., INSERT with line breaks)
+	// - Quoted option names that appear in comments or string values
+	// - Complex SQL syntax with subqueries or nested statements
+	// - Different quoting styles (backticks, single quotes, double quotes)
+	// - Escaped characters within option values
+	// - REPLACE, UPSERT, or other non-standard INSERT variations
+	//
+	// For a production-grade solution, consider using a proper SQL parser library like:
+	// - github.com/xwb1989/sqlparser (MySQL)
+	// - github.com/akamensky/sql-parser
+	// - Or calling mysql/mysqldump with specific filtering options
 	for _, option := range optionsToRemove {
 		// Simple line-based removal for statements containing the option
-		// This is a simplified approach - in production you might want more sophisticated SQL parsing
 		lines := strings.Split(sqlContent, "\n")
 		var newLines []string
 		for _, line := range lines {
@@ -2322,21 +2345,27 @@ func (bm *BackupManager) removeLicenseKeysFromSQL(sqlFile string, optionsToRemov
 	}
 
 	// Also update the _transient_astra-addon_license_status to 0
-	// Look for UPDATE statements setting this value
+	// This transient should be set to 0 to indicate no license
+	// NOTE: This is a simplified line-based approach. In production, you might want
+	// more sophisticated SQL parsing to handle edge cases like:
+	// - Multi-line statements
+	// - Quoted option names with similar patterns
+	// - Complex SQL syntax with subqueries
+	// - Different quoting styles
+	// For a more robust solution, consider using a proper SQL parser library.
 	lines := strings.Split(sqlContent, "\n")
 	var newLines []string
 	for _, line := range lines {
 		if strings.Contains(line, "_transient_astra-addon_license_status") {
-			// Replace any value with 0
-			// This is a simple string replacement - more sophisticated parsing would be better
-			if strings.Contains(line, "INSERT") || strings.Contains(line, "UPDATE") {
-				modified = true
-				// Keep the line but try to replace the value pattern with 0
-				// This is a basic implementation
-				newLines = append(newLines, line)
-			} else {
-				newLines = append(newLines, line)
-			}
+			// Try to replace common value patterns with 0
+			// This handles INSERT statements like: INSERT INTO `wp_options` VALUES (...,'_transient_astra-addon_license_status','1','yes');
+			modified = true
+			// Replace single-quoted values after the option name
+			// Pattern: '..._transient_astra-addon_license_status','<any_value>','yes'
+			// Replace with: '..._transient_astra-addon_license_status','0','yes'
+			newLine := strings.ReplaceAll(line, "'_transient_astra-addon_license_status','1'", "'_transient_astra-addon_license_status','0'")
+			newLine = strings.ReplaceAll(newLine, "'_transient_astra-addon_license_status',\"1\"", "'_transient_astra-addon_license_status','0'")
+			newLines = append(newLines, newLine)
 		} else {
 			newLines = append(newLines, line)
 		}
