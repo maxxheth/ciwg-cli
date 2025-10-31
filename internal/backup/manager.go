@@ -730,7 +730,8 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 
 	fmt.Printf("Migrating %d oldest backups (%.1f%%) from Minio to AWS Glacier...\n", numToMigrate, percent)
 	if dryRun {
-		fmt.Println("\n📋 MIGRATION PLAN (no changes will be made):\n")
+		fmt.Println("\n📋 MIGRATION PLAN (no changes will be made):")
+		fmt.Println()
 	}
 
 	// Migrate each backup
@@ -890,17 +891,19 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 	}
 
 	if dryRun {
-		fmt.Printf("\n" + strings.Repeat("=", 70) + "\n")
-		fmt.Printf("📊 DRY RUN SUMMARY\n")
-		fmt.Printf(strings.Repeat("=", 70) + "\n")
+		fmt.Println()
+		fmt.Println(strings.Repeat("=", 70))
+		fmt.Println("📊 DRY RUN SUMMARY")
+		fmt.Println(strings.Repeat("=", 70))
 		fmt.Printf("Would migrate:     %d backups\n", migratedCount)
 		fmt.Printf("Would free:        %.2f MB (%.2f GB)\n",
 			float64(totalFreed)/(1024*1024),
 			float64(totalFreed)/(1024*1024*1024))
 		fmt.Printf("Source:            Minio bucket '%s'\n", bm.minioConfig.Bucket)
 		fmt.Printf("Destination:       AWS Glacier vault '%s'\n", bm.awsConfig.Vault)
-		fmt.Printf("\nℹ️  No changes were made. Run without --dry-run to perform migration.\n")
-		fmt.Printf(strings.Repeat("=", 70) + "\n")
+		fmt.Println()
+		fmt.Println("ℹ️  No changes were made. Run without --dry-run to perform migration.")
+		fmt.Println(strings.Repeat("=", 70))
 	} else {
 		fmt.Printf("\n✓ Migration complete: %d/%d backups migrated, %.2f MB (%.2f GB) freed\n",
 			migratedCount, numToMigrate,
