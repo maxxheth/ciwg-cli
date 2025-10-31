@@ -132,6 +132,37 @@ Example:
 	RunE: runBackupConn,
 }
 
+var backupSanitizeCmd = &cobra.Command{
+	Use:   "sanitize",
+	Short: "Sanitize a backup by extracting specific content and removing sensitive data",
+	Long: `Sanitize a backup tarball by extracting specific directories and files, 
+and removing license keys from SQL files. This creates a backup suitable for 
+sharing with clients without sensitive or proprietary data.
+
+By default:
+  - Extracts wp-content directory from the tarball
+  - Extracts all SQL files
+  - Removes license keys from MySQL/MariaDB databases
+
+Examples:
+  # Sanitize a backup with default settings
+  ciwg-cli backup sanitize --input backup.tgz --output sanitized.tgz
+
+  # Extract custom directory
+  ciwg-cli backup sanitize --input backup.tgz --output clean.tgz --extract-dir "app/public"
+
+  # Extract multiple directories
+  ciwg-cli backup sanitize --input backup.tgz --output clean.tgz --extract-dir "wp-content,uploads"
+
+  # Custom SQL file pattern
+  ciwg-cli backup sanitize --input backup.tgz --output clean.tgz --extract-file "*.sql,*.dump"
+
+  # Dry run to preview what would be extracted
+  ciwg-cli backup sanitize --input backup.tgz --output clean.tgz --dry-run`,
+	Args: cobra.NoArgs,
+	RunE: runBackupSanitize,
+}
+
 func init() {
 	// Load .env early so getEnvWithDefault calls used during flag setup
 	// will see values from a local .env file in development.
@@ -164,6 +195,7 @@ func init() {
 	backupCmd.AddCommand(backupDeleteCmd)
 	backupCmd.AddCommand(backupMonitorCmd)
 	backupCmd.AddCommand(backupConnCmd)
+	backupCmd.AddCommand(backupSanitizeCmd)
 
 	// Backup creation flags
 	backupCreateCmd.Flags().Bool("dry-run", false, "Print actions without executing them")
@@ -297,6 +329,15 @@ func init() {
 	backupConnCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
 	backupConnCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
 	backupConnCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
+
+	// Sanitize command flags
+	backupSanitizeCmd.Flags().String("input", "", "Path to input backup tarball (required)")
+	backupSanitizeCmd.Flags().String("output", "", "Path to output sanitized tarball (required)")
+	backupSanitizeCmd.Flags().String("extract-dir", "wp-content", "Comma-separated list of directories to extract from tarball (default: wp-content)")
+	backupSanitizeCmd.Flags().String("extract-file", "*.sql", "Comma-separated list of file patterns to extract (default: *.sql)")
+	backupSanitizeCmd.Flags().Bool("dry-run", false, "Preview what would be extracted without making changes")
+	backupSanitizeCmd.MarkFlagRequired("input")
+	backupSanitizeCmd.MarkFlagRequired("output")
 }
 
 // findEnvArg inspects argv for an explicit --env argument and returns
@@ -1082,6 +1123,79 @@ func runBackupConn(cmd *cobra.Command, args []string) error {
 	fmt.Println("===========================================")
 	fmt.Println("Connection Tests Complete")
 	fmt.Println("===========================================")
+
+	return nil
+}
+
+func runBackupSanitize(cmd *cobra.Command, args []string) error {
+	inputPath := mustGetStringFlag(cmd, "input")
+	outputPath := mustGetStringFlag(cmd, "output")
+	extractDirStr := mustGetStringFlag(cmd, "extract-dir")
+	extractFileStr := mustGetStringFlag(cmd, "extract-file")
+	dryRun := mustGetBoolFlag(cmd, "dry-run")
+
+	// Parse comma-separated lists
+	var extractDirs []string
+	for _, dir := range strings.Split(extractDirStr, ",") {
+		if trimmed := strings.TrimSpace(dir); trimmed != "" {
+			extractDirs = append(extractDirs, trimmed)
+		}
+	}
+
+	var extractFiles []string
+	for _, file := range strings.Split(extractFileStr, ",") {
+		if trimmed := strings.TrimSpace(file); trimmed != "" {
+			extractFiles = append(extractFiles, trimmed)
+		}
+	}
+
+	// Validate input
+	if inputPath == "" {
+		return fmt.Errorf("--input is required")
+	}
+	if outputPath == "" {
+		return fmt.Errorf("--output is required")
+	}
+
+	// Check if input file exists
+	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
+		return fmt.Errorf("input file does not exist: %s", inputPath)
+	}
+
+	fmt.Println("===========================================")
+	fmt.Println("Backup Sanitization")
+	fmt.Println("===========================================")
+	if dryRun {
+		fmt.Println("Mode: 🔍 DRY RUN (preview only)")
+	} else {
+		fmt.Println("Mode: 🚀 LIVE")
+	}
+	fmt.Printf("Input:         %s\n", inputPath)
+	fmt.Printf("Output:        %s\n", outputPath)
+	fmt.Printf("Extract Dirs:  %v\n", extractDirs)
+	fmt.Printf("Extract Files: %v\n", extractFiles)
+	fmt.Println("===========================================\n")
+
+	// Create a backup manager (no SSH or Minio needed for sanitization)
+	bm := backup.NewBackupManager(nil, nil)
+
+	options := &backup.SanitizeOptions{
+		InputPath:    inputPath,
+		OutputPath:   outputPath,
+		ExtractDirs:  extractDirs,
+		ExtractFiles: extractFiles,
+		DryRun:       dryRun,
+	}
+
+	if err := bm.SanitizeBackup(options); err != nil {
+		return fmt.Errorf("sanitization failed: %w", err)
+	}
+
+	if dryRun {
+		fmt.Println("\n✓ Dry run complete. No changes were made.")
+	} else {
+		fmt.Printf("\n✓ Sanitization complete! Output: %s\n", outputPath)
+	}
 
 	return nil
 }
