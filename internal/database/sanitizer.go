@@ -5,7 +5,7 @@ import (
 	"io"
 	"strings"
 
-	"vitess.io/vitess/go/vt/sqlparser"
+	"github.com/blastrain/vitess-sqlparser/sqlparser"
 )
 
 // OptionsToRemove is the list of WordPress option names to be removed from the database dump.
@@ -53,8 +53,9 @@ func (s *Sanitizer) Sanitize(reader io.Reader, writer io.Writer) error {
 
 		sql += line
 
-		// Check if we have a full statement
+		// Check if we have a full statementr
 		if strings.HasSuffix(strings.TrimSpace(line), ";") {
+			// stmt, err := sqlparser.Parse(sql)
 			stmt, err := sqlparser.Parse(sql)
 			if err != nil {
 				// This might not be a valid statement on its own, could be part of a larger one.
