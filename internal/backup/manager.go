@@ -32,6 +32,54 @@ import (
 	"ciwg-cli/internal/auth"
 )
 
+// ProgressReader wraps an io.Reader and reports progress
+type ProgressReader struct {
+	reader      io.Reader
+	total       int64
+	read        int64
+	lastReport  time.Time
+	reportEvery time.Duration
+	label       string
+}
+
+// NewProgressReader creates a progress tracking reader
+func NewProgressReader(r io.Reader, total int64, label string) *ProgressReader {
+	return &ProgressReader{
+		reader:      r,
+		total:       total,
+		lastReport:  time.Now(),
+		reportEvery: 2 * time.Second, // Report every 2 seconds
+		label:       label,
+	}
+}
+
+func (pr *ProgressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	pr.read += int64(n)
+
+	// Report progress periodically or on completion/error
+	now := time.Now()
+	if now.Sub(pr.lastReport) >= pr.reportEvery || err == io.EOF || err != nil {
+		pr.report()
+		pr.lastReport = now
+	}
+
+	return n, err
+}
+
+func (pr *ProgressReader) report() {
+	if pr.total > 0 {
+		percent := float64(pr.read) / float64(pr.total) * 100
+		mbRead := float64(pr.read) / (1024 * 1024)
+		mbTotal := float64(pr.total) / (1024 * 1024)
+		fmt.Printf("   %s: %.2f%% (%.2f / %.2f MB)\n", pr.label, percent, mbRead, mbTotal)
+	} else {
+		// Unknown total size, just show bytes transferred
+		mbRead := float64(pr.read) / (1024 * 1024)
+		fmt.Printf("   %s: %.2f MB transferred\n", pr.label, mbRead)
+	}
+}
+
 type MinioConfig struct {
 	Endpoint  string
 	AccessKey string
@@ -77,6 +125,8 @@ type BackupOptions struct {
 	DatabaseUser string
 	// RespectCapacityLimit checks storage capacity before creating backups
 	RespectCapacityLimit bool
+	// IncludeAWSGlacier enables uploading backups to AWS Glacier in addition to Minio
+	IncludeAWSGlacier bool
 }
 
 // SanitizeOptions contains options for sanitizing backup tarballs
@@ -443,6 +493,8 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 
 	// Create a temporary file to buffer the data
 	// This is necessary because Glacier needs to calculate tree-hash which requires seekable data
+	fmt.Printf("      [AWS] Creating temporary buffer file...\n")
+	bufferStartTime := time.Now()
 	tmpFile, err := os.CreateTemp("", "glacier-upload-*.tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary file: %w", err)
@@ -451,12 +503,22 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	defer tmpFile.Close()
 
 	// Copy data from reader to temp file and calculate checksums
+	fmt.Printf("      [AWS] Buffering stream to temporary file...\n")
 	written, err := io.Copy(tmpFile, reader)
+	bufferEndTime := time.Now()
+	bufferDuration := bufferEndTime.Sub(bufferStartTime)
 	if err != nil {
 		return fmt.Errorf("failed to buffer data to temporary file: %w", err)
 	}
+	fmt.Printf("      [AWS] Buffered %d bytes (%.2f MB) in %s (%.2f MB/s)\n",
+		written,
+		float64(written)/(1024*1024),
+		bufferDuration,
+		float64(written)/(1024*1024)/bufferDuration.Seconds())
 
 	// Read the file content for checksum calculation
+	fmt.Printf("      [AWS] Reading buffered data for checksum calculation...\n")
+	checksumStartTime := time.Now()
 	if _, err := tmpFile.Seek(0, 0); err != nil {
 		return fmt.Errorf("failed to seek temporary file for checksum: %w", err)
 	}
@@ -467,9 +529,15 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	}
 
 	// Calculate the required checksums
+	fmt.Printf("      [AWS] Calculating tree hash and linear hash...\n")
 	treeHash := computeTreeHash(data)
 	linearHash := sha256.Sum256(data)
 	linearHashHex := hex.EncodeToString(linearHash[:])
+	checksumEndTime := time.Now()
+	checksumDuration := checksumEndTime.Sub(checksumStartTime)
+	fmt.Printf("      [AWS] Checksums calculated in %s\n", checksumDuration)
+	fmt.Printf("      [AWS] Tree hash: %s\n", treeHash[:16]+"...")
+	fmt.Printf("      [AWS] Linear hash: %s\n", linearHashHex[:16]+"...")
 
 	// Get the file size for Content-Length
 	fileSize := int64(len(data))
@@ -479,9 +547,9 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 		return fmt.Errorf("failed to seek temporary file for upload: %w", err)
 	}
 
-	fmt.Printf("  ℹ️  Uploading %d bytes to Glacier (archive description: %s)...\n", written, archiveDescription)
-	fmt.Printf("  ℹ️  Tree hash: %s\n", treeHash)
-	fmt.Printf("  ℹ️  Linear hash: %s\n", linearHashHex)
+	fmt.Printf("      [AWS] Initiating upload to Glacier vault '%s'...\n", bm.awsConfig.Vault)
+	fmt.Printf("      [AWS] Archive: %s\n", archiveDescription)
+	fmt.Printf("      [AWS] Size: %.2f MB\n", float64(fileSize)/(1024*1024))
 
 	// Set the payload hash in the context for the AWS signer to use in signature calculation
 	ctx = v4.SetPayloadHash(ctx, linearHashHex)
@@ -492,6 +560,7 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 
 	// Upload with explicitly calculated checksums
 	// We need to add the x-amz-content-sha256 header explicitly via middleware
+	uploadStartTime := time.Now()
 	uploadResult, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
 		AccountId:          aws.String(accountID),
 		VaultName:          aws.String(bm.awsConfig.Vault),
@@ -517,11 +586,16 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 			), middleware.Before)
 		})
 	})
+	uploadEndTime := time.Now()
+	uploadDuration := uploadEndTime.Sub(uploadStartTime)
 	if err != nil {
+		fmt.Printf("      [AWS] Upload failed after %s: %v\n", uploadDuration, err)
 		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
 	}
 
-	fmt.Printf("  ✓ Successfully uploaded to Glacier (Archive ID: %s...)\n", (*uploadResult.ArchiveId)[:40])
+	uploadMBps := float64(fileSize) / (1024 * 1024) / uploadDuration.Seconds()
+	fmt.Printf("      [AWS] Upload completed in %s (%.2f MB/s)\n", uploadDuration, uploadMBps)
+	fmt.Printf("      [AWS] Archive ID: %s...\n", (*uploadResult.ArchiveId)[:40])
 
 	return nil
 }
@@ -1262,7 +1336,8 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 	}
 
 	// Create and stream tarball to Minio
-	fmt.Printf("Creating and streaming tarball to Minio...\n")
+	siteName := filepath.Base(container.WorkingDir)
+	fmt.Printf("\n📦 Creating tarball for %s...\n", siteName)
 
 	// Determine backup directory - use custom app dir if specified
 	backupDir := container.WorkingDir
@@ -1275,8 +1350,31 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 		containerBucketPath = container.Config.BucketPath
 	}
 
-	if err := bm.streamBackupToMinio(backupDir, backupName, options.ParentDir, containerBucketPath); err != nil {
+	fmt.Printf("   Source: %s\n", backupDir)
+	fmt.Printf("   Target: %s\n", backupName)
+
+	// Get uncompressed directory size for compression ratio calculation
+	fmt.Printf("   Calculating source size...\n")
+	uncompressedSize, err := bm.getDirectorySize(backupDir, options.ParentDir)
+	if err != nil {
+		fmt.Printf("   ⚠️  Warning: Could not determine source size: %v\n", err)
+		uncompressedSize = 0 // Continue anyway
+	} else {
+		uncompressedMB := float64(uncompressedSize) / (1024 * 1024)
+		fmt.Printf("   Uncompressed: %.2f MB\n", uncompressedMB)
+	}
+
+	fmt.Printf("   Compressing and streaming...\n")
+
+	compressedSize, err := bm.streamBackupToMinio(backupDir, backupName, options.ParentDir, containerBucketPath, uncompressedSize, options.IncludeAWSGlacier)
+	if err != nil {
 		return fmt.Errorf("failed to stream backup to Minio: %w", err)
+	}
+
+	// Calculate and display compression ratio
+	if uncompressedSize > 0 && compressedSize > 0 {
+		compressionRatio := (1.0 - float64(compressedSize)/float64(uncompressedSize)) * 100
+		fmt.Printf("   💾 Compression: %.1f%% space saved\n", compressionRatio)
 	}
 
 	// Run post-backup commands if specified
@@ -1335,7 +1433,39 @@ func (bm *BackupManager) exportWordPressDatabase(container ContainerInfo) error 
 	return nil
 }
 
-func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, containerBucketPath string) error {
+// getDirectorySize returns the total size of a directory in bytes
+func (bm *BackupManager) getDirectorySize(dirPath string, parentDir string) (int64, error) {
+	// Try the primary path first
+	var duCmd string
+	duCmd = fmt.Sprintf(`du -sb "%s" 2>/dev/null | awk '{print $1}'`, dirPath)
+
+	stdout, stderr, err := bm.executeCommand(duCmd)
+
+	// If the primary path failed and we have a parentDir, try the fallback
+	if (err != nil || strings.TrimSpace(stdout) == "") && parentDir != "" {
+		altPath := filepath.Join(parentDir, filepath.Base(dirPath))
+		duCmd = fmt.Sprintf(`du -sb "%s" 2>/dev/null | awk '{print $1}'`, altPath)
+		stdout, stderr, err = bm.executeCommand(duCmd)
+	}
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to get directory size: %w (stderr: %s)", err, stderr)
+	}
+
+	trimmedOutput := strings.TrimSpace(stdout)
+	if trimmedOutput == "" {
+		return 0, fmt.Errorf("directory not found or empty output from du command")
+	}
+
+	size, err := strconv.ParseInt(trimmedOutput, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse directory size '%s': %w", trimmedOutput, err)
+	}
+
+	return size, nil
+}
+
+func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, containerBucketPath string, uncompressedSize int64, includeAWSGlacier bool) (int64, error) {
 	// Build a tar command that attempts the provided workingDir first and
 	// falls back to parentDir/<basename> if the first path doesn't exist.
 	// This works for both local and remote execution because we run the
@@ -1356,10 +1486,10 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 		cmd.Stderr = &stderr
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			return fmt.Errorf("failed to create stdout pipe for local tar: %w", err)
+			return 0, fmt.Errorf("failed to create stdout pipe for local tar: %w", err)
 		}
 		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("failed to start local tar command: %w", err)
+			return 0, fmt.Errorf("failed to start local tar command: %w", err)
 		}
 
 		ctx := context.Background()
@@ -1380,9 +1510,9 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 			objectName = fmt.Sprintf("backups/%s/%s", siteName, backupName)
 		}
 
-		// If AWS is configured, upload to AWS first using TeeReader to capture data
+		// If AWS is configured and includeAWSGlacier flag is set, upload to AWS first using TeeReader to capture data
 		var reader io.Reader = stdout
-		if bm.awsConfig != nil && bm.awsConfig.Vault != "" {
+		if includeAWSGlacier && bm.awsConfig != nil && bm.awsConfig.Vault != "" {
 			if err := bm.initAWSClient(); err != nil {
 				fmt.Printf("Warning: failed to initialize AWS client, skipping AWS upload: %v\n", err)
 			} else {
@@ -1396,15 +1526,23 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 				awsErrChan := make(chan error, 1)
 				go func() {
 					defer pw.Close()
+					awsStartTime := time.Now()
+					fmt.Printf("   ☁️  Streaming to AWS Glacier...\n")
+					fmt.Printf("      [AWS] Starting upload at %s\n", awsStartTime.Format("15:04:05"))
 					err := bm.UploadToAWS(objectName, pr, -1)
+					awsEndTime := time.Now()
+					awsDuration := awsEndTime.Sub(awsStartTime)
 					if err != nil {
+						fmt.Printf("      [AWS] Failed after %s: %v\n", awsDuration, err)
 						awsErrChan <- fmt.Errorf("AWS upload failed: %w", err)
 					} else {
+						fmt.Printf("      [AWS] Completed in %s\n", awsDuration)
 						awsErrChan <- nil
 					}
 				}()
 
 				// Continue with Minio upload using the TeeReader
+				fmt.Printf("   📦 Streaming to Minio...\n")
 				info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, reader, -1, minio.PutObjectOptions{
 					ContentType: "application/gzip",
 				})
@@ -1412,14 +1550,14 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 					if cmd.Process != nil {
 						_ = cmd.Process.Kill()
 					}
-					return fmt.Errorf("failed to upload to Minio: %w", err)
+					return 0, fmt.Errorf("failed to upload to Minio: %w", err)
 				}
 
 				// Wait for AWS upload to complete
 				if awsErr := <-awsErrChan; awsErr != nil {
-					fmt.Printf("Warning: %v\n", awsErr)
+					fmt.Printf("⚠️  Warning: %v\n", awsErr)
 				} else {
-					fmt.Printf("Successfully uploaded %s to AWS Glacier\n", objectName)
+					fmt.Printf("   ✓ AWS Glacier upload complete\n")
 				}
 
 				if err := cmd.Wait(); err != nil {
@@ -1427,17 +1565,18 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 					var exitErr *exec.ExitError
 					if errors.As(err, &exitErr) {
 						if exitErr.ExitCode() == 1 && strings.Contains(stderr.String(), "file changed as we read it") {
-							fmt.Printf("Warning: tar reported non-fatal issue: %s\n", strings.TrimSpace(stderr.String()))
+							fmt.Printf("⚠️  Warning: tar reported non-fatal issue: %s\n", strings.TrimSpace(stderr.String()))
 						} else {
-							return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+							return 0, fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
 						}
 					} else {
-						return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+						return 0, fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
 					}
 				}
 
-				fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
-				return nil
+				sizeMB := float64(info.Size) / (1024 * 1024)
+				fmt.Printf("✓ Successfully uploaded to Minio: %s (%.2f MB)\n", objectName, sizeMB)
+				return info.Size, nil
 			}
 		}
 
@@ -1449,7 +1588,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
-			return fmt.Errorf("failed to upload to Minio: %w", err)
+			return 0, fmt.Errorf("failed to upload to Minio: %w", err)
 		}
 
 		if err := cmd.Wait(); err != nil {
@@ -1457,30 +1596,31 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
 				if exitErr.ExitCode() == 1 && strings.Contains(stderr.String(), "file changed as we read it") {
-					fmt.Printf("Warning: tar reported non-fatal issue: %s\n", strings.TrimSpace(stderr.String()))
+					fmt.Printf("⚠️  Warning: tar reported non-fatal issue: %s\n", strings.TrimSpace(stderr.String()))
 				} else {
-					return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+					return 0, fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
 				}
 			} else {
-				return fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
+				return 0, fmt.Errorf("local tar command failed: %w (stderr: %s)", err, stderr.String())
 			}
 		}
 
-		fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
-		return nil
+		sizeMB := float64(info.Size) / (1024 * 1024)
+		fmt.Printf("✓ Successfully uploaded to Minio: %s (%.2f MB)\n", objectName, sizeMB)
+		return info.Size, nil
 	}
 
 	// Remote (ssh) path - run the tarCmd under bash -lc on the remote side
 	session, err := bm.sshClient.GetSession()
 	if err != nil {
-		return fmt.Errorf("failed to create SSH session: %w", err)
+		return 0, fmt.Errorf("failed to create SSH session: %w", err)
 	}
 	defer session.Close()
 
 	// Get stdout pipe
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
+		return 0, fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
 	remoteCmd := fmt.Sprintf("bash -lc %q", tarCmd)
@@ -1488,7 +1628,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 	// Prepare to capture remote stderr so we can detect benign tar warnings
 	remoteStderrPipe, err := session.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("failed to get stderr pipe from SSH session: %w", err)
+		return 0, fmt.Errorf("failed to get stderr pipe from SSH session: %w", err)
 	}
 	var remoteStderr bytes.Buffer
 	go func() {
@@ -1497,7 +1637,7 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 
 	// Start the tar command
 	if err := session.Start(remoteCmd); err != nil {
-		return fmt.Errorf("failed to start tar command: %w", err)
+		return 0, fmt.Errorf("failed to start tar command: %w", err)
 	}
 
 	// Stream directly to Minio
@@ -1515,9 +1655,9 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 		objectName = fmt.Sprintf("backups/%s/%s", siteName, backupName)
 	}
 
-	// If AWS is configured, upload to AWS first using TeeReader
+	// If AWS is configured and includeAWSGlacier flag is set, upload to AWS first using TeeReader
 	var reader io.Reader = stdout
-	if bm.awsConfig != nil && bm.awsConfig.Vault != "" {
+	if includeAWSGlacier && bm.awsConfig != nil && bm.awsConfig.Vault != "" {
 		if err := bm.initAWSClient(); err != nil {
 			fmt.Printf("Warning: failed to initialize AWS client, skipping AWS upload: %v\n", err)
 		} else {
@@ -1531,42 +1671,51 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 			awsErrChan := make(chan error, 1)
 			go func() {
 				defer pw.Close()
+				awsStartTime := time.Now()
+				fmt.Printf("   ☁️  Streaming to AWS Glacier...\n")
+				fmt.Printf("      [AWS] Starting upload at %s\n", awsStartTime.Format("15:04:05"))
 				err := bm.UploadToAWS(objectName, pr, -1)
+				awsEndTime := time.Now()
+				awsDuration := awsEndTime.Sub(awsStartTime)
 				if err != nil {
+					fmt.Printf("      [AWS] Failed after %s: %v\n", awsDuration, err)
 					awsErrChan <- fmt.Errorf("AWS upload failed: %w", err)
 				} else {
+					fmt.Printf("      [AWS] Completed in %s\n", awsDuration)
 					awsErrChan <- nil
 				}
 			}()
 
 			// Continue with Minio upload using the TeeReader
+			fmt.Printf("   📦 Streaming to Minio...\n")
 			info, err := bm.minioClient.PutObject(ctx, bm.minioConfig.Bucket, objectName, reader, -1, minio.PutObjectOptions{
 				ContentType: "application/gzip",
 			})
 			if err != nil {
 				session.Signal("KILL") // Kill the session if upload fails
-				return fmt.Errorf("failed to upload to Minio: %w", err)
+				return 0, fmt.Errorf("failed to upload to Minio: %w", err)
 			}
 
 			// Wait for AWS upload to complete
 			if awsErr := <-awsErrChan; awsErr != nil {
-				fmt.Printf("Warning: %v\n", awsErr)
+				fmt.Printf("⚠️  Warning: %v\n", awsErr)
 			} else {
-				fmt.Printf("Successfully uploaded %s to AWS Glacier\n", objectName)
+				fmt.Printf("   ✓ AWS Glacier upload complete\n")
 			}
 
 			// Wait for command to complete
 			if err := session.Wait(); err != nil {
 				// If remote tar printed "file changed as we read it" consider it a warning
 				if strings.Contains(remoteStderr.String(), "file changed as we read it") {
-					fmt.Printf("Warning: remote tar reported non-fatal issue: %s\n", strings.TrimSpace(remoteStderr.String()))
+					fmt.Printf("⚠️  Warning: remote tar reported non-fatal issue: %s\n", strings.TrimSpace(remoteStderr.String()))
 				} else {
-					return fmt.Errorf("tar command failed: %w (remote stderr: %s)", err, remoteStderr.String())
+					return 0, fmt.Errorf("tar command failed: %w (remote stderr: %s)", err, remoteStderr.String())
 				}
 			}
 
-			fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
-			return nil
+			sizeMB := float64(info.Size) / (1024 * 1024)
+			fmt.Printf("✓ Successfully uploaded to Minio: %s (%.2f MB)\n", objectName, sizeMB)
+			return info.Size, nil
 		}
 	}
 
@@ -1576,21 +1725,22 @@ func (bm *BackupManager) streamBackupToMinio(workingDir, backupName, parentDir, 
 	})
 	if err != nil {
 		session.Signal("KILL") // Kill the session if upload fails
-		return fmt.Errorf("failed to upload to Minio: %w", err)
+		return 0, fmt.Errorf("failed to upload to Minio: %w", err)
 	}
 
 	// Wait for command to complete
 	if err := session.Wait(); err != nil {
 		// If remote tar printed "file changed as we read it" consider it a warning
 		if strings.Contains(remoteStderr.String(), "file changed as we read it") {
-			fmt.Printf("Warning: remote tar reported non-fatal issue: %s\n", strings.TrimSpace(remoteStderr.String()))
+			fmt.Printf("⚠️  Warning: remote tar reported non-fatal issue: %s\n", strings.TrimSpace(remoteStderr.String()))
 		} else {
-			return fmt.Errorf("tar command failed: %w (remote stderr: %s)", err, remoteStderr.String())
+			return 0, fmt.Errorf("tar command failed: %w (remote stderr: %s)", err, remoteStderr.String())
 		}
 	}
 
-	fmt.Printf("Successfully uploaded %s (%d bytes) to Minio\n", objectName, info.Size)
-	return nil
+	sizeMB := float64(info.Size) / (1024 * 1024)
+	fmt.Printf("✓ Successfully uploaded to Minio: %s (%.2f MB)\n", objectName, sizeMB)
+	return info.Size, nil
 }
 
 func (bm *BackupManager) readRemoteFile(filePath string) ([]byte, error) {
@@ -2166,11 +2316,11 @@ func (bm *BackupManager) extractTarball(tarballPath, destDir string) error {
 	cmd := exec.Command("tar", "-xzf", tarballPath, "-C", destDir)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("tar extraction failed: %w (stderr: %s)", err, stderr.String())
 	}
-	
+
 	return nil
 }
 
@@ -2203,9 +2353,9 @@ func (bm *BackupManager) filterAndCopyContent(srcDir, destDir string, options *S
 			//   - "site/www/wp-content/themes/..."
 			// But not:
 			//   - "my-wp-content-backup/..."
-			if strings.HasPrefix(relPath, extractDir+"/") || 
-			   strings.HasPrefix(relPath, extractDir) && relPath == extractDir ||
-			   strings.Contains(relPath, "/"+extractDir+"/") {
+			if strings.HasPrefix(relPath, extractDir+"/") ||
+				strings.HasPrefix(relPath, extractDir) && relPath == extractDir ||
+				strings.Contains(relPath, "/"+extractDir+"/") {
 				shouldExtractDir = true
 				break
 			}
@@ -2392,10 +2542,10 @@ func (bm *BackupManager) createTarball(srcDir, tarballPath string) error {
 	cmd := exec.Command("tar", "-czf", tarballPath, "-C", srcDir, ".")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("tar creation failed: %w (stderr: %s)", err, stderr.String())
 	}
-	
+
 	return nil
 }
