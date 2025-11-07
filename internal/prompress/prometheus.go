@@ -2,6 +2,7 @@ package prompress
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"ciwg-cli/internal/auth"
@@ -179,7 +180,27 @@ func (pm *PrometheusManager) ValidateConfig() error {
 
 // RestartPrometheus restarts the Prometheus container
 func (pm *PrometheusManager) RestartPrometheus() error {
-	return pm.prometheusManager.RestartContainer()
+	// If we have a compose manager, prefer using it
+	if pm.prometheusManager != nil {
+		return pm.prometheusManager.RestartContainer()
+	}
+
+	// Otherwise, fallback to restarting the prometheus container directly
+	cmd := `docker ps --format '{{.Names}}' | grep prometheus`
+	stdout, stderr, err := pm.sshClient.ExecuteCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to find prometheus container: %w (stderr: %s)", err, stderr)
+	}
+	promContainer := strings.TrimSpace(stdout)
+	if promContainer == "" {
+		return fmt.Errorf("prometheus container not found")
+	}
+	restartCmd := fmt.Sprintf("docker restart %s", promContainer)
+	_, stderr, err = pm.sshClient.ExecuteCommand(restartCmd)
+	if err != nil {
+		return fmt.Errorf("failed to restart prometheus container: %w (stderr: %s)", err, stderr)
+	}
+	return nil
 }
 
 // ReloadConfig sends a reload signal to Prometheus
@@ -258,11 +279,20 @@ func (pm *PrometheusManager) getPrometheusYmlPath() string {
 		return pm.prometheusYmlPath
 	}
 	// Fall back to inferring from compose path
+	if pm.prometheusDockerComposeYmlPath != "" {
+		return filepath.Join(filepath.Dir(pm.prometheusDockerComposeYmlPath), "prometheus.yml")
+	}
 	return pm.prometheusManager.GetComposePath() + "/../prometheus.yml"
 }
 
 // getPrometheusWorkDir returns the Prometheus working directory
 func (pm *PrometheusManager) getPrometheusWorkDir() (string, error) {
+	// If a docker-compose.yml path was provided directly, use its directory as the work dir
+	if pm.prometheusDockerComposeYmlPath != "" {
+		return filepath.Dir(pm.prometheusDockerComposeYmlPath), nil
+	}
+
+	// Otherwise, attempt to infer from the running container labels
 	cmd := `docker ps --format '{{.Names}}' | grep prometheus`
 	stdout, _, err := pm.sshClient.ExecuteCommand(cmd)
 	if err != nil {

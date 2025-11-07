@@ -253,7 +253,7 @@ func (o *Orchestrator) Execute(config WorkflowConfig) (*WorkflowResult, error) {
 		step.Status = "skipped"
 		fmt.Println("⊘ Dry run: Would verify metrics endpoint")
 	} else {
-		metricsURL := fmt.Sprintf("%s/%s", siteURL, config.MetricsPath)
+		metricsURL := joinURL(siteURL, config.MetricsPath)
 		result.MetricsURL = metricsURL
 		if err := o.installer.VerifyMetricsEndpoint(siteURL, config.MetricsPath, config.MetricsToken); err != nil {
 			step.Status = "failed"
@@ -530,7 +530,17 @@ func (o *Orchestrator) createPrometheusManager(sshClient *auth.SSHClient, config
 		}
 	}
 
-	// Create compose manager for Prometheus
+	// If direct Prometheus file paths are provided, prefer creating a PrometheusManager
+	// that operates on those files without requiring a compose.Manager. This helps when
+	// the Prometheus container doesn't have compose labels or when the user provided
+	// explicit paths via flags (--prom-yml or --prom-dc-yml).
+	if config.PrometheusYmlPath != "" || config.PrometheusDockerComposeYmlPath != "" {
+		pm := NewPrometheusManager(sshClient, o.prometheusHost, nil)
+		pm.SetDirectPaths(config.PrometheusYmlPath, config.PrometheusDockerComposeYmlPath)
+		return pm, nil
+	}
+
+	// Create compose manager for Prometheus (either with explicit workdir or via discovery)
 	var promManager *compose.Manager
 	var err error
 
@@ -547,12 +557,6 @@ func (o *Orchestrator) createPrometheusManager(sshClient *auth.SSHClient, config
 	}
 
 	pm := NewPrometheusManager(sshClient, o.prometheusHost, promManager)
-
-	// Set direct paths if provided
-	if config.PrometheusYmlPath != "" || config.PrometheusDockerComposeYmlPath != "" {
-		pm.SetDirectPaths(config.PrometheusYmlPath, config.PrometheusDockerComposeYmlPath)
-	}
-
 	return pm, nil
 }
 
@@ -565,4 +569,11 @@ func (o *Orchestrator) generateJobName(siteURL string) string {
 	// Replace dots and dashes with underscores
 	jobName := strings.ReplaceAll(strings.ReplaceAll(domain, ".", "_"), "-", "_")
 	return "wordpress_" + jobName
+}
+
+// joinURL safely joins a base URL and a path segment without producing double slashes
+func joinURL(base, p string) string {
+	base = strings.TrimRight(base, "/")
+	p = strings.TrimLeft(p, "/")
+	return base + "/" + p
 }
