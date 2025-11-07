@@ -33,10 +33,13 @@ func init() {
 	viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
 
 	// Load environment variables from a .env file in the current directory.
-	// godotenv.Load() will not return an error if the .env file doesn't exist,
-	// allowing you to still set variables in the shell.
+	// If the .env file doesn't exist, that's fine - environment variables can still be set in the shell.
+	// Only warn on actual errors (permissions, parse errors, etc.)
 	if err := godotenv.Load(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading .env file: %v\n", err)
+		// Check if it's just a "file not found" error
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: Error loading .env file: %v\n", err)
+		}
 	}
 }
 
