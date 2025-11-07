@@ -210,6 +210,7 @@ func init() {
 	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --prune (default: 5)")
 	backupCreateCmd.Flags().Bool("clean-aws", false, "Also clean up old backups from AWS S3 when using --prune (default: false, only cleans Minio)")
 	backupCreateCmd.Flags().Bool("respect-capacity-limit", getEnvBoolWithDefault("BACKUP_RESPECT_CAPACITY_LIMIT", false), "Check storage capacity before creating backup, fail if >95% (env: BACKUP_RESPECT_CAPACITY_LIMIT)")
+	backupCreateCmd.Flags().Bool("include-aws-glacier", getEnvBoolWithDefault("BACKUP_INCLUDE_AWS_GLACIER", false), "Upload backups to AWS Glacier in addition to Minio (env: BACKUP_INCLUDE_AWS_GLACIER)")
 
 	// Custom container / config file flags
 	backupCreateCmd.Flags().String("config-file", "", "Path to YAML configuration file for custom backup configurations")
@@ -460,6 +461,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		DatabaseName:         mustGetStringFlag(cmd, "database-name"),
 		DatabaseUser:         mustGetStringFlag(cmd, "database-user"),
 		RespectCapacityLimit: mustGetBoolFlag(cmd, "respect-capacity-limit"),
+		IncludeAWSGlacier:    mustGetBoolFlag(cmd, "include-aws-glacier"),
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
