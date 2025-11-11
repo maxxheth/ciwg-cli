@@ -227,6 +227,7 @@ func init() {
 	backupCreateCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupCreateCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupCreateCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupCreateCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 	backupCreateCmd.Flags().String("bucket-path", getEnvWithDefault("MINIO_BUCKET_PATH", ""), "Path prefix within Minio bucket (e.g., 'production/backups', env: MINIO_BUCKET_PATH)")
 
 	// AWS S3 configuration flags with environment variable support
@@ -235,6 +236,7 @@ func init() {
 	backupCreateCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
 	backupCreateCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
 	backupCreateCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
+	backupCreateCmd.Flags().Duration("aws-http-timeout", getEnvDurationWithDefault("AWS_HTTP_TIMEOUT", 0), "AWS HTTP client timeout (e.g., 0s for no timeout) (env: AWS_HTTP_TIMEOUT)")
 
 	// SSH connection flags with environment variable support
 	backupCreateCmd.Flags().StringP("user", "u", getEnvWithDefault("SSH_USER", ""), "SSH username (env: SSH_USER, default: current user)")
@@ -249,6 +251,7 @@ func init() {
 	backupTestMinioCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupTestMinioCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupTestMinioCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupTestMinioCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 
 	// AWS test command flags
 	backupTestAWSCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
@@ -256,6 +259,7 @@ func init() {
 	backupTestAWSCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
 	backupTestAWSCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
 	backupTestAWSCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
+	backupTestAWSCmd.Flags().Duration("aws-http-timeout", getEnvDurationWithDefault("AWS_HTTP_TIMEOUT", 0), "AWS HTTP client timeout (e.g., 0s for no timeout) (env: AWS_HTTP_TIMEOUT)")
 
 	// Read command flags
 	backupReadCmd.Flags().String("output", "", "Output file path (if empty, writes to stdout)")
@@ -267,6 +271,7 @@ func init() {
 	backupReadCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupReadCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupReadCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupReadCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 
 	// List command flags
 	backupListCmd.Flags().String("prefix", "", "Prefix to filter listed objects (e.g. backups/site-)")
@@ -277,6 +282,7 @@ func init() {
 	backupListCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupListCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupListCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupListCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 
 	// Delete command flags
 	backupDeleteCmd.Flags().Bool("dry-run", false, "Preview deletions without performing them")
@@ -292,6 +298,7 @@ func init() {
 	backupDeleteCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupDeleteCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupDeleteCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupDeleteCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 
 	// Monitor command flags
 	backupMonitorCmd.Flags().Bool("dry-run", false, "Preview what would be migrated without making changes")
@@ -305,11 +312,13 @@ func init() {
 	backupMonitorCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupMonitorCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupMonitorCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupMonitorCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 	backupMonitorCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
 	backupMonitorCmd.Flags().String("aws-account-id", getEnvWithDefault("AWS_ACCOUNT_ID", "-"), "AWS account ID or '-' for current account (env: AWS_ACCOUNT_ID, default: -)")
 	backupMonitorCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
 	backupMonitorCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
 	backupMonitorCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
+	backupMonitorCmd.Flags().Duration("aws-http-timeout", getEnvDurationWithDefault("AWS_HTTP_TIMEOUT", 0), "AWS HTTP client timeout (e.g., 0s for no timeout) (env: AWS_HTTP_TIMEOUT)")
 
 	// SSH connection flags for remote storage server
 	backupMonitorCmd.Flags().StringP("user", "u", getEnvWithDefault("SSH_USER", ""), "SSH username for storage server (env: SSH_USER, default: current user)")
@@ -324,11 +333,13 @@ func init() {
 	backupConnCmd.Flags().String("minio-secret-key", getEnvWithDefault("MINIO_SECRET_KEY", ""), "Minio secret key (env: MINIO_SECRET_KEY)")
 	backupConnCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupConnCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupConnCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 	backupConnCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
 	backupConnCmd.Flags().String("aws-account-id", getEnvWithDefault("AWS_ACCOUNT_ID", "-"), "AWS account ID or '-' for current account (env: AWS_ACCOUNT_ID, default: -)")
 	backupConnCmd.Flags().String("aws-access-key", getEnvWithDefault("AWS_ACCESS_KEY", ""), "AWS access key (env: AWS_ACCESS_KEY)")
 	backupConnCmd.Flags().String("aws-secret-access-key", getEnvWithDefault("AWS_SECRET_ACCESS_KEY", ""), "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
 	backupConnCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION, default: us-east-1)")
+	backupConnCmd.Flags().Duration("aws-http-timeout", getEnvDurationWithDefault("AWS_HTTP_TIMEOUT", 0), "AWS HTTP client timeout (e.g., 0s for no timeout) (env: AWS_HTTP_TIMEOUT)")
 
 	// Sanitize command flags
 	backupSanitizeCmd.Flags().String("input", "", "Path to input backup tarball (required)")
@@ -591,7 +602,7 @@ func runTestMinio(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Minio connection test failed: %w", err)
 	}
 
-	fmt.Println("\n✓ Minio connection test successful!")
+	fmt.Println("✓ Minio connection test successful!")
 	return nil
 }
 
@@ -624,7 +635,7 @@ func runTestAWS(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("AWS Glacier connection test failed: %w", err)
 	}
 
-	fmt.Println("\n✓ AWS Glacier connection test successful!")
+	fmt.Println("✓ AWS Glacier connection test successful!")
 	return nil
 }
 
@@ -874,6 +885,7 @@ func getMinioConfig(cmd *cobra.Command) (*backup.MinioConfig, error) {
 	bucket := mustGetStringFlag(cmd, "minio-bucket")
 	useSSL := mustGetBoolFlag(cmd, "minio-ssl")
 	bucketPath := mustGetStringFlag(cmd, "bucket-path")
+	httpTimeout := mustGetDurationFlag(cmd, "minio-http-timeout")
 
 	if endpoint == "" {
 		return nil, fmt.Errorf("minio-endpoint is required (can be set via MINIO_ENDPOINT environment variable)")
@@ -886,12 +898,13 @@ func getMinioConfig(cmd *cobra.Command) (*backup.MinioConfig, error) {
 	}
 
 	return &backup.MinioConfig{
-		Endpoint:   endpoint,
-		AccessKey:  accessKey,
-		SecretKey:  secretKey,
-		Bucket:     bucket,
-		UseSSL:     useSSL,
-		BucketPath: bucketPath,
+		Endpoint:    endpoint,
+		AccessKey:   accessKey,
+		SecretKey:   secretKey,
+		Bucket:      bucket,
+		UseSSL:      useSSL,
+		BucketPath:  bucketPath,
+		HTTPTimeout: httpTimeout,
 	}, nil
 }
 
@@ -901,6 +914,7 @@ func getAWSConfig(cmd *cobra.Command) (*backup.AWSConfig, error) {
 	accessKey := mustGetStringFlag(cmd, "aws-access-key")
 	secretKey := mustGetStringFlag(cmd, "aws-secret-access-key")
 	region := mustGetStringFlag(cmd, "aws-region")
+	httpTimeout := mustGetDurationFlag(cmd, "aws-http-timeout")
 
 	// AWS is optional, so only validate if vault is provided
 	if vault == "" {
@@ -921,11 +935,12 @@ func getAWSConfig(cmd *cobra.Command) (*backup.AWSConfig, error) {
 	}
 
 	return &backup.AWSConfig{
-		Vault:     vault,
-		AccountID: accountID,
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-		Region:    region,
+		Vault:       vault,
+		AccountID:   accountID,
+		AccessKey:   accessKey,
+		SecretKey:   secretKey,
+		Region:      region,
+		HTTPTimeout: httpTimeout,
 	}, nil
 }
 
@@ -936,6 +951,11 @@ func mustGetStringFlag(cmd *cobra.Command, name string) string {
 
 func mustGetBoolFlag(cmd *cobra.Command, name string) bool {
 	value, _ := cmd.Flags().GetBool(name)
+	return value
+}
+
+func mustGetDurationFlag(cmd *cobra.Command, name string) time.Duration {
+	value, _ := cmd.Flags().GetDuration(name)
 	return value
 }
 
@@ -964,7 +984,7 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	if showMounts {
 		fmt.Println("===========================================")
 		fmt.Println("Filesystem Mount Points")
-		fmt.Println("===========================================\n")
+		fmt.Println("===========================================")
 
 		if sshClient != nil {
 			// Remote mount points via SSH
@@ -982,7 +1002,8 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 			fmt.Println(mounts)
 		}
 
-		fmt.Println("\n💡 TIP: Look for your Minio data mount (e.g., /mnt/minio_nyc2)")
+		fmt.Println()
+		fmt.Println("💡 TIP: Look for your Minio data mount (e.g., /mnt/minio_nyc2)")
 		fmt.Println("   Then use: --storage-path /mnt/minio_nyc2")
 		return nil
 	}
@@ -1064,7 +1085,7 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Migrate Percent:   %.1f%%\n", migratePercent)
 	fmt.Printf("Minio Bucket:      %s\n", minioConfig.Bucket)
 	fmt.Printf("AWS Glacier Vault: %s\n", awsConfig.Vault)
-	fmt.Println("===========================================\n")
+	fmt.Println("===========================================")
 
 	return manager.MonitorAndMigrateIfNeeded(storagePath, threshold, migratePercent, dryRun)
 }
@@ -1079,7 +1100,7 @@ func runBackupConn(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("===========================================")
 	fmt.Println("Testing Backup System Connections")
-	fmt.Println("===========================================\n")
+	fmt.Println("===========================================")
 
 	// Test Minio
 	minioConfig, err := getMinioConfig(cmd)
@@ -1095,7 +1116,7 @@ func runBackupConn(cmd *cobra.Command, args []string) error {
 		if err := backupManager.TestMinioConnection(); err != nil {
 			fmt.Printf("   ❌ Minio test failed: %v\n\n", err)
 		} else {
-			fmt.Println("   ✓ Minio connection successful!\n")
+			fmt.Println("   ✓ Minio connection successful!")
 		}
 	}
 
@@ -1103,10 +1124,10 @@ func runBackupConn(cmd *cobra.Command, args []string) error {
 	awsConfig, err := getAWSConfig(cmd)
 	if err != nil {
 		fmt.Printf("⚠️  AWS Glacier Configuration: %v\n", err)
-		fmt.Println("   Skipping AWS Glacier test.\n")
+		fmt.Println("   Skipping AWS Glacier test.")
 	} else if awsConfig == nil {
 		fmt.Println("⚠️  AWS Glacier not configured.")
-		fmt.Println("   Skipping AWS Glacier test.\n")
+		fmt.Println("   Skipping AWS Glacier test.")
 	} else {
 		fmt.Println("☁️  Testing AWS Glacier Connection...")
 		fmt.Printf("   Vault:      %s\n", awsConfig.Vault)
@@ -1117,7 +1138,7 @@ func runBackupConn(cmd *cobra.Command, args []string) error {
 		if err := backupManager.TestAWSConnection(); err != nil {
 			fmt.Printf("   ❌ AWS Glacier test failed: %v\n\n", err)
 		} else {
-			fmt.Println("   ✓ AWS Glacier connection successful!\n")
+			fmt.Println("   ✓ AWS Glacier connection successful!")
 		}
 	}
 
@@ -1175,7 +1196,7 @@ func runBackupSanitize(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Output:        %s\n", outputPath)
 	fmt.Printf("Extract Dirs:  %v\n", extractDirs)
 	fmt.Printf("Extract Files: %v\n", extractFiles)
-	fmt.Println("===========================================\n")
+	fmt.Println("===========================================")
 
 	// Create a backup manager (no SSH or Minio needed for sanitization)
 	bm := backup.NewBackupManager(nil, nil)
