@@ -214,6 +214,42 @@ func TestSanitizeBackupDryRun(t *testing.T) {
 	}
 }
 
+func TestCleanupGlacierTempFiles(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "glacier-clean-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a couple of candidate files and a non-target file
+	target1 := filepath.Join(tmpDir, "glacier-upload-abc.tmp")
+	target2 := filepath.Join(tmpDir, "glacier-migrate-123")
+	other := filepath.Join(tmpDir, "other-file.tmp")
+
+	if err := os.WriteFile(target1, []byte("data"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+	if err := os.WriteFile(target2, []byte("data"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+	if err := os.WriteFile(other, []byte("data"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	deleted, err := cleanupGlacierTempFiles(tmpDir)
+	if err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 files deleted, got %d", deleted)
+	}
+
+	// Check remaining files
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("expected other file to still exist: %v", err)
+	}
+}
+
 func TestListAndReadRoundTrip(t *testing.T) {
 	cfg := getTestMinioConfigFromEnv()
 	if cfg == nil {
