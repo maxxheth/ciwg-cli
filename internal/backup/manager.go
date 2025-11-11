@@ -21,6 +21,9 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
+	"net"
+	"net/http"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -88,6 +91,9 @@ type MinioConfig struct {
 	UseSSL    bool
 	// BucketPath is an optional path prefix within the bucket (e.g., "production/backups")
 	BucketPath string
+	// HTTPTimeout is an optional overall timeout for the HTTP client used by the Minio SDK.
+	// Zero means no timeout (requests can run indefinitely).
+	HTTPTimeout time.Duration
 }
 
 type AWSConfig struct {
@@ -96,6 +102,9 @@ type AWSConfig struct {
 	AccessKey string
 	SecretKey string
 	Region    string
+	// HTTPTimeout is an optional overall timeout for the AWS HTTP client.
+	// Zero means no timeout (requests can run indefinitely).
+	HTTPTimeout time.Duration
 }
 
 type BackupOptions struct {
@@ -230,9 +239,31 @@ func (bm *BackupManager) initMinioClient() error {
 		return nil
 	}
 
+	// Create custom transport for Minio client using configured timeouts.
+	dialer := &net.Dialer{
+		Timeout:   60 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   5 * time.Minute,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       5 * time.Minute,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		// ResponseHeaderTimeout controls how long to wait for a server's
+		// response headers after writing the request. When non-zero, it will
+		// help prevent long stalls waiting for headers; leave zero for no timeout.
+	}
+	if bm.minioConfig.HTTPTimeout > 0 {
+		tr.ResponseHeaderTimeout = bm.minioConfig.HTTPTimeout
+	}
+
 	client, err := minio.New(bm.minioConfig.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(bm.minioConfig.AccessKey, bm.minioConfig.SecretKey, ""),
-		Secure: bm.minioConfig.UseSSL,
+		Creds:     credentials.NewStaticV4(bm.minioConfig.AccessKey, bm.minioConfig.SecretKey, ""),
+		Secure:    bm.minioConfig.UseSSL,
+		Transport: tr,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create Minio client: %w", err)
@@ -335,6 +366,24 @@ func (bm *BackupManager) initAWSClient() error {
 	}
 
 	// Create AWS config with static credentials
+	// Build a custom HTTP client for AWS SDK to handle long uploads and avoid timing out
+	dialer := &net.Dialer{Timeout: 60 * time.Second, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   5 * time.Minute,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       5 * time.Minute,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+	}
+	var httpClient *http.Client
+	if bm.awsConfig.HTTPTimeout > 0 {
+		httpClient = &http.Client{Timeout: bm.awsConfig.HTTPTimeout, Transport: tr}
+	} else {
+		httpClient = &http.Client{Transport: tr}
+	}
+
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion(bm.awsConfig.Region),
 		awsconfig.WithCredentialsProvider(awscredentials.NewStaticCredentialsProvider(
@@ -342,6 +391,7 @@ func (bm *BackupManager) initAWSClient() error {
 			bm.awsConfig.SecretKey,
 			"",
 		)),
+		awsconfig.WithHTTPClient(httpClient),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
@@ -495,12 +545,34 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	// This is necessary because Glacier needs to calculate tree-hash which requires seekable data
 	fmt.Printf("      [AWS] Creating temporary buffer file...\n")
 	bufferStartTime := time.Now()
-	tmpFile, err := os.CreateTemp("", "glacier-upload-*.tmp")
+	// Attempt to create a temp file and if we fail with ENOSPC, cleanup
+	// existing `glacier-*` temp files and retry once.
+	tmpDir := os.TempDir()
+	tmpFile, err := os.CreateTemp(tmpDir, "glacier-upload-*.tmp")
 	if err != nil {
-		return fmt.Errorf("failed to create temporary file: %w", err)
+		if errors.Is(err, syscall.ENOSPC) {
+			fmt.Printf("      [AWS] Disk full - attempting to clean up other glacier temp files in %s\n", tmpDir)
+			if deleted, derr := cleanupGlacierTempFiles(tmpDir); derr != nil {
+				fmt.Printf("      [AWS] Failed to cleanup temp files: %v\n", derr)
+			} else {
+				fmt.Printf("      [AWS] Removed %d old glacier temp file(s)\n", deleted)
+			}
+			// Try to create the temp file again
+			tmpFile, err = os.CreateTemp(tmpDir, "glacier-upload-*.tmp")
+			if err != nil {
+				return fmt.Errorf("failed to create temporary file after cleanup: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to create temporary file: %w", err)
+		}
 	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
+	// Ensure the file is closed and removed. We remove explicitly after upload
+	// completes successfully to free space immediately.
+	defer func() {
+		tmpFile.Close()
+		// best-effort remove
+		_ = os.Remove(tmpFile.Name())
+	}()
 
 	// Copy data from reader to temp file and calculate checksums
 	fmt.Printf("      [AWS] Buffering stream to temporary file...\n")
@@ -508,6 +580,17 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	bufferEndTime := time.Now()
 	bufferDuration := bufferEndTime.Sub(bufferStartTime)
 	if err != nil {
+		// If copying fails due to ENOSPC, attempt to clean up other glacier temp files
+		if errors.Is(err, syscall.ENOSPC) {
+			fmt.Printf("      [AWS] Buffering failed: disk full (ENOSPC). Attempting to cleanup other glacier temp files...\n")
+			if deleted, derr := cleanupGlacierTempFiles(tmpDir); derr != nil {
+				fmt.Printf("      [AWS] Failed to cleanup temp files: %v\n", derr)
+			} else {
+				fmt.Printf("      [AWS] Removed %d old glacier temp file(s)\n", deleted)
+			}
+			// Can't reliably resume the copy for non-seekable readers, so return an error
+			return fmt.Errorf("failed to buffer data to temporary file (disk full): %w", err)
+		}
 		return fmt.Errorf("failed to buffer data to temporary file: %w", err)
 	}
 	fmt.Printf("      [AWS] Buffered %d bytes (%.2f MB) in %s (%.2f MB/s)\n",
@@ -593,6 +676,12 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
 	}
 
+	// Upload success - remove the temp buffer file immediately
+	if err := os.Remove(tmpFile.Name()); err == nil {
+		fmt.Printf("      [AWS] Removed temporary buffer file %s\n", tmpFile.Name())
+	} else {
+		fmt.Printf("      [AWS] Warning: failed to delete temp file %s: %v\n", tmpFile.Name(), err)
+	}
 	uploadMBps := float64(fileSize) / (1024 * 1024) / uploadDuration.Seconds()
 	fmt.Printf("      [AWS] Upload completed in %s (%.2f MB/s)\n", uploadDuration, uploadMBps)
 	fmt.Printf("      [AWS] Archive ID: %s...\n", (*uploadResult.ArchiveId)[:40])
@@ -619,6 +708,34 @@ func (bm *BackupManager) ListAWSBackups(prefix string, limit int) ([]ObjectInfo,
 
 	// Return empty list - actual implementation would require job management
 	return []ObjectInfo{}, nil
+}
+
+// cleanupGlacierTempFiles deletes old temporary files used by glacier uploads
+// in the provided tmpDir. It returns the number of files deleted and any error
+// encountered while reading or deleting files.
+func cleanupGlacierTempFiles(tmpDir string) (int, error) {
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read temp dir %s: %w", tmpDir, err)
+	}
+	deleted := 0
+	for _, e := range entries {
+		// We only target regular files
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, "glacier-upload-") || strings.HasPrefix(name, "glacier-migrate-") {
+			path := filepath.Join(tmpDir, name)
+			if err := os.Remove(path); err != nil {
+				// Best effort: log and continue
+				fmt.Printf("      [AWS] Warning: failed to remove old temp file %s: %v\n", path, err)
+				continue
+			}
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 
 // DeleteAWSObjects deletes multiple archives from AWS Glacier
