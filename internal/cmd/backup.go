@@ -24,8 +24,30 @@ var backupCmd = &cobra.Command{
 var backupCreateCmd = &cobra.Command{
 	Use:   "create [hostname]",
 	Short: "Create backups of WordPress containers",
-	Args:  cobra.MaximumNArgs(1),
-	RunE:  runBackupCreate,
+	Long: `Create backups of WordPress containers and stream them to Minio storage.
+
+Dry-run mode supports three compression estimation methods:
+  - heuristic: Instant estimation based on file types (~80% accurate)
+  - sample: Compress a sample and extrapolate (~90% accurate, uses --sample-size)
+  - accurate: Full compression simulation (100% accurate, same speed as real backup)
+
+Examples:
+  # Standard backup
+  ciwg-cli backup create wp0.example.com
+
+  # Dry-run with instant estimation
+  ciwg-cli backup create wp0.example.com --dry-run --estimate-method heuristic
+
+  # Dry-run with sample-based estimation (compress first 100MB)
+  ciwg-cli backup create wp0.example.com --dry-run --estimate-method sample
+
+  # Dry-run with accurate estimation (full compression)
+  ciwg-cli backup create wp0.example.com --dry-run --estimate-method accurate
+
+  # Dry-run with larger sample size (200MB)
+  ciwg-cli backup create wp0.example.com --dry-run --estimate-method sample --sample-size 209715200`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runBackupCreate,
 }
 
 var backupTestMinioCmd = &cobra.Command{
@@ -163,6 +185,45 @@ Examples:
 	RunE: runBackupSanitize,
 }
 
+var backupMigrateAWSCmd = &cobra.Command{
+	Use:   "migrate-aws",
+	Short: "Manually migrate backups from Minio to AWS Glacier",
+	Long: `Manually trigger migration of backups from Minio storage to AWS Glacier.
+This command gives you fine-grained control over which backups to migrate and
+provides detailed diagnostic output to troubleshoot migration issues.
+
+Migration strategies:
+  - Specific object: Use --object to migrate a specific backup by its exact key
+  - Oldest N backups: Use --count to migrate the N oldest backups
+  - By prefix: Use --prefix to migrate backups for specific sites
+  - By age: Use --older-than to migrate backups older than a duration
+  - Percentage: Use --percent to migrate oldest N% of all backups
+
+Examples:
+  # Migrate a specific backup object
+  ciwg-cli backup migrate-aws --object backups/mysite.com/mysite.com-20241112-120000.tgz -vv
+
+  # Migrate 10 oldest backups with debug output
+  ciwg-cli backup migrate-aws --count 10 -vv
+
+  # Migrate backups for a specific site
+  ciwg-cli backup migrate-aws --prefix backups/mysite.com/ --count 5 -vv
+
+  # Migrate backups older than 30 days
+  ciwg-cli backup migrate-aws --older-than 720h -vvv
+
+  # Migrate oldest 10% of all backups
+  ciwg-cli backup migrate-aws --percent 10 -vv
+
+  # Dry run to preview what would be migrated
+  ciwg-cli backup migrate-aws --count 10 --dry-run -v
+
+  # Delete from Minio after successful migration
+  ciwg-cli backup migrate-aws --count 5 --delete-after -vv`,
+	Args: cobra.NoArgs,
+	RunE: runBackupMigrateAWS,
+}
+
 func init() {
 	// Load .env early so getEnvWithDefault calls used during flag setup
 	// will see values from a local .env file in development.
@@ -196,9 +257,14 @@ func init() {
 	backupCmd.AddCommand(backupConnCmd)
 	backupCmd.AddCommand(backupSanitizeCmd)
 	backupCmd.AddCommand(backupDeleteCmd)
+	backupCmd.AddCommand(backupMigrateAWSCmd)
 
 	// Backup creation flags
+	backupCreateCmd.Flags().Int("log-level", 1, "Logging level: 0=quiet, 1=normal, 2=verbose, 3=debug, 4=trace (or use -v/-vv/-vvv/-vvvv, env: BACKUP_LOG_LEVEL)")
+	backupCreateCmd.Flags().CountP("vflag", "v", "Increase verbosity (-v=verbose, -vv=debug, -vvv=trace, -vvvv=ultra-trace)")
 	backupCreateCmd.Flags().Bool("dry-run", false, "Print actions without executing them")
+	backupCreateCmd.Flags().String("estimate-method", "", "Compression estimation method for dry-run: 'heuristic' (instant, ~80% accurate), 'sample' (fast, ~90% accurate), 'accurate' (same speed as backup, 100% accurate)")
+	backupCreateCmd.Flags().Int64("sample-size", 100*1024*1024, "Sample size in bytes for 'sample' estimation method (default: 100MB)")
 	backupCreateCmd.Flags().Bool("delete", false, "Stop and remove containers, and delete associated directories after backup")
 	backupCreateCmd.Flags().String("container-name", "", "Pipe-delimited container names or working directories to process (e.g. wp_foo|wp_bar|/srv/foo)")
 	backupCreateCmd.Flags().String("container-names", "", "Comma-delimited container names to process (e.g. wp_foo,wp_bar)")
@@ -302,6 +368,8 @@ func init() {
 	backupDeleteCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
 
 	// Monitor command flags
+	backupMonitorCmd.Flags().Int("log-level", 1, "Logging level: 0=quiet, 1=normal, 2=verbose, 3=debug, 4=trace (or use -v/-vv/-vvv/-vvvv, env: BACKUP_LOG_LEVEL)")
+	backupMonitorCmd.Flags().CountP("vflag", "v", "Increase verbosity (-v=verbose, -vv=debug, -vvv=trace, -vvvv=ultra-trace)")
 	backupMonitorCmd.Flags().Bool("dry-run", false, "Preview what would be migrated without making changes")
 	backupMonitorCmd.Flags().Bool("show-mounts", false, "Display all filesystem mount points and exit (helpful for finding storage-path)")
 	backupMonitorCmd.Flags().String("storage-server", getEnvWithDefault("STORAGE_SERVER_ADDR", ""), "Remote storage server address for SSH capacity checking (env: STORAGE_SERVER_ADDR)")
@@ -350,6 +418,34 @@ func init() {
 	backupSanitizeCmd.Flags().Bool("dry-run", false, "Preview what would be extracted without making changes")
 	backupSanitizeCmd.MarkFlagRequired("input")
 	backupSanitizeCmd.MarkFlagRequired("output")
+
+	// Migrate AWS command flags
+	backupMigrateAWSCmd.Flags().Int("log-level", 1, "Logging level: 0=quiet, 1=normal, 2=verbose, 3=debug, 4=trace (or use -v/-vv/-vvv/-vvvv, env: BACKUP_LOG_LEVEL)")
+	backupMigrateAWSCmd.Flags().CountP("vflag", "v", "Increase verbosity (-v=verbose, -vv=debug, -vvv=trace, -vvvv=ultra-trace)")
+	backupMigrateAWSCmd.Flags().Bool("dry-run", false, "Preview what would be migrated without making changes")
+	backupMigrateAWSCmd.Flags().String("prefix", "", "Prefix to filter backups (e.g., backups/mysite.com/)")
+	backupMigrateAWSCmd.Flags().String("object", "", "Specific backup object key to migrate (e.g., backups/site.com/backup.tgz, mutually exclusive with --count, --percent, and --older-than)")
+	backupMigrateAWSCmd.Flags().Int("count", 0, "Number of oldest backups to migrate (mutually exclusive with --object, --percent, and --older-than)")
+	backupMigrateAWSCmd.Flags().Float64("percent", 0, "Percentage of oldest backups to migrate (e.g., 10 for 10%, mutually exclusive with --object, --count, and --older-than)")
+	backupMigrateAWSCmd.Flags().Duration("older-than", 0, "Migrate backups older than this duration (e.g., 720h for 30 days, mutually exclusive with --object, --count, and --percent)")
+	backupMigrateAWSCmd.Flags().Bool("delete-after", false, "Delete backups from Minio after successful migration to AWS Glacier")
+	backupMigrateAWSCmd.Flags().Int("limit", 0, "Maximum number of backups to list for selection (0=unlimited)")
+
+	// Minio configuration for migrate-aws
+	backupMigrateAWSCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
+	backupMigrateAWSCmd.Flags().String("minio-access-key", "", "Minio access key (env: MINIO_ACCESS_KEY)")
+	backupMigrateAWSCmd.Flags().String("minio-secret-key", "", "Minio secret key (env: MINIO_SECRET_KEY)")
+	backupMigrateAWSCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
+	backupMigrateAWSCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
+	backupMigrateAWSCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (env: MINIO_HTTP_TIMEOUT)")
+
+	// AWS configuration for migrate-aws
+	backupMigrateAWSCmd.Flags().String("aws-vault", getEnvWithDefault("AWS_VAULT", ""), "AWS Glacier vault name (env: AWS_VAULT)")
+	backupMigrateAWSCmd.Flags().String("aws-account-id", getEnvWithDefault("AWS_ACCOUNT_ID", "-"), "AWS account ID or '-' for current account (env: AWS_ACCOUNT_ID)")
+	backupMigrateAWSCmd.Flags().String("aws-access-key", "", "AWS access key (env: AWS_ACCESS_KEY)")
+	backupMigrateAWSCmd.Flags().String("aws-secret-access-key", "", "AWS secret access key (env: AWS_SECRET_ACCESS_KEY)")
+	backupMigrateAWSCmd.Flags().String("aws-region", getEnvWithDefault("AWS_REGION", "us-east-1"), "AWS region (env: AWS_REGION)")
+	backupMigrateAWSCmd.Flags().Duration("aws-http-timeout", getEnvDurationWithDefault("AWS_HTTP_TIMEOUT", 0), "AWS HTTP client timeout (env: AWS_HTTP_TIMEOUT)")
 }
 
 // findEnvArg inspects argv for an explicit --env argument and returns
@@ -446,6 +542,15 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		backupManager = backup.NewBackupManager(sshClient, minioConfig)
 	}
 
+	// Set verbosity level
+	logLevel, _ := cmd.Flags().GetInt("log-level")
+	vflag, _ := cmd.Flags().GetCount("vflag")
+	verbosity := logLevel
+	if vflag > 0 {
+		verbosity = 1 + vflag // -v=2, -vv=3, -vvv=4, -vvvv=5
+	}
+	backupManager.SetVerbosity(verbosity)
+
 	// Parse container-names (comma-delimited)
 	var containerNames []string
 	if v := mustGetStringFlag(cmd, "container-names"); v != "" {
@@ -457,6 +562,9 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 	}
 
 	// Get backup options from flags
+	estimateMethod := mustGetStringFlag(cmd, "estimate-method")
+	sampleSize, _ := cmd.Flags().GetInt64("sample-size")
+
 	options := &backup.BackupOptions{
 		DryRun:               mustGetBoolFlag(cmd, "dry-run"),
 		Delete:               mustGetBoolFlag(cmd, "delete"),
@@ -474,6 +582,8 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		DatabaseUser:         mustGetStringFlag(cmd, "database-user"),
 		RespectCapacityLimit: mustGetBoolFlag(cmd, "respect-capacity-limit"),
 		IncludeAWSGlacier:    mustGetBoolFlag(cmd, "include-aws-glacier"),
+		EstimateMethod:       estimateMethod,
+		SampleSize:           sampleSize,
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
@@ -1071,6 +1181,15 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	// Create backup manager with SSH client for remote storage capacity checking
 	manager := backup.NewBackupManagerWithAWS(sshClient, &minioConfig, awsConfig)
 
+	// Set verbosity level
+	logLevel, _ := cmd.Flags().GetInt("log-level")
+	vflag, _ := cmd.Flags().GetCount("vflag")
+	verbosity := logLevel
+	if vflag > 0 {
+		verbosity = 1 + vflag // -v=2, -vv=3, -vvv=4, -vvvv=5
+	}
+	manager.SetVerbosity(verbosity)
+
 	// Run monitoring and migration
 	fmt.Println("===========================================")
 	fmt.Println("CIWG Backup Storage Capacity Monitor")
@@ -1228,6 +1347,269 @@ func runBackupSanitize(cmd *cobra.Command, args []string) error {
 		fmt.Println("\n✓ Dry run complete. No changes were made.")
 	} else {
 		fmt.Printf("\n✓ Sanitization complete! Output: %s\n", outputPath)
+	}
+
+	return nil
+}
+
+func runBackupMigrateAWS(cmd *cobra.Command, args []string) error {
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
+
+	// Parse flags
+	dryRun := mustGetBoolFlag(cmd, "dry-run")
+	prefix := mustGetStringFlag(cmd, "prefix")
+	objectKey := mustGetStringFlag(cmd, "object")
+	count, _ := cmd.Flags().GetInt("count")
+	percent, _ := cmd.Flags().GetFloat64("percent")
+	olderThan, _ := cmd.Flags().GetDuration("older-than")
+	deleteAfter := mustGetBoolFlag(cmd, "delete-after")
+	limit, _ := cmd.Flags().GetInt("limit")
+
+	// Validate mutually exclusive flags
+	strategyCount := 0
+	if objectKey != "" {
+		strategyCount++
+	}
+	if count > 0 {
+		strategyCount++
+	}
+	if percent > 0 {
+		strategyCount++
+	}
+	if olderThan > 0 {
+		strategyCount++
+	}
+
+	if strategyCount == 0 {
+		return fmt.Errorf("must specify one of: --object, --count, --percent, or --older-than")
+	}
+	if strategyCount > 1 {
+		return fmt.Errorf("only one of --object, --count, --percent, or --older-than can be specified")
+	}
+
+	// Get Minio configuration
+	minioConfig, err := getMinioConfig(cmd)
+	if err != nil {
+		return err
+	}
+
+	// Get AWS configuration
+	awsConfig, err := getAWSConfig(cmd)
+	if err != nil {
+		return err
+	}
+
+	if awsConfig == nil {
+		return fmt.Errorf("AWS Glacier vault not configured (set AWS_VAULT environment variable or --aws-vault flag)")
+	}
+
+	// Validate required AWS configuration
+	if !dryRun {
+		if awsConfig.AccessKey == "" {
+			return fmt.Errorf("aws-access-key is required for migration")
+		}
+		if awsConfig.SecretKey == "" {
+			return fmt.Errorf("aws-secret-access-key is required for migration")
+		}
+	}
+
+	// Create backup manager
+	manager := backup.NewBackupManagerWithAWS(nil, minioConfig, awsConfig)
+
+	// Set verbosity level
+	logLevel, _ := cmd.Flags().GetInt("log-level")
+	vflag, _ := cmd.Flags().GetCount("vflag")
+	verbosity := logLevel
+	if vflag > 0 {
+		verbosity = 1 + vflag // -v=2, -vv=3, -vvv=4, -vvvv=5
+	}
+	manager.SetVerbosity(verbosity)
+
+	// Display configuration
+	fmt.Println("===========================================")
+	fmt.Println("AWS Glacier Manual Migration")
+	fmt.Println("===========================================")
+	if dryRun {
+		fmt.Println("Mode:            🔍 DRY RUN (preview only)")
+	} else {
+		fmt.Println("Mode:            🚀 LIVE (will migrate)")
+	}
+	fmt.Printf("Minio Bucket:    %s\n", minioConfig.Bucket)
+	fmt.Printf("AWS Vault:       %s\n", awsConfig.Vault)
+	fmt.Printf("AWS Region:      %s\n", awsConfig.Region)
+	if prefix != "" {
+		fmt.Printf("Prefix Filter:   %s\n", prefix)
+	}
+	if objectKey != "" {
+		fmt.Printf("Strategy:        Migrate specific object: %s\n", objectKey)
+	} else if count > 0 {
+		fmt.Printf("Strategy:        Migrate %d oldest backups\n", count)
+	} else if percent > 0 {
+		fmt.Printf("Strategy:        Migrate oldest %.1f%% of backups\n", percent)
+	} else if olderThan > 0 {
+		fmt.Printf("Strategy:        Migrate backups older than %s\n", olderThan)
+	}
+	if deleteAfter {
+		fmt.Println("Delete After:    YES (will delete from Minio after successful migration)")
+	} else {
+		fmt.Println("Delete After:    NO (will keep in Minio)")
+	}
+	fmt.Println("===========================================")
+	fmt.Println()
+
+	// Select backups to migrate based on strategy
+	var toMigrate []backup.ObjectInfo
+
+	// Handle specific object migration
+	if objectKey != "" {
+		fmt.Printf("Getting object info for: %s\n", objectKey)
+
+		// Get object info via StatObject
+		objs, err := manager.ListBackups(objectKey, 1)
+		if err != nil {
+			return fmt.Errorf("failed to get object info: %w", err)
+		}
+
+		if len(objs) == 0 {
+			return fmt.Errorf("object not found: %s", objectKey)
+		}
+
+		// Verify exact match (ListBackups may return prefix matches)
+		if objs[0].Key != objectKey {
+			return fmt.Errorf("object not found: %s (got prefix match: %s)", objectKey, objs[0].Key)
+		}
+
+		toMigrate = objs
+		fmt.Printf("Found object: %s (%.2f MB, %s)\n\n",
+			objs[0].Key,
+			float64(objs[0].Size)/(1024*1024),
+			objs[0].LastModified.Format("2006-01-02 15:04:05"))
+	} else {
+		// List backups from Minio
+		fmt.Println("Fetching backups from Minio...")
+		objs, err := manager.ListBackups(prefix, limit)
+		if err != nil {
+			return fmt.Errorf("failed to list backups: %w", err)
+		}
+
+		if len(objs) == 0 {
+			fmt.Println("No backups found matching criteria.")
+			return nil
+		}
+
+		fmt.Printf("Found %d backup(s) in Minio\n\n", len(objs))
+
+		// Select based on strategy
+		if count > 0 {
+			// Migrate N oldest backups
+			if count > len(objs) {
+				count = len(objs)
+			}
+			toMigrate = objs[:count]
+		} else if percent > 0 {
+			// Migrate oldest N% of backups
+			numToMigrate := int(float64(len(objs)) * percent / 100.0)
+			if numToMigrate < 1 {
+				numToMigrate = 1
+			}
+			if numToMigrate > len(objs) {
+				numToMigrate = len(objs)
+			}
+			toMigrate = objs[:numToMigrate]
+		} else if olderThan > 0 {
+			// Migrate backups older than duration
+			cutoffTime := time.Now().Add(-olderThan)
+			for _, obj := range objs {
+				if obj.LastModified.Before(cutoffTime) {
+					toMigrate = append(toMigrate, obj)
+				}
+			}
+		}
+	}
+
+	if len(toMigrate) == 0 {
+		fmt.Println("No backups match the migration criteria.")
+		return nil
+	}
+
+	// Display migration plan
+	fmt.Printf("Selected %d backup(s) for migration:\n", len(toMigrate))
+	fmt.Println("-------------------------------------------")
+	var totalSize int64
+	for i, obj := range toMigrate {
+		fmt.Printf("%3d. %s (%.2f MB, %s)\n",
+			i+1,
+			obj.Key,
+			float64(obj.Size)/(1024*1024),
+			obj.LastModified.Format("2006-01-02 15:04:05"))
+		totalSize += obj.Size
+	}
+	fmt.Println("-------------------------------------------")
+	fmt.Printf("Total size to migrate: %.2f MB\n\n", float64(totalSize)/(1024*1024))
+
+	if dryRun {
+		fmt.Println("✓ Dry run complete. No backups were migrated.")
+		return nil
+	}
+
+	// Perform migration
+	fmt.Println("Starting migration...")
+	var migratedCount, failedCount int
+	var migratedSize int64
+
+	for i, obj := range toMigrate {
+		fmt.Printf("\n[%d/%d] Migrating: %s (%.2f MB)\n", i+1, len(toMigrate), obj.Key, float64(obj.Size)/(1024*1024))
+
+		// Download from Minio
+		reader, err := manager.DownloadBackup(obj.Key)
+		if err != nil {
+			fmt.Printf("   ❌ Failed to download from Minio: %v\n", err)
+			failedCount++
+			continue
+		}
+
+		// Upload to AWS Glacier
+		err = manager.UploadToAWS(obj.Key, reader, obj.Size)
+		if err != nil {
+			fmt.Printf("   ❌ Failed to upload to AWS Glacier: %v\n", err)
+			failedCount++
+			continue
+		}
+
+		migratedCount++
+		migratedSize += obj.Size
+
+		// Delete from Minio if requested
+		if deleteAfter {
+			fmt.Printf("   Deleting from Minio...\n")
+			if err := manager.DeleteObjects([]string{obj.Key}); err != nil {
+				fmt.Printf("   ⚠️  Failed to delete from Minio: %v\n", err)
+			} else {
+				fmt.Printf("   ✓ Deleted from Minio\n")
+			}
+		}
+
+		fmt.Printf("   ✓ Migration complete\n")
+	}
+
+	// Summary
+	fmt.Println("\n===========================================")
+	fmt.Println("Migration Summary")
+	fmt.Println("===========================================")
+	fmt.Printf("Total backups:     %d\n", len(toMigrate))
+	fmt.Printf("Migrated:          %d (%.2f MB)\n", migratedCount, float64(migratedSize)/(1024*1024))
+	fmt.Printf("Failed:            %d\n", failedCount)
+	if deleteAfter {
+		fmt.Printf("Deleted from Minio: %d\n", migratedCount)
+	}
+	fmt.Println("===========================================")
+
+	if failedCount > 0 {
+		return fmt.Errorf("%d backup(s) failed to migrate", failedCount)
 	}
 
 	return nil
