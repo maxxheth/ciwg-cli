@@ -120,3 +120,12 @@ func getEnvFloat64WithDefault(key string, defaultValue float64) float64 {
 	}
 	return defaultValue
 }
+
+func getEnvIntWithDefault(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.Atoi(value); err == nil {
+			return intVal
+		}
+	}
+	return defaultValue
+}
