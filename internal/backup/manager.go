@@ -153,6 +153,19 @@ type BackupOptions struct {
 	EstimateMethod string
 	// SampleSize specifies the number of bytes to sample for "sample" estimation method
 	SampleSize int64
+	// SmartRetention enables date-aware retention policy (preserves weekly/monthly backups)
+	SmartRetention *SmartRetentionPolicy
+}
+
+// SmartRetentionPolicy defines intelligent backup retention based on backup dates
+// Allows preserving weekly and monthly backups from a single daily backup job
+type SmartRetentionPolicy struct {
+	Enabled      bool // Enable smart retention (vs simple "keep N most recent")
+	KeepDaily    int  // Number of daily backups to keep (default: 14)
+	KeepWeekly   int  // Number of weekly backups to keep (default: 26)
+	KeepMonthly  int  // Number of monthly backups to keep (default: 6)
+	WeeklyDay    int  // Day of week for weekly backups, 0=Sunday (default: 0)
+	MonthlyDay   int  // Day of month for monthly backups (default: 1)
 }
 
 // SanitizeOptions contains options for sanitizing backup tarballs
@@ -2474,6 +2487,91 @@ func (bm *BackupManager) SelectObjectsForOverwrite(objs []ObjectInfo, remainder 
 
 	// Return all objects after the first N (remainder) items
 	return sorted[remainder:]
+}
+
+// SelectObjectsWithSmartRetention selects backups to delete using date-aware retention policy
+// Preserves weekly and monthly backups based on the policy configuration
+func (bm *BackupManager) SelectObjectsWithSmartRetention(objs []ObjectInfo, policy *SmartRetentionPolicy) []ObjectInfo {
+	if policy == nil || !policy.Enabled {
+		// Fallback to simple retention: keep all objects
+		return []ObjectInfo{}
+	}
+
+	// Sort by LastModified descending (most recent first)
+	sorted := make([]ObjectInfo, len(objs))
+	copy(sorted, objs)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].LastModified.After(sorted[j].LastModified)
+	})
+
+	// Classify backups into categories
+	type classifiedBackup struct {
+		obj      ObjectInfo
+		isDaily   bool
+		isWeekly  bool
+		isMonthly bool
+	}
+
+	var classified []classifiedBackup
+
+	for _, obj := range sorted {
+		c := classifiedBackup{obj: obj}
+
+		// Check if this backup qualifies as monthly (day of month matches policy)
+		if obj.LastModified.Day() == policy.MonthlyDay {
+			c.isMonthly = true
+		}
+
+		// Check if this backup qualifies as weekly (day of week matches policy)
+		if int(obj.LastModified.Weekday()) == policy.WeeklyDay {
+			c.isWeekly = true
+		}
+
+		// All backups are daily by default
+		c.isDaily = true
+
+		classified = append(classified, c)
+	}
+
+	// Select backups to preserve based on policy
+	var toKeep []ObjectInfo
+	var toDelete []ObjectInfo
+
+	dailyCount := 0
+	weeklyCount := 0
+	monthlyCount := 0
+
+	for _, c := range classified {
+		shouldKeep := false
+
+		// Priority order: Monthly > Weekly > Daily
+		// This ensures monthly backups are preserved even if they're also weekly/daily
+
+		// Check monthly quota first
+		if c.isMonthly && monthlyCount < policy.KeepMonthly {
+			shouldKeep = true
+			monthlyCount++
+		} else if c.isWeekly && weeklyCount < policy.KeepWeekly && !c.isMonthly {
+			// Weekly backup (but not already counted as monthly)
+			shouldKeep = true
+			weeklyCount++
+		} else if dailyCount < policy.KeepDaily {
+			// Daily backup
+			shouldKeep = true
+			dailyCount++
+		}
+
+		if shouldKeep {
+			toKeep = append(toKeep, c.obj)
+		} else {
+			toDelete = append(toDelete, c.obj)
+		}
+	}
+
+	bm.logVerbose("Smart retention: keeping %d backups (daily=%d, weekly=%d, monthly=%d), deleting %d",
+		len(toKeep), dailyCount, weeklyCount, monthlyCount, len(toDelete))
+
+	return toDelete
 }
 
 // getContainersFromConfig loads containers from a YAML config file
