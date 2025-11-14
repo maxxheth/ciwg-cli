@@ -323,7 +323,7 @@ func init() {
 	backupCreateCmd.Flags().Bool("prune", false, "After creating backup, delete all old backups except the N most recent (configure N with --remainder)")
 	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --prune (default: 5)")
 	backupCreateCmd.Flags().Bool("clean-aws", false, "Also clean up old backups from AWS S3 when using --prune (default: false, only cleans Minio)")
-	
+
 	// Smart retention flags
 	backupCreateCmd.Flags().Bool("smart-retention", getEnvBoolWithDefault("BACKUP_SMART_RETENTION", false), "Enable date-aware retention (preserves weekly/monthly from daily backups, env: BACKUP_SMART_RETENTION)")
 	backupCreateCmd.Flags().Int("keep-daily", getEnvIntWithDefault("BACKUP_KEEP_DAILY", 14), "Daily backups to keep with smart retention (default: 14, env: BACKUP_KEEP_DAILY)")
@@ -331,7 +331,7 @@ func init() {
 	backupCreateCmd.Flags().Int("keep-monthly", getEnvIntWithDefault("BACKUP_KEEP_MONTHLY", 6), "Monthly backups to keep with smart retention (default: 6, env: BACKUP_KEEP_MONTHLY)")
 	backupCreateCmd.Flags().Int("weekly-day", getEnvIntWithDefault("BACKUP_WEEKLY_DAY", 0), "Day of week for weekly backups, 0=Sunday (default: 0, env: BACKUP_WEEKLY_DAY)")
 	backupCreateCmd.Flags().Int("monthly-day", getEnvIntWithDefault("BACKUP_MONTHLY_DAY", 1), "Day of month for monthly backups (default: 1, env: BACKUP_MONTHLY_DAY)")
-	
+
 	backupCreateCmd.Flags().Bool("respect-capacity-limit", getEnvBoolWithDefault("BACKUP_RESPECT_CAPACITY_LIMIT", false), "Check storage capacity before creating backup (env: BACKUP_RESPECT_CAPACITY_LIMIT)")
 	backupCreateCmd.Flags().Float64("capacity-threshold", getEnvFloat64WithDefault("BACKUP_CAPACITY_THRESHOLD", 95.0), "Storage capacity threshold percentage (default: 95.0, env: BACKUP_CAPACITY_THRESHOLD)")
 	backupCreateCmd.Flags().Bool("include-aws-glacier", getEnvBoolWithDefault("BACKUP_INCLUDE_AWS_GLACIER", false), "Upload backups to AWS Glacier in addition to Minio (env: BACKUP_INCLUDE_AWS_GLACIER)")
@@ -777,7 +777,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 			var toDelete []backup.ObjectInfo
 			if smartRetention != nil && smartRetention.Enabled {
 				toDelete = backupManager.SelectObjectsWithSmartRetention(objs, smartRetention)
-				
+
 				if len(toDelete) == 0 {
 					fmt.Printf("Site %s: Found %d backup(s), all preserved by retention policy\n", siteName, len(objs))
 					continue
