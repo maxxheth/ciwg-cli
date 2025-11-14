@@ -323,6 +323,15 @@ func init() {
 	backupCreateCmd.Flags().Bool("prune", false, "After creating backup, delete all old backups except the N most recent (configure N with --remainder)")
 	backupCreateCmd.Flags().Int("remainder", 5, "Number of most recent backups to keep when using --prune (default: 5)")
 	backupCreateCmd.Flags().Bool("clean-aws", false, "Also clean up old backups from AWS S3 when using --prune (default: false, only cleans Minio)")
+	
+	// Smart retention flags
+	backupCreateCmd.Flags().Bool("smart-retention", getEnvBoolWithDefault("BACKUP_SMART_RETENTION", false), "Enable date-aware retention (preserves weekly/monthly from daily backups, env: BACKUP_SMART_RETENTION)")
+	backupCreateCmd.Flags().Int("keep-daily", getEnvIntWithDefault("BACKUP_KEEP_DAILY", 14), "Daily backups to keep with smart retention (default: 14, env: BACKUP_KEEP_DAILY)")
+	backupCreateCmd.Flags().Int("keep-weekly", getEnvIntWithDefault("BACKUP_KEEP_WEEKLY", 26), "Weekly backups to keep with smart retention (default: 26, env: BACKUP_KEEP_WEEKLY)")
+	backupCreateCmd.Flags().Int("keep-monthly", getEnvIntWithDefault("BACKUP_KEEP_MONTHLY", 6), "Monthly backups to keep with smart retention (default: 6, env: BACKUP_KEEP_MONTHLY)")
+	backupCreateCmd.Flags().Int("weekly-day", getEnvIntWithDefault("BACKUP_WEEKLY_DAY", 0), "Day of week for weekly backups, 0=Sunday (default: 0, env: BACKUP_WEEKLY_DAY)")
+	backupCreateCmd.Flags().Int("monthly-day", getEnvIntWithDefault("BACKUP_MONTHLY_DAY", 1), "Day of month for monthly backups (default: 1, env: BACKUP_MONTHLY_DAY)")
+	
 	backupCreateCmd.Flags().Bool("respect-capacity-limit", getEnvBoolWithDefault("BACKUP_RESPECT_CAPACITY_LIMIT", false), "Check storage capacity before creating backup (env: BACKUP_RESPECT_CAPACITY_LIMIT)")
 	backupCreateCmd.Flags().Float64("capacity-threshold", getEnvFloat64WithDefault("BACKUP_CAPACITY_THRESHOLD", 95.0), "Storage capacity threshold percentage (default: 95.0, env: BACKUP_CAPACITY_THRESHOLD)")
 	backupCreateCmd.Flags().Bool("include-aws-glacier", getEnvBoolWithDefault("BACKUP_INCLUDE_AWS_GLACIER", false), "Upload backups to AWS Glacier in addition to Minio (env: BACKUP_INCLUDE_AWS_GLACIER)")
@@ -663,6 +672,25 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 	estimateMethod := mustGetStringFlag(cmd, "estimate-method")
 	sampleSize, _ := cmd.Flags().GetInt64("sample-size")
 
+	// Parse smart retention options
+	var smartRetention *backup.SmartRetentionPolicy
+	if mustGetBoolFlag(cmd, "smart-retention") {
+		keepDaily, _ := cmd.Flags().GetInt("keep-daily")
+		keepWeekly, _ := cmd.Flags().GetInt("keep-weekly")
+		keepMonthly, _ := cmd.Flags().GetInt("keep-monthly")
+		weeklyDay, _ := cmd.Flags().GetInt("weekly-day")
+		monthlyDay, _ := cmd.Flags().GetInt("monthly-day")
+
+		smartRetention = &backup.SmartRetentionPolicy{
+			Enabled:     true,
+			KeepDaily:   keepDaily,
+			KeepWeekly:  keepWeekly,
+			KeepMonthly: keepMonthly,
+			WeeklyDay:   weeklyDay,
+			MonthlyDay:  monthlyDay,
+		}
+	}
+
 	options := &backup.BackupOptions{
 		DryRun:               mustGetBoolFlag(cmd, "dry-run"),
 		Delete:               mustGetBoolFlag(cmd, "delete"),
@@ -683,6 +711,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		IncludeAWSGlacier:    mustGetBoolFlag(cmd, "include-aws-glacier"),
 		EstimateMethod:       estimateMethod,
 		SampleSize:           sampleSize,
+		SmartRetention:       smartRetention,
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
@@ -704,10 +733,18 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 
 		cleanAWS := mustGetBoolFlag(cmd, "clean-aws")
 
-		if cleanAWS && awsConfig != nil && awsConfig.Vault != "" {
-			fmt.Printf("\n--- Pruning old backups from Minio and AWS Glacier (keeping %d most recent) ---\n", remainder)
+		// Display pruning strategy
+		if smartRetention != nil && smartRetention.Enabled {
+			fmt.Printf("\n--- Smart Retention Pruning (daily=%d, weekly=%d, monthly=%d) ---\n",
+				smartRetention.KeepDaily, smartRetention.KeepWeekly, smartRetention.KeepMonthly)
+			fmt.Printf("Weekly backups: every %s | Monthly backups: day %d of month\n",
+				time.Weekday(smartRetention.WeeklyDay), smartRetention.MonthlyDay)
 		} else {
-			fmt.Printf("\n--- Pruning old backups from Minio (keeping %d most recent) ---\n", remainder)
+			if cleanAWS && awsConfig != nil && awsConfig.Vault != "" {
+				fmt.Printf("\n--- Pruning old backups from Minio and AWS Glacier (keeping %d most recent) ---\n", remainder)
+			} else {
+				fmt.Printf("\n--- Pruning old backups from Minio (keeping %d most recent) ---\n", remainder)
+			}
 		}
 
 		// For each container that was backed up, clean up old backups
@@ -736,19 +773,32 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 				continue
 			}
 
-			if len(objs) <= remainder {
-				fmt.Printf("Site %s: Found %d backup(s), keeping all\n", siteName, len(objs))
-				continue
+			// Use smart retention or simple retention based on configuration
+			var toDelete []backup.ObjectInfo
+			if smartRetention != nil && smartRetention.Enabled {
+				toDelete = backupManager.SelectObjectsWithSmartRetention(objs, smartRetention)
+				
+				if len(toDelete) == 0 {
+					fmt.Printf("Site %s: Found %d backup(s), all preserved by retention policy\n", siteName, len(objs))
+					continue
+				}
+
+				fmt.Printf("Site %s: Found %d backup(s), preserving backups per policy, deleting %d older backup(s)\n",
+					siteName, len(objs), len(toDelete))
+			} else {
+				if len(objs) <= remainder {
+					fmt.Printf("Site %s: Found %d backup(s), keeping all\n", siteName, len(objs))
+					continue
+				}
+
+				toDelete = backupManager.SelectObjectsForOverwrite(objs, remainder)
+				if len(toDelete) == 0 {
+					continue
+				}
+
+				fmt.Printf("Site %s: Found %d backup(s), keeping %d most recent, deleting %d older backup(s)\n",
+					siteName, len(objs), remainder, len(toDelete))
 			}
-
-			toDelete := backupManager.SelectObjectsForOverwrite(objs, remainder)
-			if len(toDelete) == 0 {
-				continue
-			}
-
-			fmt.Printf("Site %s: Found %d backup(s), keeping %d most recent, deleting %d older backup(s)\n",
-				siteName, len(objs), remainder, len(toDelete))
-
 			var deleteKeys []string
 			for _, o := range toDelete {
 				deleteKeys = append(deleteKeys, o.Key)
