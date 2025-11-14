@@ -145,6 +145,8 @@ type BackupOptions struct {
 	DatabaseUser string
 	// RespectCapacityLimit checks storage capacity before creating backups
 	RespectCapacityLimit bool
+	// CapacityThreshold is the percentage threshold for capacity checks (default 95.0)
+	CapacityThreshold float64
 	// IncludeAWSGlacier enables uploading backups to AWS Glacier in addition to Minio
 	IncludeAWSGlacier bool
 	// EstimateMethod specifies compression estimation for dry-run: "heuristic", "sample", or "accurate"
@@ -193,6 +195,89 @@ var DefaultLicenseKeysToRemove = []string{
 	"_transient_rg_gforms_license",
 	"_transient_timeout_uael_license_status",
 	"_transient_timeout_astra-addon_license_status",
+}
+
+// CapacityEstimateOptions contains parameters for capacity estimation
+type CapacityEstimateOptions struct {
+	// Retention policy
+	DailyRetention   int
+	WeeklyRetention  int
+	MonthlyRetention int
+
+	// Growth modeling
+	GrowthRate       float64 // Monthly growth percentage
+	ProjectionMonths int
+	BufferPercent    float64
+
+	// Cost parameters
+	GlacierPricePerGB   float64 // Per GB per month
+	RetrievalPricePerGB float64
+
+	// Baseline data (one of these will be set)
+	AvgCompressedSize int64 // Manual input in bytes
+	SiteCount         int
+}
+
+// SiteEstimate represents capacity estimates for a single site
+type SiteEstimate struct {
+	SiteName         string  `json:"site_name"`
+	UncompressedSize int64   `json:"uncompressed_size"`
+	CompressedSize   int64   `json:"compressed_size"`
+	CompressionRatio float64 `json:"compression_ratio"`
+	HotStorageSize   int64   `json:"hot_storage_size"`  // Daily backups in Minio
+	ColdStorageSize  int64   `json:"cold_storage_size"` // Weekly+Monthly in Glacier
+	TotalStorageSize int64   `json:"total_storage_size"`
+}
+
+// CapacityEstimate represents the complete capacity estimation results
+type CapacityEstimate struct {
+	// Input parameters
+	EstimationMethod string `json:"estimation_method"`
+	SitesScanned     int    `json:"sites_scanned"`
+
+	// Retention policy
+	DailyRetention      int `json:"daily_retention"`
+	WeeklyRetention     int `json:"weekly_retention"`
+	MonthlyRetention    int `json:"monthly_retention"`
+	TotalBackupsPerSite int `json:"total_backups_per_site"`
+
+	// Baseline measurements
+	AvgUncompressedSize int64   `json:"avg_uncompressed_size"`
+	AvgCompressedSize   int64   `json:"avg_compressed_size"`
+	AvgCompressionRatio float64 `json:"avg_compression_ratio"`
+
+	// Per-site storage requirements
+	PerSiteHotStorage   int64 `json:"per_site_hot_storage"`
+	PerSiteColdStorage  int64 `json:"per_site_cold_storage"`
+	PerSiteTotalStorage int64 `json:"per_site_total_storage"`
+
+	// Fleet-wide storage requirements
+	FleetHotStorage   int64 `json:"fleet_hot_storage"`
+	FleetColdStorage  int64 `json:"fleet_cold_storage"`
+	FleetTotalStorage int64 `json:"fleet_total_storage"`
+
+	// With buffer
+	FleetTotalWithBuffer int64   `json:"fleet_total_with_buffer"`
+	BufferPercent        float64 `json:"buffer_percent"`
+
+	// Growth projections (if enabled)
+	GrowthProjections []GrowthProjection `json:"growth_projections,omitempty"`
+
+	// Cost estimates (if enabled)
+	MonthlyCost        float64 `json:"monthly_cost,omitempty"`
+	RetrievalCost10Pct float64 `json:"retrieval_cost_10pct,omitempty"`
+
+	// Per-site details
+	Sites []SiteEstimate `json:"sites,omitempty"`
+}
+
+// GrowthProjection represents storage projections at a specific month
+type GrowthProjection struct {
+	Month          int     `json:"month"`
+	TotalStorageGB float64 `json:"total_storage_gb"`
+	HotStorageGB   float64 `json:"hot_storage_gb"`
+	ColdStorageGB  float64 `json:"cold_storage_gb"`
+	MonthlyCost    float64 `json:"monthly_cost,omitempty"`
 }
 
 type BackupManager struct {
@@ -1007,6 +1092,14 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 		if err := bm.initAWSClient(); err != nil {
 			return fmt.Errorf("failed to initialize AWS Glacier client: %w", err)
 		}
+
+		// Clean up any stale glacier temp files from previous runs before starting
+		tmpDir := os.TempDir()
+		if deleted, err := cleanupGlacierTempFiles(tmpDir); err != nil {
+			fmt.Printf("⚠️  Warning: Failed to cleanup old glacier temp files: %v\n", err)
+		} else if deleted > 0 {
+			fmt.Printf("🧹 Cleaned up %d stale glacier temp file(s) from previous runs\n", deleted)
+		}
 	}
 
 	ctx := context.Background()
@@ -1300,6 +1393,12 @@ func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold
 func (bm *BackupManager) CreateBackups(options *BackupOptions) error {
 	// Check capacity if RespectCapacityLimit is enabled
 	if options.RespectCapacityLimit {
+		// Default threshold to 95% if not specified
+		threshold := options.CapacityThreshold
+		if threshold <= 0 {
+			threshold = 95.0
+		}
+
 		storagePath := "/" // Default to root filesystem
 		if bm.minioConfig.Endpoint != "" {
 			// Try to infer storage path from Minio endpoint if it's a local path
@@ -1312,11 +1411,11 @@ func (bm *BackupManager) CreateBackups(options *BackupOptions) error {
 			return fmt.Errorf("failed to check storage capacity: %w", err)
 		}
 
-		if capacity.UsedPercent > 95.0 {
-			return fmt.Errorf("storage capacity exceeds 95%% (current: %.1f%%). Cannot create backup. Please run 'backup monitor' to free up space", capacity.UsedPercent)
+		if capacity.UsedPercent > threshold {
+			return fmt.Errorf("storage capacity exceeds %.1f%% (current: %.1f%%). Cannot create backup. Please run 'backup monitor' to free up space", threshold, capacity.UsedPercent)
 		}
 
-		fmt.Printf("Storage capacity check passed: %.1f%% used (threshold: 95%%)\n", capacity.UsedPercent)
+		fmt.Printf("✓ Storage capacity check passed: %.1f%% used (threshold: %.1f%%)\n", capacity.UsedPercent, threshold)
 	}
 
 	if err := bm.initMinioClient(); err != nil {
@@ -1575,6 +1674,7 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 		fmt.Printf("[DRY RUN] Would create and stream tarball %s to Minio\n", backupName)
 
 		// Estimate compressed size if method specified
+		var estimatedCompressed int64
 		if options.EstimateMethod != "" {
 			fmt.Printf("\n[DRY RUN] Estimating compressed size using '%s' method...\n", options.EstimateMethod)
 			startTime := time.Now()
@@ -1591,6 +1691,7 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 			if err != nil {
 				fmt.Printf("[DRY RUN] ⚠️  Estimation failed: %v\n", err)
 			} else {
+				estimatedCompressed = compressedSize
 				compressedMB := float64(compressedSize) / (1024 * 1024)
 				uncompressedMB := float64(uncompressedSize) / (1024 * 1024)
 				ratio := 0.0
@@ -1622,7 +1723,7 @@ func (bm *BackupManager) processContainer(container ContainerInfo, options *Back
 			fmt.Printf("[DRY RUN] Would remove directory %s\n", container.WorkingDir)
 		}
 		fmt.Printf("Done with %s\n\n", container.Name)
-		return 0, false, nil
+		return estimatedCompressed, false, nil
 	}
 
 	// Run pre-backup commands if specified
@@ -3121,4 +3222,298 @@ func (bm *BackupManager) estimateAccurate(workingDir, parentDir string) (int64, 
 	}
 
 	return counter.written, nil
+}
+
+// EstimateCapacityFromScan scans containers and estimates storage capacity requirements
+func (bm *BackupManager) EstimateCapacityFromScan(containers []ContainerInfo, estimateMethod string, sampleSize int64, options *CapacityEstimateOptions) (*CapacityEstimate, error) {
+	if len(containers) == 0 {
+		return nil, fmt.Errorf("no containers provided")
+	}
+
+	result := &CapacityEstimate{
+		EstimationMethod:    estimateMethod,
+		SitesScanned:        len(containers),
+		DailyRetention:      options.DailyRetention,
+		WeeklyRetention:     options.WeeklyRetention,
+		MonthlyRetention:    options.MonthlyRetention,
+		TotalBackupsPerSite: options.DailyRetention + options.WeeklyRetention + options.MonthlyRetention,
+		BufferPercent:       options.BufferPercent,
+		Sites:               make([]SiteEstimate, 0, len(containers)),
+	}
+
+	var totalCompressed int64
+	var totalUncompressed int64
+
+	// Show method warning if using accurate method over SSH
+	if estimateMethod == "accurate" && bm.sshClient != nil {
+		fmt.Printf("⚠️  Using 'accurate' method over SSH - this will take several minutes per site.\n")
+		fmt.Printf("   Consider using 'heuristic' (~instant) or 'sample' (~5-10 sec/site) for faster estimates.\n\n")
+	}
+
+	fmt.Printf("Scanning %d container(s)...\n", len(containers))
+	startTime := time.Now()
+
+	for i, container := range containers {
+		containerStart := time.Now()
+		fmt.Printf("  [%d/%d] Analyzing %s...\n", i+1, len(containers), container.Name)
+
+		// Estimate compressed size for this container
+		compressedSize, uncompressedSize, err := bm.EstimateCompressedSize(
+			container.WorkingDir,
+			"", // parentDir not needed for estimation
+			estimateMethod,
+			sampleSize,
+		)
+
+		containerDuration := time.Since(containerStart)
+
+		if err != nil {
+			fmt.Printf("    ⚠️  Warning: Could not estimate %s: %v\n", container.Name, err)
+			continue
+		}
+
+		compressionRatio := 0.0
+		if uncompressedSize > 0 {
+			compressionRatio = (1.0 - float64(compressedSize)/float64(uncompressedSize)) * 100
+		}
+
+		siteEst := SiteEstimate{
+			SiteName:         filepath.Base(container.WorkingDir),
+			UncompressedSize: uncompressedSize,
+			CompressedSize:   compressedSize,
+			CompressionRatio: compressionRatio,
+		}
+
+		// Calculate storage requirements
+		siteEst.HotStorageSize = compressedSize * int64(options.DailyRetention)
+		siteEst.ColdStorageSize = compressedSize * int64(options.WeeklyRetention+options.MonthlyRetention)
+		siteEst.TotalStorageSize = siteEst.HotStorageSize + siteEst.ColdStorageSize
+
+		result.Sites = append(result.Sites, siteEst)
+		totalCompressed += compressedSize
+		totalUncompressed += uncompressedSize
+
+		// Show timing and ETA
+		avgTimePerSite := time.Since(startTime) / time.Duration(i+1)
+		remaining := len(containers) - (i + 1)
+		eta := avgTimePerSite * time.Duration(remaining)
+
+		fmt.Printf("    Compressed: %.2f MB, Uncompressed: %.2f MB (%.1f%% saved) [took %s]\n",
+			float64(compressedSize)/(1024*1024),
+			float64(uncompressedSize)/(1024*1024),
+			compressionRatio,
+			containerDuration.Round(time.Second))
+
+		if remaining > 0 {
+			fmt.Printf("    ⏱️  Avg: %s/site, ETA: %s for %d remaining\n",
+				avgTimePerSite.Round(time.Second),
+				eta.Round(time.Second),
+				remaining)
+		}
+	}
+
+	if len(result.Sites) == 0 {
+		return nil, fmt.Errorf("no sites successfully analyzed")
+	}
+
+	totalDuration := time.Since(startTime)
+	fmt.Printf("\n✅ Scan complete in %s (avg %s/site)\n\n",
+		totalDuration.Round(time.Second),
+		(totalDuration / time.Duration(len(result.Sites))).Round(time.Second))
+
+	// Calculate averages
+	result.AvgCompressedSize = totalCompressed / int64(len(result.Sites))
+	result.AvgUncompressedSize = totalUncompressed / int64(len(result.Sites))
+	if result.AvgUncompressedSize > 0 {
+		result.AvgCompressionRatio = (1.0 - float64(result.AvgCompressedSize)/float64(result.AvgUncompressedSize)) * 100
+	}
+
+	// Calculate per-site storage
+	result.PerSiteHotStorage = result.AvgCompressedSize * int64(options.DailyRetention)
+	result.PerSiteColdStorage = result.AvgCompressedSize * int64(options.WeeklyRetention+options.MonthlyRetention)
+	result.PerSiteTotalStorage = result.PerSiteHotStorage + result.PerSiteColdStorage
+
+	// Calculate fleet-wide storage
+	result.FleetHotStorage = result.PerSiteHotStorage * int64(result.SitesScanned)
+	result.FleetColdStorage = result.PerSiteColdStorage * int64(result.SitesScanned)
+	result.FleetTotalStorage = result.FleetHotStorage + result.FleetColdStorage
+
+	// Add buffer
+	result.FleetTotalWithBuffer = int64(float64(result.FleetTotalStorage) * (1.0 + options.BufferPercent/100.0))
+
+	// Calculate growth projections if growth rate specified
+	if options.GrowthRate > 0 && options.ProjectionMonths > 0 {
+		result.GrowthProjections = calculateGrowthProjections(
+			result.FleetHotStorage,
+			result.FleetColdStorage,
+			options.GrowthRate,
+			options.ProjectionMonths,
+			options.GlacierPricePerGB,
+		)
+	}
+
+	// Calculate costs if price specified
+	if options.GlacierPricePerGB > 0 {
+		coldStorageGB := float64(result.FleetColdStorage) / (1024 * 1024 * 1024)
+		result.MonthlyCost = coldStorageGB * options.GlacierPricePerGB
+
+		if options.RetrievalPricePerGB > 0 {
+			// Assume 10% monthly retrieval rate
+			result.RetrievalCost10Pct = coldStorageGB * 0.10 * options.RetrievalPricePerGB
+		}
+	}
+
+	return result, nil
+}
+
+// EstimateCapacityFromManual creates capacity estimate from manual input
+func (bm *BackupManager) EstimateCapacityFromManual(avgCompressedSize int64, siteCount int, options *CapacityEstimateOptions) (*CapacityEstimate, error) {
+	result := &CapacityEstimate{
+		EstimationMethod:    "manual",
+		SitesScanned:        siteCount,
+		DailyRetention:      options.DailyRetention,
+		WeeklyRetention:     options.WeeklyRetention,
+		MonthlyRetention:    options.MonthlyRetention,
+		TotalBackupsPerSite: options.DailyRetention + options.WeeklyRetention + options.MonthlyRetention,
+		AvgCompressedSize:   avgCompressedSize,
+		BufferPercent:       options.BufferPercent,
+	}
+
+	// Calculate per-site storage
+	result.PerSiteHotStorage = avgCompressedSize * int64(options.DailyRetention)
+	result.PerSiteColdStorage = avgCompressedSize * int64(options.WeeklyRetention+options.MonthlyRetention)
+	result.PerSiteTotalStorage = result.PerSiteHotStorage + result.PerSiteColdStorage
+
+	// Calculate fleet-wide storage
+	result.FleetHotStorage = result.PerSiteHotStorage * int64(siteCount)
+	result.FleetColdStorage = result.PerSiteColdStorage * int64(siteCount)
+	result.FleetTotalStorage = result.FleetHotStorage + result.FleetColdStorage
+
+	// Add buffer
+	result.FleetTotalWithBuffer = int64(float64(result.FleetTotalStorage) * (1.0 + options.BufferPercent/100.0))
+
+	// Calculate growth projections if growth rate specified
+	if options.GrowthRate > 0 && options.ProjectionMonths > 0 {
+		result.GrowthProjections = calculateGrowthProjections(
+			result.FleetHotStorage,
+			result.FleetColdStorage,
+			options.GrowthRate,
+			options.ProjectionMonths,
+			options.GlacierPricePerGB,
+		)
+	}
+
+	// Calculate costs if price specified
+	if options.GlacierPricePerGB > 0 {
+		coldStorageGB := float64(result.FleetColdStorage) / (1024 * 1024 * 1024)
+		result.MonthlyCost = coldStorageGB * options.GlacierPricePerGB
+
+		if options.RetrievalPricePerGB > 0 {
+			result.RetrievalCost10Pct = coldStorageGB * 0.10 * options.RetrievalPricePerGB
+		}
+	}
+
+	return result, nil
+}
+
+// EstimateCapacityFromBackup analyzes an existing backup to estimate capacity
+func (bm *BackupManager) EstimateCapacityFromBackup(backupKey string, siteCount int, options *CapacityEstimateOptions) (*CapacityEstimate, error) {
+	if err := bm.initMinioClient(); err != nil {
+		return nil, fmt.Errorf("failed to initialize Minio client: %w", err)
+	}
+
+	// Get backup size
+	objs, err := bm.ListBackups(backupKey, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get backup info: %w", err)
+	}
+
+	if len(objs) == 0 {
+		return nil, fmt.Errorf("backup not found: %s", backupKey)
+	}
+
+	backup := objs[0]
+	if backup.Key != backupKey {
+		return nil, fmt.Errorf("backup not found: %s (found: %s)", backupKey, backup.Key)
+	}
+
+	result := &CapacityEstimate{
+		EstimationMethod:    "from-backup",
+		SitesScanned:        siteCount,
+		DailyRetention:      options.DailyRetention,
+		WeeklyRetention:     options.WeeklyRetention,
+		MonthlyRetention:    options.MonthlyRetention,
+		TotalBackupsPerSite: options.DailyRetention + options.WeeklyRetention + options.MonthlyRetention,
+		AvgCompressedSize:   backup.Size,
+		BufferPercent:       options.BufferPercent,
+	}
+
+	// Calculate per-site storage
+	result.PerSiteHotStorage = backup.Size * int64(options.DailyRetention)
+	result.PerSiteColdStorage = backup.Size * int64(options.WeeklyRetention+options.MonthlyRetention)
+	result.PerSiteTotalStorage = result.PerSiteHotStorage + result.PerSiteColdStorage
+
+	// Calculate fleet-wide storage
+	result.FleetHotStorage = result.PerSiteHotStorage * int64(siteCount)
+	result.FleetColdStorage = result.PerSiteColdStorage * int64(siteCount)
+	result.FleetTotalStorage = result.FleetHotStorage + result.FleetColdStorage
+
+	// Add buffer
+	result.FleetTotalWithBuffer = int64(float64(result.FleetTotalStorage) * (1.0 + options.BufferPercent/100.0))
+
+	// Calculate growth projections if growth rate specified
+	if options.GrowthRate > 0 && options.ProjectionMonths > 0 {
+		result.GrowthProjections = calculateGrowthProjections(
+			result.FleetHotStorage,
+			result.FleetColdStorage,
+			options.GrowthRate,
+			options.ProjectionMonths,
+			options.GlacierPricePerGB,
+		)
+	}
+
+	// Calculate costs if price specified
+	if options.GlacierPricePerGB > 0 {
+		coldStorageGB := float64(result.FleetColdStorage) / (1024 * 1024 * 1024)
+		result.MonthlyCost = coldStorageGB * options.GlacierPricePerGB
+
+		if options.RetrievalPricePerGB > 0 {
+			result.RetrievalCost10Pct = coldStorageGB * 0.10 * options.RetrievalPricePerGB
+		}
+	}
+
+	return result, nil
+}
+
+// calculateGrowthProjections computes storage growth over time
+func calculateGrowthProjections(hotStorage, coldStorage int64, growthRate float64, months int, glacierPrice float64) []GrowthProjection {
+	projections := make([]GrowthProjection, 0, months)
+
+	currentTotal := float64(hotStorage + coldStorage)
+	growthMultiplier := 1.0 + (growthRate / 100.0)
+
+	for month := 1; month <= months; month++ {
+		currentTotal *= growthMultiplier
+		totalGB := currentTotal / (1024 * 1024 * 1024)
+
+		// Assume same hot/cold ratio
+		ratio := float64(coldStorage) / float64(hotStorage+coldStorage)
+		coldGB := totalGB * ratio
+		hotGB := totalGB * (1.0 - ratio)
+
+		projection := GrowthProjection{
+			Month:          month,
+			TotalStorageGB: totalGB,
+			HotStorageGB:   hotGB,
+			ColdStorageGB:  coldGB,
+		}
+
+		if glacierPrice > 0 {
+			projection.MonthlyCost = coldGB * glacierPrice
+		}
+
+		projections = append(projections, projection)
+	}
+
+	return projections
 }
