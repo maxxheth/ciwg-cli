@@ -160,12 +160,12 @@ type BackupOptions struct {
 // SmartRetentionPolicy defines intelligent backup retention based on backup dates
 // Allows preserving weekly and monthly backups from a single daily backup job
 type SmartRetentionPolicy struct {
-	Enabled      bool // Enable smart retention (vs simple "keep N most recent")
-	KeepDaily    int  // Number of daily backups to keep (default: 14)
-	KeepWeekly   int  // Number of weekly backups to keep (default: 26)
-	KeepMonthly  int  // Number of monthly backups to keep (default: 6)
-	WeeklyDay    int  // Day of week for weekly backups, 0=Sunday (default: 0)
-	MonthlyDay   int  // Day of month for monthly backups (default: 1)
+	Enabled     bool // Enable smart retention (vs simple "keep N most recent")
+	KeepDaily   int  // Number of daily backups to keep (default: 14)
+	KeepWeekly  int  // Number of weekly backups to keep (default: 26)
+	KeepMonthly int  // Number of monthly backups to keep (default: 6)
+	WeeklyDay   int  // Day of week for weekly backups, 0=Sunday (default: 0)
+	MonthlyDay  int  // Day of month for monthly backups (default: 1)
 }
 
 // SanitizeOptions contains options for sanitizing backup tarballs
@@ -2506,7 +2506,7 @@ func (bm *BackupManager) SelectObjectsWithSmartRetention(objs []ObjectInfo, poli
 
 	// Classify backups into categories
 	type classifiedBackup struct {
-		obj      ObjectInfo
+		obj       ObjectInfo
 		isDaily   bool
 		isWeekly  bool
 		isMonthly bool
