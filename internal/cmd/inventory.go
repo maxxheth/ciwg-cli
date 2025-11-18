@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ciwg-cli/internal/auth"
@@ -37,13 +38,52 @@ var (
 
 	// new flag: produce per-server site counts from existing inventory JSON
 	inventoryGetQty bool
+
+	// search subcommand flags
+	searchPattern       string
+	searchAction        string
+	searchExec          string
+	searchCaseSensitive bool
+	searchRegex         bool
+	searchMaxDepth      int
+	searchGetIPAddr     bool
 )
 
 var inventoryCmd = &cobra.Command{
 	Use:   "inventory",
+	Short: "Manage WordPress container inventory",
+	Long:  `Generate, search, and manage inventory of WordPress sites with their domains, URLs, and server information.`,
+}
+
+var inventoryGenerateCmd = &cobra.Command{
+	Use:   "generate [user@]host",
 	Short: "Generate inventory of WordPress containers",
 	Long:  `Scan Docker containers and generate an inventory of WordPress sites with their domains, URLs, and server information.`,
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runInventoryGenerate,
+}
+
+var inventorySearchCmd = &cobra.Command{
+	Use:   "search PATTERN",
+	Short: "Search for WordPress sites matching a pattern across servers",
+	Long: `Search for WordPress site directories matching a pattern across one or more servers.
+Supports wildcards, regex, and various output formats.
+
+Examples:
+  # Search for sites containing "example"
+  ciwg inventory search "example" --server-range="wp%d.ciwgserver.com:0-41"
+  
+  # Search with regex
+  ciwg inventory search ".*\.dev$" --regex --server-range="wp%d.ciwgserver.com:0-10"
+  
+  # Search and list containers
+  ciwg inventory search "acomfort" --server-range="wp%d.ciwgserver.com:0-41" --action="list-containers"
+  
+  # Search and execute custom command
+  ciwg inventory search "mysite" --server-range="wp%d.ciwgserver.com:0-5" --exec="docker ps"
+`,
+	Args: cobra.ExactArgs(1),
+	RunE: runInventorySearch,
 }
 
 // var inventoryGenerateCmd = &cobra.Command{
@@ -54,25 +94,43 @@ var inventoryCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(inventoryCmd)
-	// inventoryCmd.AddCommand(inventoryGenerateCmd)
+	inventoryCmd.AddCommand(inventoryGenerateCmd)
+	inventoryCmd.AddCommand(inventorySearchCmd)
 
-	// Inventory specific flags
-	inventoryCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "inventory.json", "Output file for inventory")
-	inventoryCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
-	inventoryCmd.Flags().BoolVar(&inventoryLocal, "local", false, "Run locally without SSH")
-	inventoryCmd.Flags().StringVar(&inventoryFormat, "format", "json", "Export format (json or csv)")
-	inventoryCmd.Flags().StringVar(&inventoryFilterSite, "filter-by-site", "", "Filter by site list (file path, pipe-delimited string, or stdin)")
-	inventoryCmd.Flags().StringVar(&inventoryFilterServer, "filter-by-server", "", "Filter by server list (file path, pipe-delimited string, or stdin)")
+	// Generate command flags
+	inventoryGenerateCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "inventory.json", "Output file for inventory")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
+	inventoryGenerateCmd.Flags().BoolVar(&inventoryLocal, "local", false, "Run locally without SSH")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryFormat, "format", "json", "Export format (json or csv)")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterSite, "filter-by-site", "", "Filter by site list (file path, pipe-delimited string, or stdin)")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterServer, "filter-by-server", "", "Filter by server list (file path, pipe-delimited string, or stdin)")
+	inventoryGenerateCmd.Flags().BoolVar(&inventoryGetQty, "get-qty", false, "Read inventory JSON and output per-server site counts")
 
-	// new flag registration
-	inventoryCmd.Flags().BoolVar(&inventoryGetQty, "get-qty", false, "Read inventory JSON and output per-server site counts")
+	// SSH connection flags for generate
+	inventoryGenerateCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
+	inventoryGenerateCmd.Flags().StringP("port", "p", "22", "SSH port")
+	inventoryGenerateCmd.Flags().StringP("key", "k", "", "Path to SSH private key")
+	inventoryGenerateCmd.Flags().BoolP("agent", "a", true, "Use SSH agent")
+	inventoryGenerateCmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
 
-	// SSH connection flags
-	inventoryCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
-	inventoryCmd.Flags().StringP("port", "p", "22", "SSH port")
-	inventoryCmd.Flags().StringP("key", "k", "", "Path to SSH private key")
-	inventoryCmd.Flags().BoolP("agent", "a", true, "Use SSH agent")
-	inventoryCmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
+	// Search command flags
+	inventorySearchCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
+	inventorySearchCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "", "Output file for search results")
+	inventorySearchCmd.Flags().StringVar(&inventoryFormat, "format", "text", "Output format (text, json, csv)")
+	inventorySearchCmd.Flags().StringVar(&searchAction, "action", "", "Action to perform on matches: list-containers, show-compose, backup")
+	inventorySearchCmd.Flags().StringVar(&searchExec, "exec", "", "Custom command to execute on matched servers")
+	inventorySearchCmd.Flags().BoolVar(&searchCaseSensitive, "case-sensitive", false, "Case-sensitive pattern matching")
+	inventorySearchCmd.Flags().BoolVar(&searchRegex, "regex", false, "Treat pattern as regex")
+	inventorySearchCmd.Flags().IntVar(&searchMaxDepth, "max-depth", 1, "Maximum directory depth to search")
+	inventorySearchCmd.Flags().BoolVar(&inventoryLocal, "local", false, "Search locally without SSH")
+	inventorySearchCmd.Flags().BoolVar(&searchGetIPAddr, "get-ip-addr", false, "Output only IP addresses of servers with matches")
+
+	// SSH connection flags for search
+	inventorySearchCmd.Flags().StringP("user", "u", "", "SSH username (default: current user)")
+	inventorySearchCmd.Flags().StringP("port", "p", "22", "SSH port")
+	inventorySearchCmd.Flags().StringP("key", "k", "", "Path to SSH private key")
+	inventorySearchCmd.Flags().BoolP("agent", "a", true, "Use SSH agent")
+	inventorySearchCmd.Flags().DurationP("timeout", "t", 30*time.Second, "Connection timeout")
 }
 
 func runInventoryGenerate(cmd *cobra.Command, args []string) error {
@@ -556,6 +614,422 @@ func getContainersLocal(hostname, serverIP string) ([]ContainerInfo, error) {
 	}
 
 	return inventory, nil
+}
+
+// SearchResult represents a search match
+type SearchResult struct {
+	Server   string   `json:"server"`
+	Hostname string   `json:"hostname"`
+	IP       string   `json:"ip"`
+	Matches  []string `json:"matches"`
+	Error    string   `json:"error,omitempty"`
+}
+
+func runInventorySearch(cmd *cobra.Command, args []string) error {
+	pattern := args[0]
+
+	if inventoryServerRange == "" && !inventoryLocal {
+		return fmt.Errorf("either --server-range or --local is required")
+	}
+
+	var results []SearchResult
+
+	if inventoryLocal {
+		// Search locally
+		result := searchLocalServer(pattern)
+		results = append(results, result)
+	} else {
+		// Search across server range
+		var err error
+		results, err = searchServers(cmd, pattern, inventoryServerRange)
+		if err != nil {
+			return fmt.Errorf("search failed: %w", err)
+		}
+	}
+
+	// If --get-ip-addr flag is set, output only IP addresses
+	if searchGetIPAddr {
+		return outputIPAddresses(results, inventoryOutputFile)
+	}
+
+	// Execute actions if specified
+	if searchAction != "" || searchExec != "" {
+		for _, result := range results {
+			if len(result.Matches) > 0 && result.Error == "" {
+				if err := executeSearchAction(cmd, result, searchAction, searchExec); err != nil {
+					fmt.Fprintf(os.Stderr, "Error executing action on %s: %v\n", result.Server, err)
+				}
+			}
+		}
+	}
+
+	// Output results
+	return outputSearchResults(results, inventoryFormat, inventoryOutputFile)
+}
+
+func searchServers(cmd *cobra.Command, pattern, serverRange string) ([]SearchResult, error) {
+	patternParsed, start, end, exclusions, err := parseServerRange(serverRange)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server range: %w", err)
+	}
+
+	var results []SearchResult
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Limit concurrent searches
+	semaphore := make(chan struct{}, 10)
+
+	for i := start; i <= end; i++ {
+		if exclusions[i] {
+			continue
+		}
+
+		hostname := fmt.Sprintf(patternParsed, i)
+
+		wg.Add(1)
+		go func(host string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			result := searchRemoteServer(cmd, host, pattern)
+
+			mu.Lock()
+			results = append(results, result)
+			mu.Unlock()
+		}(hostname)
+	}
+
+	wg.Wait()
+
+	// Sort results by server name
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Server < results[j].Server
+	})
+
+	return results, nil
+}
+
+func searchRemoteServer(cmd *cobra.Command, hostname, pattern string) SearchResult {
+	result := SearchResult{
+		Server:  hostname,
+		Matches: []string{},
+	}
+
+	// Create SSH client
+	sshClient, err := createSSHClient(cmd, hostname)
+	if err != nil {
+		result.Error = fmt.Sprintf("SSH connection failed: %v", err)
+		return result
+	}
+	defer sshClient.Close()
+
+	// Get server info
+	serverIP, err := getServerPublicIP(sshClient)
+	if err == nil {
+		result.IP = serverIP
+	}
+
+	hostnameOut, err := getServerHostname(sshClient)
+	if err == nil {
+		result.Hostname = hostnameOut
+	}
+
+	// Build find command
+	searchPath := "/var/opt/sites"
+	findCmd := buildFindCommand(searchPath, pattern, searchMaxDepth, searchCaseSensitive, searchRegex)
+
+	// Execute search
+	stdout, stderr, err := sshClient.ExecuteCommand(findCmd)
+	if err != nil {
+		// Check if it's just "no matches found" vs actual error
+		if !strings.Contains(stderr, "No such file") && stderr != "" {
+			result.Error = fmt.Sprintf("Search failed: %v", err)
+		}
+		return result
+	}
+
+	// Parse matches
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result.Matches = append(result.Matches, line)
+		}
+	}
+
+	return result
+}
+
+func searchLocalServer(pattern string) SearchResult {
+	result := SearchResult{
+		Server:  "localhost",
+		Matches: []string{},
+	}
+
+	// Get local hostname
+	hostname, err := os.Hostname()
+	if err == nil {
+		result.Hostname = hostname
+	}
+
+	// Get local IP
+	ip, err := getLocalServerIP()
+	if err == nil {
+		result.IP = ip
+	}
+
+	// Build find command
+	searchPath := "/var/opt/sites"
+	findCmd := buildFindCommand(searchPath, pattern, searchMaxDepth, searchCaseSensitive, searchRegex)
+
+	// Execute locally
+	out, err := runLocalCommand(findCmd)
+	if err != nil {
+		result.Error = fmt.Sprintf("Search failed: %v", err)
+		return result
+	}
+
+	// Parse matches
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result.Matches = append(result.Matches, line)
+		}
+	}
+
+	return result
+}
+
+func buildFindCommand(searchPath, pattern string, maxDepth int, caseSensitive, regex bool) string {
+	var cmd strings.Builder
+
+	cmd.WriteString(fmt.Sprintf("find %s -maxdepth %d -type d", searchPath, maxDepth))
+
+	if regex {
+		// Use -regex for pattern matching
+		if caseSensitive {
+			cmd.WriteString(fmt.Sprintf(" -regex '.*/%s'", pattern))
+		} else {
+			cmd.WriteString(fmt.Sprintf(" -iregex '.*/%s'", pattern))
+		}
+	} else {
+		// Use -name for wildcard matching
+		if caseSensitive {
+			cmd.WriteString(fmt.Sprintf(" -name '*%s*'", pattern))
+		} else {
+			cmd.WriteString(fmt.Sprintf(" -iname '*%s*'", pattern))
+		}
+	}
+
+	cmd.WriteString(" -print 2>/dev/null")
+
+	return cmd.String()
+}
+
+func executeSearchAction(cmd *cobra.Command, result SearchResult, action, execCmd string) error {
+	// Create SSH client
+	sshClient, err := createSSHClient(cmd, result.Server)
+	if err != nil {
+		return fmt.Errorf("SSH connection failed: %w", err)
+	}
+	defer sshClient.Close()
+
+	fmt.Printf("\n=== Executing action on %s ===\n", result.Server)
+
+	// Execute custom command if specified
+	if execCmd != "" {
+		fmt.Printf("Running: %s\n", execCmd)
+		stdout, stderr, err := sshClient.ExecuteCommand(execCmd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\nStderr: %s\n", err, stderr)
+		} else {
+			fmt.Println(stdout)
+		}
+		return nil
+	}
+
+	// Execute predefined actions
+	switch action {
+	case "list-containers":
+		for _, match := range result.Matches {
+			domain := filepath.Base(match)
+			containerName := fmt.Sprintf("wp_%s", strings.ReplaceAll(domain, ".", "_"))
+
+			fmt.Printf("\nSite: %s\n", domain)
+			fmt.Printf("Path: %s\n", match)
+
+			// Check if container exists and is running
+			checkCmd := fmt.Sprintf("docker ps -a --filter name=%s --format '{{.Names}}\t{{.Status}}'", containerName)
+			stdout, _, err := sshClient.ExecuteCommand(checkCmd)
+			if err == nil && strings.TrimSpace(stdout) != "" {
+				fmt.Printf("Container: %s\n", strings.TrimSpace(stdout))
+			} else {
+				fmt.Printf("Container: Not found or not running\n")
+			}
+		}
+
+	case "show-compose":
+		for _, match := range result.Matches {
+			composePath := filepath.Join(match, "docker-compose.yml")
+			fmt.Printf("\n=== %s ===\n", composePath)
+
+			catCmd := fmt.Sprintf("cat %s 2>/dev/null", composePath)
+			stdout, _, err := sshClient.ExecuteCommand(catCmd)
+			if err == nil {
+				fmt.Println(stdout)
+			} else {
+				fmt.Printf("Error reading docker-compose.yml\n")
+			}
+		}
+
+	case "backup":
+		fmt.Println("Backup action not yet implemented")
+		// TODO: Integrate with existing backup functionality
+
+	default:
+		return fmt.Errorf("unknown action: %s", action)
+	}
+
+	return nil
+}
+
+func outputIPAddresses(results []SearchResult, outputFile string) error {
+	var ips []string
+	seen := make(map[string]bool)
+
+	for _, result := range results {
+		// Only include servers with matches and valid IPs
+		if len(result.Matches) > 0 && result.Error == "" && result.IP != "" {
+			if !seen[result.IP] {
+				ips = append(ips, result.IP)
+				seen[result.IP] = true
+			}
+		}
+	}
+
+	output := strings.Join(ips, "\n")
+	if output != "" {
+		output += "\n"
+	}
+
+	if outputFile != "" {
+		return os.WriteFile(outputFile, []byte(output), 0644)
+	}
+
+	fmt.Print(output)
+	return nil
+}
+
+func outputSearchResults(results []SearchResult, format, outputFile string) error {
+	switch strings.ToLower(format) {
+	case "json":
+		return outputSearchJSON(results, outputFile)
+	case "csv":
+		return outputSearchCSV(results, outputFile)
+	default:
+		return outputSearchText(results, outputFile)
+	}
+}
+
+func outputSearchText(results []SearchResult, outputFile string) error {
+	var output strings.Builder
+
+	totalMatches := 0
+	serversWithMatches := 0
+
+	for _, result := range results {
+		if len(result.Matches) > 0 {
+			serversWithMatches++
+			totalMatches += len(result.Matches)
+
+			output.WriteString(fmt.Sprintf("\n✓ %s", result.Server))
+			if result.Hostname != "" {
+				output.WriteString(fmt.Sprintf(" [%s]", result.Hostname))
+			}
+			if result.IP != "" {
+				output.WriteString(fmt.Sprintf(" (%s)", result.IP))
+			}
+			output.WriteString(fmt.Sprintf(" - %d match(es)\n", len(result.Matches)))
+
+			for _, match := range result.Matches {
+				output.WriteString(fmt.Sprintf("  %s\n", match))
+			}
+		} else if result.Error != "" {
+			output.WriteString(fmt.Sprintf("\n✗ %s - %s\n", result.Server, result.Error))
+		}
+	}
+
+	output.WriteString(fmt.Sprintf("\n\nSummary: %d match(es) found on %d server(s) out of %d checked\n",
+		totalMatches, serversWithMatches, len(results)))
+
+	if outputFile != "" {
+		return os.WriteFile(outputFile, []byte(output.String()), 0644)
+	}
+
+	fmt.Print(output.String())
+	return nil
+}
+
+func outputSearchJSON(results []SearchResult, outputFile string) error {
+	data, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	if outputFile != "" {
+		return os.WriteFile(outputFile, data, 0644)
+	}
+
+	fmt.Println(string(data))
+	return nil
+}
+
+func outputSearchCSV(results []SearchResult, outputFile string) error {
+	var records [][]string
+	records = append(records, []string{"Server", "Hostname", "IP", "Match", "Error"})
+
+	for _, result := range results {
+		if len(result.Matches) > 0 {
+			for _, match := range result.Matches {
+				records = append(records, []string{
+					result.Server,
+					result.Hostname,
+					result.IP,
+					match,
+					"",
+				})
+			}
+		} else {
+			records = append(records, []string{
+				result.Server,
+				result.Hostname,
+				result.IP,
+				"",
+				result.Error,
+			})
+		}
+	}
+
+	var f *os.File
+	var err error
+
+	if outputFile != "" {
+		f, err = os.Create(outputFile)
+		if err != nil {
+			return fmt.Errorf("failed to create CSV file: %w", err)
+		}
+		defer f.Close()
+	} else {
+		f = os.Stdout
+	}
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	return writer.WriteAll(records)
 }
 
 // Parse server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')
