@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -867,14 +866,6 @@ func findDomainsLocal(domainPath string) ([]string, error) {
 	}
 	log(1, "Found %d domains to check in %s", len(domains), domainPath)
 	return domains, nil
-}
-
-func runLocalCommand(cmd string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
-	return string(out), err
 }
 
 // Stub for local backup and removal logic
