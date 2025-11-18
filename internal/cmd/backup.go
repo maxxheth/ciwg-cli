@@ -1923,7 +1923,7 @@ func runBackupEstimateCapacity(cmd *cobra.Command, args []string) error {
 
 		} else {
 			// Server range scan
-			estimate, err = processCapacityEstimateForServerRange(cmd, serverRange, estimateMethod, sampleSize, parentDir, capacityOpts)
+			estimate, err = processCapacityEstimateForServerRange(cmd, serverRange, estimateMethod, sampleSize, parentDir, capacityOpts, outputFormat)
 			if err != nil {
 				return err
 			}
@@ -1947,7 +1947,7 @@ func runBackupEstimateCapacity(cmd *cobra.Command, args []string) error {
 }
 
 // processCapacityEstimateForServerRange handles server range processing
-func processCapacityEstimateForServerRange(cmd *cobra.Command, serverRange, estimateMethod string, sampleSize int64, parentDir string, options *backup.CapacityEstimateOptions) (*backup.CapacityEstimate, error) {
+func processCapacityEstimateForServerRange(cmd *cobra.Command, serverRange, estimateMethod string, sampleSize int64, parentDir string, options *backup.CapacityEstimateOptions, outputFormat string) (*backup.CapacityEstimate, error) {
 	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return nil, err
@@ -1960,7 +1960,12 @@ func processCapacityEstimateForServerRange(cmd *cobra.Command, serverRange, esti
 	successfulServers := 0
 	totalContainers := 0
 
-	fmt.Printf("🌐 Scanning server range: %s\n\n", serverRange)
+	// Suppress progress output for JSON/CSV formats
+	quiet := outputFormat == "json" || outputFormat == "csv"
+
+	if !quiet {
+		fmt.Printf("🌐 Scanning server range: %s\n\n", serverRange)
+	}
 
 	for i := start; i <= end; i++ {
 		if exclusions[i] {
@@ -1969,13 +1974,17 @@ func processCapacityEstimateForServerRange(cmd *cobra.Command, serverRange, esti
 		totalServers++
 
 		hostname := fmt.Sprintf(pattern, i)
-		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-		fmt.Printf("Server: %s\n", hostname)
-		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+		if !quiet {
+			fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+			fmt.Printf("Server: %s\n", hostname)
+			fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+		}
 
 		sshClient, err := createSSHClient(cmd, hostname)
 		if err != nil {
-			fmt.Printf("⚠️  Failed to connect to %s: %v\n\n", hostname, err)
+			if !quiet {
+				fmt.Printf("⚠️  Failed to connect to %s: %v\n\n", hostname, err)
+			}
 			continue
 		}
 
@@ -1985,25 +1994,33 @@ func processCapacityEstimateForServerRange(cmd *cobra.Command, serverRange, esti
 		})
 
 		if err != nil {
-			fmt.Printf("⚠️  Failed to get containers from %s: %v\n\n", hostname, err)
+			if !quiet {
+				fmt.Printf("⚠️  Failed to get containers from %s: %v\n\n", hostname, err)
+			}
 			sshClient.Close()
 			continue
 		}
 
 		if len(containers) == 0 {
-			fmt.Printf("ℹ️  No containers found on %s\n\n", hostname)
+			if !quiet {
+				fmt.Printf("ℹ️  No containers found on %s\n\n", hostname)
+			}
 			sshClient.Close()
 			continue
 		}
 
-		fmt.Printf("Found %d container(s) on %s\n\n", len(containers), hostname)
+		if !quiet {
+			fmt.Printf("Found %d container(s) on %s\n\n", len(containers), hostname)
+		}
 
 		// Scan this server's containers
 		estimate, err := manager.EstimateCapacityFromScan(containers, estimateMethod, sampleSize, options)
 		sshClient.Close()
 
 		if err != nil {
-			fmt.Printf("⚠️  Failed to estimate capacity for %s: %v\n\n", hostname, err)
+			if !quiet {
+				fmt.Printf("⚠️  Failed to estimate capacity for %s: %v\n\n", hostname, err)
+			}
 			continue
 		}
 
@@ -2013,22 +2030,26 @@ func processCapacityEstimateForServerRange(cmd *cobra.Command, serverRange, esti
 		successfulServers++
 
 		// Show server summary
-		fmt.Printf("Server %s Summary:\n", hostname)
-		fmt.Printf("  Sites: %d, Avg compressed: %.2f MB\n",
-			len(estimate.Sites),
-			float64(estimate.AvgCompressedSize)/(1024*1024))
-		fmt.Printf("  Server total: %.2f GB compressed\n\n",
-			float64(estimate.AvgCompressedSize*int64(len(estimate.Sites)))/(1024*1024*1024))
+		if !quiet {
+			fmt.Printf("Server %s Summary:\n", hostname)
+			fmt.Printf("  Sites: %d, Avg compressed: %.2f MB\n",
+				len(estimate.Sites),
+				float64(estimate.AvgCompressedSize)/(1024*1024))
+			fmt.Printf("  Server total: %.2f GB compressed\n\n",
+				float64(estimate.AvgCompressedSize*int64(len(estimate.Sites)))/(1024*1024*1024))
+		}
 	}
 
 	if successfulServers == 0 {
 		return nil, fmt.Errorf("failed to scan any servers (tried %d)", totalServers)
 	}
 
-	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-	fmt.Printf("📊 FLEET-WIDE AGGREGATION\n")
-	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
-	fmt.Printf("Successfully scanned: %d/%d servers, %d total containers\n\n", successfulServers, totalServers, totalContainers)
+	if !quiet {
+		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+		fmt.Printf("📊 FLEET-WIDE AGGREGATION\n")
+		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+		fmt.Printf("Successfully scanned: %d/%d servers, %d total containers\n\n", successfulServers, totalServers, totalContainers)
+	}
 
 	// Aggregate all server estimates into one combined result
 	combinedEstimate := &backup.CapacityEstimate{
