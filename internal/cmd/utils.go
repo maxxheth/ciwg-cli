@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -128,4 +130,12 @@ func getEnvIntWithDefault(key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+func runLocalCommand(cmd string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	return string(out), err
 }
