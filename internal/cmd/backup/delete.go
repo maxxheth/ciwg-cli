@@ -65,8 +65,9 @@ func runBackupDelete(cmd *cobra.Command, args []string) error {
 		toDelete = append(toDelete, objectName)
 	} else if prefix != "" || deleteAll || deleteRange != "" || deleteRangeByDate != "" {
 		limit := 0 // Get all objects for these operations
-		if v, err := cmd.Flags().GetInt("limit"); err == nil && !deleteAll && deleteRange == "" && deleteRangeByDate == "" {
-			limit = v
+		// Only use limit flag if not using delete-all or range operations
+		if !deleteAll && deleteRange == "" && deleteRangeByDate == "" {
+			limit = mustGetIntFlag(cmd, "limit")
 		}
 		objs, err := bm.ListBackups(prefix, limit)
 		if err != nil {

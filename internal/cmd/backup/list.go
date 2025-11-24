@@ -26,9 +26,9 @@ func runBackupList(cmd *cobra.Command, args []string) error {
 	backupManager := backup.NewBackupManager(nil, minioConfig)
 
 	prefix := mustGetStringFlag(cmd, "prefix")
-	limit := 100
-	if v, err := cmd.Flags().GetInt("limit"); err == nil {
-		limit = v
+	limit := mustGetIntFlag(cmd, "limit")
+	if limit == 0 {
+		limit = 100 // default value
 	}
 
 	objs, err := backupManager.ListBackups(prefix, limit)

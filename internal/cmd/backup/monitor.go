@@ -11,13 +11,13 @@ import (
 
 func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	// Parse flags
-	storageServer, _ := cmd.Flags().GetString("storage-server")
-	storagePath, _ := cmd.Flags().GetString("storage-path")
-	threshold, _ := cmd.Flags().GetFloat64("threshold")
-	migratePercent, _ := cmd.Flags().GetFloat64("migrate-percent")
-	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	showMounts, _ := cmd.Flags().GetBool("show-mounts")
-	forceDelete, _ := cmd.Flags().GetBool("force-delete")
+	storageServer := mustGetStringFlag(cmd, "storage-server")
+	storagePath := mustGetStringFlag(cmd, "storage-path")
+	threshold := mustGetFloat64Flag(cmd, "threshold")
+	migratePercent := mustGetFloat64Flag(cmd, "migrate-percent")
+	dryRun := mustGetBoolFlag(cmd, "dry-run")
+	showMounts := mustGetBoolFlag(cmd, "show-mounts")
+	forceDelete := mustGetBoolFlag(cmd, "force-delete")
 
 	// Create SSH client if storage server specified
 	var sshClient *auth.SSHClient

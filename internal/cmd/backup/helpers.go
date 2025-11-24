@@ -51,6 +51,24 @@ func mustGetDurationFlag(cmd *cobra.Command, name string) time.Duration {
 	return val
 }
 
+// mustGetIntFlag gets an int flag value from a cobra command
+func mustGetIntFlag(cmd *cobra.Command, name string) int {
+	val, _ := cmd.Flags().GetInt(name)
+	return val
+}
+
+// mustGetInt64Flag gets an int64 flag value from a cobra command
+func mustGetInt64Flag(cmd *cobra.Command, name string) int64 {
+	val, _ := cmd.Flags().GetInt64(name)
+	return val
+}
+
+// mustGetCountFlag gets a count flag value from a cobra command
+func mustGetCountFlag(cmd *cobra.Command, name string) int {
+	val, _ := cmd.Flags().GetCount(name)
+	return val
+}
+
 // getEnvWithDefault returns the environment variable value or a default
 func getEnvWithDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {

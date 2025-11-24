@@ -21,11 +21,11 @@ func runBackupMigrateAWS(cmd *cobra.Command, args []string) error {
 	dryRun := mustGetBoolFlag(cmd, "dry-run")
 	prefix := mustGetStringFlag(cmd, "prefix")
 	objectKey := mustGetStringFlag(cmd, "object")
-	count, _ := cmd.Flags().GetInt("count")
-	percent, _ := cmd.Flags().GetFloat64("percent")
-	olderThan, _ := cmd.Flags().GetDuration("older-than")
+	count := mustGetIntFlag(cmd, "count")
+	percent := mustGetFloat64Flag(cmd, "percent")
+	olderThan := mustGetDurationFlag(cmd, "older-than")
 	deleteAfter := mustGetBoolFlag(cmd, "delete-after")
-	limit, _ := cmd.Flags().GetInt("limit")
+	limit := mustGetIntFlag(cmd, "limit")
 
 	// Validate mutually exclusive flags
 	strategyCount := 0

@@ -21,7 +21,7 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
 		}
 	}
-	serverRange, _ := cmd.Flags().GetString("server-range")
+	serverRange := mustGetStringFlag(cmd, "server-range")
 
 	// Validate Minio configuration
 	minioConfig, err := getMinioConfig(cmd)
@@ -94,8 +94,8 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 	}
 
 	// Set verbosity level
-	logLevel, _ := cmd.Flags().GetInt("log-level")
-	vflag, _ := cmd.Flags().GetCount("vflag")
+	logLevel := mustGetIntFlag(cmd, "log-level")
+	vflag := mustGetCountFlag(cmd, "vflag")
 	verbosity := logLevel
 	if vflag > 0 {
 		verbosity = 1 + vflag // -v=2, -vv=3, -vvv=4, -vvvv=5
@@ -114,16 +114,16 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 
 	// Get backup options from flags
 	estimateMethod := mustGetStringFlag(cmd, "estimate-method")
-	sampleSize, _ := cmd.Flags().GetInt64("sample-size")
+	sampleSize := mustGetInt64Flag(cmd, "sample-size")
 
 	// Parse smart retention options
 	var smartRetention *backup.SmartRetentionPolicy
 	if mustGetBoolFlag(cmd, "smart-retention") {
-		keepDaily, _ := cmd.Flags().GetInt("keep-daily")
-		keepWeekly, _ := cmd.Flags().GetInt("keep-weekly")
-		keepMonthly, _ := cmd.Flags().GetInt("keep-monthly")
-		weeklyDay, _ := cmd.Flags().GetInt("weekly-day")
-		monthlyDay, _ := cmd.Flags().GetInt("monthly-day")
+		keepDaily := mustGetIntFlag(cmd, "keep-daily")
+		keepWeekly := mustGetIntFlag(cmd, "keep-weekly")
+		keepMonthly := mustGetIntFlag(cmd, "keep-monthly")
+		weeklyDay := mustGetIntFlag(cmd, "weekly-day")
+		monthlyDay := mustGetIntFlag(cmd, "monthly-day")
 
 		smartRetention = &backup.SmartRetentionPolicy{
 			Enabled:     true,
@@ -167,9 +167,9 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 	// Handle prune mode: clean up old backups
 	prune := mustGetBoolFlag(cmd, "prune")
 	if prune {
-		remainder := 5
-		if v, err := cmd.Flags().GetInt("remainder"); err == nil {
-			remainder = v
+		remainder := mustGetIntFlag(cmd, "remainder")
+		if remainder == 0 {
+			remainder = 5 // default value
 		}
 		if remainder < 0 {
 			return fmt.Errorf("--remainder must be >= 0")
