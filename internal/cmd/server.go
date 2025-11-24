@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 var (
@@ -19,6 +21,8 @@ var (
 	domainJSONData      string
 	refreshInterval     int
 	serverHost          string
+	configFile          string
+	pathPrefix          string
 	inventoryMutex      sync.RWMutex
 	lastInventoryUpdate time.Time
 	isRefreshing        bool
@@ -46,9 +50,38 @@ func init() {
 	serverStartCmd.Flags().StringVar(&serverHost, "host", "0.0.0.0", "Host address to bind to")
 	serverStartCmd.Flags().StringVar(&domainJSONData, "domain-json-data", "", "Path to custom JSON data file (default: inventory.json)")
 	serverStartCmd.Flags().IntVar(&refreshInterval, "refresh", 0, "Refresh interval in minutes (0 = no automatic refresh)")
+	serverStartCmd.Flags().StringVar(&configFile, "config", "", "Path to config file (yaml)")
+	serverStartCmd.Flags().StringVar(&pathPrefix, "path-prefix", "", "Path prefix for the server (e.g. /inventory)")
+
+	viper.BindPFlag("port", serverStartCmd.Flags().Lookup("port"))
+	viper.BindPFlag("host", serverStartCmd.Flags().Lookup("host"))
+	viper.BindPFlag("domain-json-data", serverStartCmd.Flags().Lookup("domain-json-data"))
+	viper.BindPFlag("refresh", serverStartCmd.Flags().Lookup("refresh"))
+	viper.BindPFlag("path-prefix", serverStartCmd.Flags().Lookup("path-prefix"))
 }
 
 func runServerStart(cmd *cobra.Command, args []string) error {
+	// Load config file if specified
+	if configFile != "" {
+		viper.SetConfigFile(configFile)
+	} else {
+		viper.SetConfigName("server-config")
+		viper.AddConfigPath(".")
+	}
+
+	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			stdlog.Printf("Error reading config file: %v", err)
+		}
+	}
+
+	// Update variables from viper
+	serverPort = viper.GetString("port")
+	serverHost = viper.GetString("host")
+	domainJSONData = viper.GetString("domain-json-data")
+	refreshInterval = viper.GetInt("refresh")
+	pathPrefix = viper.GetString("path-prefix")
+
 	// Determine JSON file path
 	jsonFilePath := getJSONFilePath()
 
@@ -78,17 +111,31 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	// Add logging middleware
 	router.Use(loggingMiddleware)
 
+	// Create a subrouter for API routes if path prefix is set
+	var apiRouter *mux.Router
+	if pathPrefix != "" {
+		// Ensure path prefix starts with / and doesn't end with /
+		if !strings.HasPrefix(pathPrefix, "/") {
+			pathPrefix = "/" + pathPrefix
+		}
+		pathPrefix = strings.TrimRight(pathPrefix, "/")
+		stdlog.Printf("Using path prefix: %s", pathPrefix)
+		apiRouter = router.PathPrefix(pathPrefix).Subrouter()
+	} else {
+		apiRouter = router
+	}
+
 	// API routes
-	router.HandleFunc("/api/inventory", handleInventory(jsonFilePath)).Methods("GET")
-	router.HandleFunc("/api/inventory/refresh", handleRefresh(jsonFilePath)).Methods("POST")
-	router.HandleFunc("/api/inventory/status", handleStatus).Methods("GET")
-	router.HandleFunc("/health", handleHealth).Methods("GET")
+	apiRouter.HandleFunc("/api/inventory", handleInventory(jsonFilePath)).Methods("GET")
+	apiRouter.HandleFunc("/api/inventory/refresh", handleRefresh(jsonFilePath)).Methods("POST")
+	apiRouter.HandleFunc("/api/inventory/status", handleStatus).Methods("GET")
+	apiRouter.HandleFunc("/health", handleHealth).Methods("GET")
 
 	// Serve static JSON file directly
-	router.HandleFunc("/inventory.json", handleServeJSON(jsonFilePath)).Methods("GET")
+	apiRouter.HandleFunc("/inventory.json", handleServeJSON(jsonFilePath)).Methods("GET")
 
 	// Add a debug route to show all available routes
-	router.HandleFunc("/debug/routes", handleDebugRoutes).Methods("GET")
+	apiRouter.HandleFunc("/debug/routes", handleDebugRoutes).Methods("GET")
 
 	// Log server startup
 	addr := fmt.Sprintf("%s:%s", serverHost, serverPort)
@@ -401,7 +448,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(wrapped, r)
 
-		stdlog.Printf("%s %s %d %v", r.Method, r.URL.Path, wrapped.statusCode, time.Since(start))
+		// Check for X-Forwarded-For header
+		clientIP := r.Header.Get("X-Forwarded-For")
+		if clientIP == "" {
+			clientIP = r.RemoteAddr
+		}
+
+		stdlog.Printf("%s %s %d %v (IP: %s)", r.Method, r.URL.Path, wrapped.statusCode, time.Since(start), clientIP)
 	})
 }
 
