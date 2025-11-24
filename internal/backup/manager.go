@@ -639,48 +639,86 @@ func (bm *BackupManager) TestAWSConnection() error {
 	return nil
 }
 
+type hashChunk [sha256.Size]byte
+
 // computeTreeHash calculates the AWS Glacier tree hash for data
 // The tree hash is computed by splitting the data into 1MB chunks,
 // hashing each chunk, then building a binary tree of hashes
 func computeTreeHash(data []byte) string {
 	const chunkSize = 1024 * 1024 // 1 MB
-
-	// Calculate hashes for all 1MB chunks
-	var hashes [][]byte
+	var chunks []hashChunk
 	for i := 0; i < len(data); i += chunkSize {
 		end := i + chunkSize
 		if end > len(data) {
 			end = len(data)
 		}
-		chunk := data[i:end]
-		hash := sha256.Sum256(chunk)
-		hashes = append(hashes, hash[:])
+		chunkHash := sha256.Sum256(data[i:end])
+		chunks = append(chunks, chunkHash)
+	}
+	return computeTreeHashFromChunks(chunks)
+}
+
+func computeTreeHashFromChunks(hashes []hashChunk) string {
+	if len(hashes) == 0 {
+		empty := sha256.Sum256(nil)
+		return hex.EncodeToString(empty[:])
 	}
 
-	// Build the hash tree by repeatedly hashing pairs until we have one hash
-	for len(hashes) > 1 {
-		var newHashes [][]byte
-		for i := 0; i < len(hashes); i += 2 {
-			if i+1 < len(hashes) {
-				// Hash the concatenation of two hashes
-				combined := append(hashes[i], hashes[i+1]...)
-				hash := sha256.Sum256(combined)
-				newHashes = append(newHashes, hash[:])
+	current := make([]hashChunk, len(hashes))
+	copy(current, hashes)
+
+	for len(current) > 1 {
+		var next []hashChunk
+		for i := 0; i < len(current); i += 2 {
+			if i+1 < len(current) {
+				var combined [sha256.Size * 2]byte
+				copy(combined[:sha256.Size], current[i][:])
+				copy(combined[sha256.Size:], current[i+1][:])
+				next = append(next, sha256.Sum256(combined[:]))
 			} else {
-				// Odd one out, just carry it forward
-				newHashes = append(newHashes, hashes[i])
+				next = append(next, current[i])
 			}
 		}
-		hashes = newHashes
+		current = next
 	}
 
-	// Return the final hash as hex string
-	if len(hashes) == 0 {
-		// Empty data case
-		hash := sha256.Sum256([]byte{})
-		return hex.EncodeToString(hash[:])
+	return hex.EncodeToString(current[0][:])
+}
+
+func computeHashesFromFile(f *os.File) (string, string, int64, error) {
+	if _, err := f.Seek(0, 0); err != nil {
+		return "", "", 0, fmt.Errorf("failed to seek file for hashing: %w", err)
 	}
-	return hex.EncodeToString(hashes[0])
+
+	const chunkSize = 1024 * 1024
+	linear := sha256.New()
+	var chunks []hashChunk
+	buf := make([]byte, chunkSize)
+	var total int64
+
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			linear.Write(buf[:n])
+			chunk := sha256.Sum256(buf[:n])
+			chunks = append(chunks, chunk)
+			total += int64(n)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", "", total, fmt.Errorf("failed while hashing file: %w", err)
+		}
+	}
+
+	if _, err := f.Seek(0, 0); err != nil {
+		return "", "", total, fmt.Errorf("failed to reset file pointer after hashing: %w", err)
+	}
+
+	treeHash := computeTreeHashFromChunks(chunks)
+	linearHash := hex.EncodeToString(linear.Sum(nil))
+	return treeHash, linearHash, total, nil
 }
 
 // UploadToAWS uploads data from a reader to AWS Glacier
@@ -783,40 +821,19 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 		bufferDuration,
 		float64(written)/(1024*1024)/bufferDuration.Seconds())
 
-	// Read the file content for checksum calculation
-	fmt.Printf("      [AWS] Reading buffered data for checksum calculation...\n")
-	checksumStartTime := time.Now()
-	bm.logTrace("Seeking to beginning of temp file for checksum")
-	if _, err := tmpFile.Seek(0, 0); err != nil {
-		bm.logDebug("Seek failed: %v", err)
-		return fmt.Errorf("failed to seek temporary file for checksum: %w", err)
-	}
-
-	bm.logTrace("Reading all data from temp file")
-	data, err := io.ReadAll(tmpFile)
-	if err != nil {
-		bm.logDebug("ReadAll failed: %v", err)
-		return fmt.Errorf("failed to read temporary file for checksum: %w", err)
-	}
-	bm.logDebug("Read %d bytes from temp file", len(data))
-
-	// Calculate the required checksums
+	// Calculate the required checksums without loading the entire file into memory
 	fmt.Printf("      [AWS] Calculating tree hash and linear hash...\n")
-	bm.logTrace("Computing tree hash")
-	treeHash := computeTreeHash(data)
-	bm.logTrace("Computing linear SHA256 hash")
-	linearHash := sha256.Sum256(data)
-	linearHashHex := hex.EncodeToString(linearHash[:])
-	checksumEndTime := time.Now()
-	checksumDuration := checksumEndTime.Sub(checksumStartTime)
+	checksumStartTime := time.Now()
+	treeHash, linearHashHex, fileSize, err := computeHashesFromFile(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to calculate checksums: %w", err)
+	}
+	checksumDuration := time.Since(checksumStartTime)
 	fmt.Printf("      [AWS] Checksums calculated in %s\n", checksumDuration)
 	fmt.Printf("      [AWS] Tree hash: %s\n", treeHash[:16]+"...")
 	fmt.Printf("      [AWS] Linear hash: %s\n", linearHashHex[:16]+"...")
 	bm.logDebug("Full tree hash: %s", treeHash)
 	bm.logDebug("Full linear hash: %s", linearHashHex)
-
-	// Get the file size for Content-Length
-	fileSize := int64(len(data))
 	bm.logDebug("File size for upload: %d bytes", fileSize)
 
 	// Seek back to beginning for upload
@@ -1222,42 +1239,17 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 		}
 		object.Close() // Done with the Minio stream
 
-		// Read the temp file into memory for checksum calculation
-		// Seek to the beginning first
-		if _, err := tmpFile.Seek(0, 0); err != nil {
-			fmt.Printf("  ⚠ Failed to seek temporary file for checksum: %v\n", err)
-			continue
-		}
-
-		data, err := io.ReadAll(tmpFile)
+		fmt.Printf("  ℹ️  Calculating checksums for %s...\n", backup.Name)
+		treeHash, linearHashHex, fileSize, err := computeHashesFromFile(tmpFile)
 		if err != nil {
-			fmt.Printf("  ⚠ Failed to read temporary file for checksum: %v\n", err)
+			fmt.Printf("  ⚠ Failed to calculate checksums: %v\n", err)
 			continue
 		}
-
-		// Calculate the AWS Glacier tree hash checksum (required for upload)
-		fmt.Printf("  ℹ️  Calculating tree hash for %s...\n", backup.Name)
-		treeHash := computeTreeHash(data)
-
-		// Calculate the linear hash (x-amz-content-sha256)
-		linearHash := sha256.Sum256(data)
-		linearHashHex := hex.EncodeToString(linearHash[:])
-
-		// Get the file size for Content-Length
-		fileSize := int64(len(data))
-
-		// Debug: Show actual file size
 		fmt.Printf("  ℹ️  File size: %d bytes (%.2f MB)\n", fileSize, float64(fileSize)/(1024*1024))
 
 		// Skip empty files
 		if fileSize == 0 {
 			fmt.Printf("  ⚠ Skipping empty file: %s\n", backup.Name)
-			continue
-		}
-
-		// Seek back to beginning for the upload
-		if _, err := tmpFile.Seek(0, 0); err != nil {
-			fmt.Printf("  ⚠ Failed to seek temporary file for upload: %v\n", err)
 			continue
 		}
 
@@ -1344,8 +1336,94 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 	return nil
 }
 
+// DeleteOldestBackups removes the oldest N% of backups directly from Minio
+// without attempting an AWS Glacier migration. Used as a last-resort option
+// when --force-delete is enabled in the monitor command.
+func (bm *BackupManager) DeleteOldestBackups(percent float64, dryRun bool) error {
+	if err := bm.initMinioClient(); err != nil {
+		return fmt.Errorf("failed to initialize Minio client: %w", err)
+	}
+
+	ctx := context.Background()
+	var backups []struct {
+		Name         string
+		LastModified time.Time
+		Size         int64
+	}
+
+	objectCh := bm.minioClient.ListObjects(ctx, bm.minioConfig.Bucket, minio.ListObjectsOptions{Recursive: true})
+	for object := range objectCh {
+		if object.Err != nil {
+			return fmt.Errorf("error listing objects: %w", object.Err)
+		}
+		backups = append(backups, struct {
+			Name         string
+			LastModified time.Time
+			Size         int64
+		}{
+			Name:         object.Key,
+			LastModified: object.LastModified,
+			Size:         object.Size,
+		})
+	}
+
+	if len(backups) == 0 {
+		fmt.Println("No backups found in Minio to delete.")
+		return nil
+	}
+
+	sort.Slice(backups, func(i, j int) bool {
+		return backups[i].LastModified.Before(backups[j].LastModified)
+	})
+
+	numToDelete := int(math.Ceil(float64(len(backups)) * percent / 100.0))
+	if numToDelete == 0 {
+		fmt.Println("No backups to delete based on the specified percentage.")
+		return nil
+	}
+
+	if dryRun {
+		fmt.Printf("\n🗑️  FORCE DELETE PLAN: would delete %d oldest backups (%.1f%%)\n", numToDelete, percent)
+	} else {
+		fmt.Printf("\n🗑️  Force deleting %d oldest backups (%.1f%%) from Minio...\n", numToDelete, percent)
+	}
+
+	deleted := 0
+	var totalFreed int64
+	for i := 0; i < numToDelete; i++ {
+		backup := backups[i]
+		fmt.Printf("  [%d/%d] %s (%.2f MB)\n", i+1, numToDelete, backup.Name, float64(backup.Size)/(1024*1024))
+		fmt.Printf("      Modified: %s\n", backup.LastModified.Format(time.RFC3339))
+
+		if dryRun {
+			continue
+		}
+
+		if err := bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, backup.Name, minio.RemoveObjectOptions{}); err != nil {
+			fmt.Printf("      ⚠ Failed to delete %s: %v\n", backup.Name, err)
+			continue
+		}
+
+		deleted++
+		totalFreed += backup.Size
+		fmt.Println("      ✓ Deleted")
+	}
+
+	if dryRun {
+		fmt.Printf("\nWould free approximately %.2f MB (%.2f GB)\n", float64(totalFreed)/(1024*1024), float64(totalFreed)/(1024*1024*1024))
+		return nil
+	}
+
+	fmt.Printf("\n✓ Force delete complete: removed %d/%d backups, freed %.2f MB (%.2f GB)\n",
+		deleted, numToDelete,
+		float64(totalFreed)/(1024*1024),
+		float64(totalFreed)/(1024*1024*1024))
+	return nil
+}
+
 // MonitorAndMigrateIfNeeded checks storage capacity and migrates backups if threshold exceeded
-func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold float64, migratePercent float64, dryRun bool) error {
+// When forceDelete is true, the oldest backups are deleted without migrating if Glacier uploads fail.
+func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold float64, migratePercent float64, dryRun bool, forceDelete bool) error {
 	fmt.Printf("Monitoring storage capacity at %s (threshold: %.1f%%)\n", storagePath, threshold)
 	if dryRun {
 		fmt.Println("🔍 DRY RUN MODE: No actual migrations will be performed")
@@ -1387,6 +1465,25 @@ func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold
 
 		err = bm.MigrateOldestBackupsToGlacier(migratePercent, dryRun)
 		if err != nil {
+			fmt.Printf("  ❌ Migration attempt failed: %v\n", err)
+			if forceDelete {
+				if dryRun {
+					fmt.Println("  🗑️  --force-delete enabled (dry run): would delete oldest backups instead of migrating.")
+				} else {
+					fmt.Println("  🗑️  --force-delete enabled: deleting oldest backups to maintain capacity...")
+				}
+				if delErr := bm.DeleteOldestBackups(migratePercent, dryRun); delErr != nil {
+					return fmt.Errorf("migration failed (%v) and force delete failed: %w", err, delErr)
+				}
+				if dryRun {
+					fmt.Println("\nℹ️  Dry run complete. Only one iteration performed for preview.")
+					return nil
+				}
+				// Give the filesystem a moment to update before re-checking usage
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			fmt.Println("  Hint: re-run with --force-delete to bypass AWS when Glacier uploads fail.")
 			return fmt.Errorf("migration failed: %w", err)
 		}
 
