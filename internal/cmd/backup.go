@@ -122,10 +122,12 @@ the oldest backups to AWS Glacier when usage exceeds a threshold.
 
 This command can be run via cron to maintain storage capacity. When capacity exceeds
 the threshold (default 95%), it will:
-  1. Select the oldest N% of backups (default 10%)
-  2. Upload them to AWS Glacier
-  3. Delete them from Minio
-  4. Repeat until capacity falls below threshold
+	1. Select the oldest N% of backups (default 10%)
+	2. Upload them to AWS Glacier
+	3. Delete them from Minio
+	4. Repeat until capacity falls below threshold
+	5. If --force-delete is specified, delete the oldest backups without migrating
+		 whenever the Glacier upload step fails (last-resort backpressure relief)
 
 Example:
   # Monitor and migrate if capacity exceeds 95%
@@ -434,6 +436,7 @@ func init() {
 	backupMonitorCmd.Flags().String("storage-path", getEnvWithDefault("STORAGE_PATH", "/mnt/minio_nyc2"), "Path to monitor for storage capacity (env: STORAGE_PATH, default: /mnt/minio_nyc2)")
 	backupMonitorCmd.Flags().Float64("threshold", getEnvFloat64WithDefault("STORAGE_THRESHOLD", 95.0), "Storage usage threshold percentage to trigger migration (env: STORAGE_THRESHOLD, default: 95.0)")
 	backupMonitorCmd.Flags().Float64("migrate-percent", getEnvFloat64WithDefault("MIGRATE_PERCENT", 10.0), "Percentage of oldest backups to migrate when threshold exceeded (env: MIGRATE_PERCENT, default: 10.0)")
+	backupMonitorCmd.Flags().Bool("force-delete", getEnvBoolWithDefault("STORAGE_FORCE_DELETE", false), "Delete oldest backups without migrating when AWS fails (env: STORAGE_FORCE_DELETE)")
 	backupMonitorCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
 	backupMonitorCmd.Flags().String("minio-access-key", "", "Minio access key (env: MINIO_ACCESS_KEY)")
 	backupMonitorCmd.Flags().String("minio-secret-key", "", "Minio secret key (env: MINIO_SECRET_KEY)")
@@ -1244,6 +1247,7 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	migratePercent, _ := cmd.Flags().GetFloat64("migrate-percent")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	showMounts, _ := cmd.Flags().GetBool("show-mounts")
+	forceDelete, _ := cmd.Flags().GetBool("force-delete")
 
 	// Create SSH client if storage server specified
 	var sshClient *auth.SSHClient
@@ -1367,11 +1371,12 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Storage Path:      %s\n", storagePath)
 	fmt.Printf("Threshold:         %.1f%%\n", threshold)
 	fmt.Printf("Migrate Percent:   %.1f%%\n", migratePercent)
+	fmt.Printf("Force Delete:      %v\n", forceDelete)
 	fmt.Printf("Minio Bucket:      %s\n", minioConfig.Bucket)
 	fmt.Printf("AWS Glacier Vault: %s\n", awsConfig.Vault)
 	fmt.Println("===========================================")
 
-	return manager.MonitorAndMigrateIfNeeded(storagePath, threshold, migratePercent, dryRun)
+	return manager.MonitorAndMigrateIfNeeded(storagePath, threshold, migratePercent, dryRun, forceDelete)
 }
 
 func runBackupConn(cmd *cobra.Command, args []string) error {
