@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -138,4 +140,28 @@ func runLocalCommand(cmd string) (string, error) {
 
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	return string(out), err
+}
+
+// mustGetStringFlag gets a string flag value from a cobra command
+func mustGetStringFlag(cmd *cobra.Command, name string) string {
+	val, _ := cmd.Flags().GetString(name)
+	return val
+}
+
+// mustGetBoolFlag gets a boolean flag value from a cobra command
+func mustGetBoolFlag(cmd *cobra.Command, name string) bool {
+	val, _ := cmd.Flags().GetBool(name)
+	return val
+}
+
+// mustGetFloat64Flag gets a float64 flag value from a cobra command
+func mustGetFloat64Flag(cmd *cobra.Command, name string) float64 {
+	val, _ := cmd.Flags().GetFloat64(name)
+	return val
+}
+
+// mustGetDurationFlag gets a duration flag value from a cobra command
+func mustGetDurationFlag(cmd *cobra.Command, name string) time.Duration {
+	val, _ := cmd.Flags().GetDuration(name)
+	return val
 }

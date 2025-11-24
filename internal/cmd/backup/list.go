@@ -1,0 +1,58 @@
+package backup
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/spf13/cobra"
+
+	"ciwg-cli/internal/backup"
+)
+
+func runBackupList(cmd *cobra.Command, args []string) error {
+	if envPath := mustGetStringFlag(cmd, "env"); envPath != "" {
+		if err := godotenv.Load(envPath); err != nil {
+			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
+		}
+	}
+	// Validate Minio configuration
+	minioConfig, err := getMinioConfig(cmd)
+	if err != nil {
+		return err
+	}
+
+	backupManager := backup.NewBackupManager(nil, minioConfig)
+
+	prefix := mustGetStringFlag(cmd, "prefix")
+	limit := 100
+	if v, err := cmd.Flags().GetInt("limit"); err == nil {
+		limit = v
+	}
+
+	objs, err := backupManager.ListBackups(prefix, limit)
+	if err != nil {
+		return fmt.Errorf("failed to list backups: %w", err)
+	}
+
+	if len(objs) == 0 {
+		fmt.Println("No objects found")
+		return nil
+	}
+
+	if jsonOut := mustGetBoolFlag(cmd, "json"); jsonOut {
+		b, err := json.MarshalIndent(objs, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal objects to JSON: %w", err)
+		}
+		fmt.Println(string(b))
+		return nil
+	}
+
+	for _, o := range objs {
+		fmt.Printf("%s\t%d\t%s\n", o.Key, o.Size, o.LastModified.Format(time.RFC3339))
+	}
+
+	return nil
+}
