@@ -296,7 +296,8 @@ func init() {
 
 	// Allow explicit env file via --env on the backup command and subcommands
 	backupCmd.PersistentFlags().String("env", "", "Path to .env file to load (overrides defaults)")
-	rootCmd.AddCommand(backupCmd)
+	// NOTE: rootCmd.AddCommand(backupCmd) is handled in root.go via the backup subpackage
+	// rootCmd.AddCommand(backupCmd) // COMMENTED OUT - using backup subpackage instead
 	backupCmd.AddCommand(backupCreateCmd)
 	backupCmd.AddCommand(backupTestMinioCmd)
 	backupCmd.AddCommand(backupTestAWSCmd)

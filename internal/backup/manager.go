@@ -2902,6 +2902,85 @@ func (bm *BackupManager) SelectObjectsWithSmartRetention(objs []ObjectInfo, poli
 	return toDelete
 }
 
+// ApplyRetentionPolicy evaluates retention policy rulesets and returns actions to take for each backup
+// Returns maps of backups to delete and backups to migrate to Glacier
+func (bm *BackupManager) ApplyRetentionPolicy(objs []ObjectInfo, rulesets map[string]RetentionRuleset) (toDelete, toMigrate []ObjectInfo) {
+	now := time.Now()
+	storageBackend := bm.GetStorageBackend()
+
+	// Track which objects have been matched by rules
+	matched := make(map[string]bool)
+	var deleteList []ObjectInfo
+	var migrateList []ObjectInfo
+
+	// Process each ruleset in order (implementation depends on YAML ordering)
+	for _, ruleset := range rulesets {
+		// Skip if this ruleset doesn't apply to current storage backend
+		if ruleset.TargetStorage != "" && ruleset.TargetStorage != "both" {
+			if storageBackend != ruleset.TargetStorage {
+				continue
+			}
+		}
+
+		// Parse the age threshold
+		duration, err := ParseHumanDuration(ruleset.OlderThan)
+		if err != nil {
+			bm.logDebug("Invalid duration in ruleset: %v", err)
+			continue
+		}
+
+		threshold := now.Add(-duration)
+
+		// Evaluate each backup against this ruleset
+		for _, obj := range objs {
+			// Skip if already matched by a previous rule
+			if matched[obj.Key] {
+				continue
+			}
+
+			// Check if backup is old enough for this rule
+			if !obj.LastModified.Before(threshold) {
+				continue // Not old enough
+			}
+
+			// Check if backup should be excluded
+			if ruleset.Exclude != "" {
+				if EvaluateExclusion(obj.LastModified, ruleset.Exclude) {
+					// This backup matches exclusion criteria, so it's kept
+					matched[obj.Key] = true
+					bm.logTrace("Backup %s excluded from rule due to exclusion: %s", obj.Key, ruleset.Exclude)
+					continue
+				}
+			}
+
+			// Apply the action
+			action := ruleset.Action
+			if action == "" {
+				action = "delete" // Default action
+			}
+
+			matched[obj.Key] = true
+
+			switch action {
+			case "delete":
+				deleteList = append(deleteList, obj)
+				bm.logTrace("Backup %s marked for deletion (rule: older than %s)", obj.Key, ruleset.OlderThan)
+			case "migrate_to_glacier":
+				migrateList = append(migrateList, obj)
+				bm.logTrace("Backup %s marked for migration to Glacier (rule: older than %s)", obj.Key, ruleset.OlderThan)
+			case "keep":
+				// Explicitly keep, do nothing
+				bm.logTrace("Backup %s kept by explicit keep rule", obj.Key)
+			}
+		}
+	}
+
+	bm.logVerbose("Retention policy evaluation: %d to delete, %d to migrate, %d unmatched",
+		len(deleteList), len(migrateList), len(objs)-len(matched))
+
+	return deleteList, migrateList
+}
+
 // getContainersFromConfig loads containers from a YAML config file
 func (bm *BackupManager) getContainersFromConfig(configPath string) ([]ContainerInfo, error) {
 	config, err := LoadConfigFromFile(configPath)

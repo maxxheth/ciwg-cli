@@ -173,14 +173,31 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 	}
 
 	fmt.Printf("Creating backups on %s...\n\n", hostname)
-	err := backupManager.CreateBackups(options)
-	if err != nil {
+	var err error
+	if err = backupManager.CreateBackups(options); err != nil {
 		return err
 	}
 
 	// Handle prune mode: clean up old backups
 	prune := mustGetBoolFlag(cmd, "prune")
 	if prune {
+		cleanAWS := mustGetBoolFlag(cmd, "clean-aws")
+
+		// Check if retention policy file is provided
+		retentionPolicyFile := mustGetStringFlag(cmd, "retention-policy")
+		if retentionPolicyFile != "" {
+			// Use YAML-based retention policy
+			fmt.Printf("\n--- Applying Retention Policy from %s ---\n", retentionPolicyFile)
+			rulesets, err := backup.LoadRetentionPolicyFromFile(retentionPolicyFile)
+			if err != nil {
+				return fmt.Errorf("failed to load retention policy: %w", err)
+			}
+			
+			fmt.Printf("Loaded %d ruleset(s)\n", len(rulesets))
+			return applyRetentionPolicy(backupManager, rulesets, options, cleanAWS)
+		}
+
+		// Use default pruning logic (remainder or smart retention)
 		remainder := mustGetIntFlag(cmd, "remainder")
 		if remainder == 0 {
 			remainder = 5 // default value
@@ -188,8 +205,6 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		if remainder < 0 {
 			return fmt.Errorf("--remainder must be >= 0")
 		}
-
-		cleanAWS := mustGetBoolFlag(cmd, "clean-aws")
 
 		// Display pruning strategy
 		if smartRetention != nil && smartRetention.Enabled {
@@ -289,6 +304,109 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 					}
 				}
 			}
+		}
+	}
+
+	return nil
+}
+
+// applyRetentionPolicy applies YAML-based retention policy to all backups
+func applyRetentionPolicy(bm *backup.BackupManager, rulesets map[string]backup.RetentionRuleset, options *backup.BackupOptions, cleanAWS bool) error {
+	// Get all containers to clean up backups for each
+	containers, err := bm.GetContainersFromOptions(options)
+	if err != nil {
+		return fmt.Errorf("failed to get containers: %w", err)
+	}
+
+	for _, container := range containers {
+		siteName := filepath.Base(container.WorkingDir)
+
+		// Determine the prefix for this container
+		var prefix string
+		if container.Config != nil && container.Config.BucketPath != "" {
+			prefix = filepath.Clean(container.Config.BucketPath) + "/"
+		} else if bm.GetBucketPath() != "" {
+			prefix = filepath.Clean(bm.GetBucketPath()) + "/"
+		} else {
+			prefix = fmt.Sprintf("backups/%s/", siteName)
+		}
+
+		fmt.Printf("\nProcessing retention for %s (prefix: %s)\n", siteName, prefix)
+
+		// Get all backups for this container
+		objs, err := bm.ListBackups(prefix, 0)
+		if err != nil {
+			fmt.Printf("  ⚠️  Failed to list backups: %v\n", err)
+			continue
+		}
+
+		if len(objs) == 0 {
+			fmt.Printf("  No backups found\n")
+			continue
+		}
+
+		fmt.Printf("  Found %d backup(s)\n", len(objs))
+
+		// Apply retention policy
+		toDelete, toMigrate := bm.ApplyRetentionPolicy(objs, rulesets)
+
+		// Handle migrations
+		if len(toMigrate) > 0 {
+			fmt.Printf("  Migrating %d backup(s) to Glacier...\n", len(toMigrate))
+			for _, obj := range toMigrate {
+				if options.DryRun {
+					fmt.Printf("    [DRY RUN] Would migrate: %s\n", obj.Key)
+					continue
+				}
+
+				// Download from storage
+				reader, err := bm.DownloadBackup(obj.Key)
+				if err != nil {
+					fmt.Printf("    ⚠️  Failed to download %s: %v\n", obj.Key, err)
+					continue
+				}
+
+				// Upload to Glacier
+				err = bm.UploadToAWS(obj.Key, reader, obj.Size)
+				reader.Close()
+				if err != nil {
+					fmt.Printf("    ⚠️  Failed to upload to Glacier: %v\n", err)
+					continue
+				}
+
+				fmt.Printf("    ✓ Migrated %s to Glacier\n", obj.Key)
+
+				// Delete from primary storage after successful migration
+				if err := bm.DeleteObject(obj.Key); err != nil {
+					fmt.Printf("    ⚠️  Failed to delete from storage: %v\n", err)
+				} else {
+					fmt.Printf("    ✓ Deleted from primary storage\n")
+				}
+			}
+		}
+
+		// Handle deletions
+		if len(toDelete) > 0 {
+			if options.DryRun {
+				fmt.Printf("  [DRY RUN] Would delete %d backup(s)\n", len(toDelete))
+				for _, obj := range toDelete {
+					fmt.Printf("    - %s\n", obj.Key)
+				}
+			} else {
+				var keys []string
+				for _, obj := range toDelete {
+					keys = append(keys, obj.Key)
+				}
+				if err := bm.DeleteObjects(keys); err != nil {
+					fmt.Printf("  ⚠️  Failed to delete backups: %v\n", err)
+				} else {
+					fmt.Printf("  ✓ Deleted %d backup(s)\n", len(toDelete))
+				}
+			}
+		}
+
+		if len(toDelete) == 0 && len(toMigrate) == 0 {
+			fmt.Printf("  All backups retained by retention policy\n")
 		}
 	}
 
