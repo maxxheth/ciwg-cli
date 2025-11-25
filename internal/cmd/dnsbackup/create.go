@@ -67,19 +67,11 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 			managerWithAWS := dnsbackup.NewBackupManagerWithAWS(minioConfig, awsConfig)
 			
-			// Download the snapshot we just uploaded
-			downloadedSnapshot, err := managerWithAWS.DownloadSnapshot(objectKey)
+			// Upload directly to Glacier
+			err = managerWithAWS.UploadToGlacier(snapshot, format)
 			if err != nil {
-				return fmt.Errorf("failed to download snapshot for Glacier upload: %w", err)
+				return fmt.Errorf("failed to upload to Glacier: %w", err)
 			}
-
-			// Re-upload to Glacier (simplified - in production you'd stream directly)
-			content, err := dnsbackup.EncodeSnapshot(downloadedSnapshot, format, true)
-			if err != nil {
-				return fmt.Errorf("failed to encode for Glacier: %w", err)
-			}
-
-			fmt.Printf("✓ Also uploaded to AWS Glacier (%d bytes)\n", len(content))
 		}
 	}
 

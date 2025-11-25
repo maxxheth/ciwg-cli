@@ -40,31 +40,43 @@ func getEnvBoolWithDefault(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+// mustGetStringFlag retrieves a string flag value.
+// Errors are ignored because cobra guarantees flags exist if they're defined.
 func mustGetStringFlag(cmd *cobra.Command, name string) string {
 	val, _ := cmd.Flags().GetString(name)
 	return val
 }
 
+// mustGetBoolFlag retrieves a bool flag value.
+// Errors are ignored because cobra guarantees flags exist if they're defined.
 func mustGetBoolFlag(cmd *cobra.Command, name string) bool {
 	val, _ := cmd.Flags().GetBool(name)
 	return val
 }
 
+// mustGetStringSliceFlag retrieves a string slice flag value.
+// Errors are ignored because cobra guarantees flags exist if they're defined.
 func mustGetStringSliceFlag(cmd *cobra.Command, name string) []string {
 	val, _ := cmd.Flags().GetStringSlice(name)
 	return val
 }
 
+// mustGetDurationFlag retrieves a duration flag value.
+// Errors are ignored because cobra guarantees flags exist if they're defined.
 func mustGetDurationFlag(cmd *cobra.Command, name string) time.Duration {
 	val, _ := cmd.Flags().GetDuration(name)
 	return val
 }
 
+// mustGetIntFlag retrieves an int flag value.
+// Errors are ignored because cobra guarantees flags exist if they're defined.
 func mustGetIntFlag(cmd *cobra.Command, name string) int {
 	val, _ := cmd.Flags().GetInt(name)
 	return val
 }
 
+// mustGetFloat64Flag retrieves a float64 flag value.
+// Errors are ignored because cobra guarantees flags exist if they're defined.
 func mustGetFloat64Flag(cmd *cobra.Command, name string) float64 {
 	val, _ := cmd.Flags().GetFloat64(name)
 	return val

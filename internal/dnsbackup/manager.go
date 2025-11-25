@@ -563,7 +563,48 @@ func (bm *BackupManager) MigrateToGlacier(percent float64, dryRun bool) error {
 	return nil
 }
 
-// extractZoneName extracts the zone name from an object key
+// UploadToGlacier uploads a DNS snapshot directly to AWS Glacier
+func (bm *BackupManager) UploadToGlacier(snapshot *ZoneSnapshot, format string) error {
+	if err := bm.initAWSClient(); err != nil {
+		return err
+	}
+
+	// Encode snapshot
+	content, err := EncodeSnapshot(snapshot, format, true)
+	if err != nil {
+		return fmt.Errorf("failed to encode snapshot: %w", err)
+	}
+
+	// Generate description
+	timestamp := snapshot.Exported.Format("20060102-150405")
+	description := fmt.Sprintf("DNS Backup: %s (%s)", snapshot.ZoneName, timestamp)
+
+	ctx := context.Background()
+	accountID := bm.awsConfig.AccountID
+	if accountID == "" {
+		accountID = "-"
+	}
+
+	fmt.Printf("Uploading DNS backup to AWS Glacier...\n")
+	uploadResult, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
+		AccountId:          aws.String(accountID),
+		VaultName:          aws.String(bm.awsConfig.Vault),
+		ArchiveDescription: aws.String(description),
+		Body:               bytes.NewReader(content),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
+	}
+
+	fmt.Printf("✓ Uploaded to AWS Glacier (%d bytes)\n", len(content))
+	if uploadResult.ArchiveId != nil {
+		fmt.Printf("  Archive ID: %s...\n", (*uploadResult.ArchiveId)[:40])
+	}
+
+	return nil
+}
+// Expected format: dns-backups/{zone-name}-YYYYMMDD-HHMMSS.{ext}
+// The timestamp is always exactly 8 digits, hyphen, 6 digits
 func extractZoneName(key string) string {
 	// Extract filename from path
 	filename := filepath.Base(key)
@@ -571,12 +612,37 @@ func extractZoneName(key string) string {
 	// Remove extension
 	name := strings.TrimSuffix(filename, filepath.Ext(filename))
 	
-	// Remove timestamp suffix (format: -YYYYMMDD-HHMMSS)
+	// Look for the timestamp pattern: -YYYYMMDD-HHMMSS at the end
+	// This pattern is exactly 16 characters: -8digits-6digits
+	if len(name) > 16 {
+		// Check if the last 16 characters match the timestamp pattern
+		possibleTimestamp := name[len(name)-16:]
+		// Pattern: -YYYYMMDD-HHMMSS
+		if len(possibleTimestamp) == 16 &&
+			possibleTimestamp[0] == '-' &&
+			possibleTimestamp[9] == '-' &&
+			isDigits(possibleTimestamp[1:9]) &&
+			isDigits(possibleTimestamp[10:16]) {
+			// Valid timestamp found, return everything before it
+			return name[:len(name)-16]
+		}
+	}
+	
+	// Fallback: use the old logic if timestamp pattern not found
 	parts := strings.Split(name, "-")
 	if len(parts) >= 3 {
-		// Remove last two parts (date and time)
 		return strings.Join(parts[:len(parts)-2], "-")
 	}
 	
 	return name
+}
+
+// isDigits checks if a string contains only digits
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -27,9 +27,19 @@ func TestExtractZoneName(t *testing.T) {
 			expected: "example.com",
 		},
 		{
-			name:     "complex zone name",
+			name:     "complex zone name with hyphens",
 			key:      "dns-backups/my-site.example.com-20240101-120000.json",
 			expected: "my-site.example.com",
+		},
+		{
+			name:     "zone with multiple hyphens",
+			key:      "dns-backups/my-complex-site-name.example.com-20240101-120000.json",
+			expected: "my-complex-site-name.example.com",
+		},
+		{
+			name:     "zone with numeric parts",
+			key:      "dns-backups/site123.example.com-20240101-120000.json",
+			expected: "site123.example.com",
 		},
 	}
 
