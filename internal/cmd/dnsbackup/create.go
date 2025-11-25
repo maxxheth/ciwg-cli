@@ -3,6 +3,7 @@ package dnsbackup
 import (
 	"context"
 	"fmt"
+	"os"
 
 	dnsbackup "ciwg-cli/internal/dnsbackup"
 
@@ -66,7 +67,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 			}
 
 			managerWithAWS := dnsbackup.NewBackupManagerWithAWS(minioConfig, awsConfig)
-			
+
 			// Upload directly to Glacier
 			err = managerWithAWS.UploadToGlacier(snapshot, format)
 			if err != nil {
@@ -95,13 +96,14 @@ func getMinioConfigFromFlags(cmd *cobra.Command) (*dnsbackup.MinioConfig, error)
 	}
 
 	return &dnsbackup.MinioConfig{
-		Endpoint:    endpoint,
-		AccessKey:   accessKey,
-		SecretKey:   secretKey,
-		Bucket:      mustGetStringFlag(cmd, "minio-bucket"),
-		UseSSL:      mustGetBoolFlag(cmd, "minio-ssl"),
-		BucketPath:  mustGetStringFlag(cmd, "bucket-path"),
-		HTTPTimeout: mustGetDurationFlag(cmd, "minio-http-timeout"),
+		Endpoint:         endpoint,
+		AccessKey:        accessKey,
+		SecretKey:        secretKey,
+		Bucket:           mustGetStringFlag(cmd, "minio-bucket"),
+		UseSSL:           mustGetBoolFlag(cmd, "minio-ssl"),
+		BucketPath:       mustGetStringFlag(cmd, "bucket-path"),
+		HTTPTimeout:      mustGetDurationFlag(cmd, "minio-http-timeout"),
+		AutoCreateBucket: os.Getenv("MINIO_DNS_BUCKET") != "",
 	}, nil
 }
 
