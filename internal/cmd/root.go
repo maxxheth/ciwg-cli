@@ -7,6 +7,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	backupcmd "ciwg-cli/internal/cmd/backup"
 )
 
 var (
@@ -31,6 +33,9 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.ciwg.yaml)")
 	rootCmd.PersistentFlags().Bool("verbose", false, "verbose output")
 	viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
+
+	// Add backup command from the backup subpackage
+	rootCmd.AddCommand(backupcmd.BackupCmd)
 
 	// Load environment variables from a .env file in the current directory.
 	// If the .env file doesn't exist, that's fine - environment variables can still be set in the shell.

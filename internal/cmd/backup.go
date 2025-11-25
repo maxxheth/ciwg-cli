@@ -1219,26 +1219,6 @@ func getAWSConfig(cmd *cobra.Command) (*backup.AWSConfig, error) {
 	}, nil
 }
 
-func mustGetStringFlag(cmd *cobra.Command, name string) string {
-	value, _ := cmd.Flags().GetString(name)
-	return value
-}
-
-func mustGetBoolFlag(cmd *cobra.Command, name string) bool {
-	value, _ := cmd.Flags().GetBool(name)
-	return value
-}
-
-func mustGetFloat64Flag(cmd *cobra.Command, name string) float64 {
-	value, _ := cmd.Flags().GetFloat64(name)
-	return value
-}
-
-func mustGetDurationFlag(cmd *cobra.Command, name string) time.Duration {
-	value, _ := cmd.Flags().GetDuration(name)
-	return value
-}
-
 func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	// Parse flags
 	storageServer, _ := cmd.Flags().GetString("storage-server")
