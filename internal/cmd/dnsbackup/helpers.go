@@ -60,6 +60,16 @@ func mustGetDurationFlag(cmd *cobra.Command, name string) time.Duration {
 	return val
 }
 
+func mustGetIntFlag(cmd *cobra.Command, name string) int {
+	val, _ := cmd.Flags().GetInt(name)
+	return val
+}
+
+func mustGetFloat64Flag(cmd *cobra.Command, name string) float64 {
+	val, _ := cmd.Flags().GetFloat64(name)
+	return val
+}
+
 func parseMetadata(values []string) (map[string]any, error) {
 	if len(values) == 0 {
 		return nil, nil
