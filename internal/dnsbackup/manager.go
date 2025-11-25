@@ -23,13 +23,14 @@ import (
 
 // MinioConfig contains configuration for Minio storage
 type MinioConfig struct {
-	Endpoint    string
-	AccessKey   string
-	SecretKey   string
-	Bucket      string
-	UseSSL      bool
-	BucketPath  string // Optional path prefix within bucket
-	HTTPTimeout time.Duration
+	Endpoint         string
+	AccessKey        string
+	SecretKey        string
+	Bucket           string
+	UseSSL           bool
+	BucketPath       string // Optional path prefix within bucket
+	HTTPTimeout      time.Duration
+	AutoCreateBucket bool
 }
 
 // AWSConfig contains configuration for AWS Glacier storage
@@ -109,8 +110,8 @@ func (bm *BackupManager) initMinioClient() error {
 	}
 
 	tr := &http.Transport{
-		IdleConnTimeout:    5 * time.Minute,
-		MaxIdleConns:       100,
+		IdleConnTimeout:     5 * time.Minute,
+		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 	}
 	if bm.minioConfig.HTTPTimeout > 0 {
@@ -128,7 +129,7 @@ func (bm *BackupManager) initMinioClient() error {
 
 	bm.minioClient = client
 
-	// Ensure bucket exists
+	// Ensure bucket exists (optionally creating it)
 	ctx := context.Background()
 	exists, err := bm.minioClient.BucketExists(ctx, bm.minioConfig.Bucket)
 	if err != nil {
@@ -136,7 +137,15 @@ func (bm *BackupManager) initMinioClient() error {
 	}
 
 	if !exists {
-		return fmt.Errorf("bucket %s does not exist", bm.minioConfig.Bucket)
+		if !bm.minioConfig.AutoCreateBucket {
+			return fmt.Errorf("bucket %s does not exist", bm.minioConfig.Bucket)
+		}
+
+		bm.logVerbose("bucket %s missing, attempting to create", bm.minioConfig.Bucket)
+		if err := bm.minioClient.MakeBucket(ctx, bm.minioConfig.Bucket, minio.MakeBucketOptions{}); err != nil {
+			return fmt.Errorf("failed to create bucket %s: %w", bm.minioConfig.Bucket, err)
+		}
+		bm.logVerbose("bucket %s created", bm.minioConfig.Bucket)
 	}
 
 	return nil
@@ -153,8 +162,8 @@ func (bm *BackupManager) initAWSClient() error {
 	}
 
 	tr := &http.Transport{
-		IdleConnTimeout:    5 * time.Minute,
-		MaxIdleConns:       100,
+		IdleConnTimeout:     5 * time.Minute,
+		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 	}
 
@@ -335,7 +344,7 @@ func (bm *BackupManager) UploadSnapshot(snapshot *ZoneSnapshot, format string) (
 		ext = ".yaml"
 	}
 	objectName := fmt.Sprintf("dns-backups/%s-%s%s", snapshot.ZoneName, timestamp, ext)
-	
+
 	if bm.minioConfig.BucketPath != "" {
 		objectName = filepath.Join(bm.minioConfig.BucketPath, objectName)
 	}
@@ -361,7 +370,7 @@ func (bm *BackupManager) ListBackups(prefix string, limit int) ([]DNSBackupInfo,
 	}
 
 	ctx := context.Background()
-	
+
 	// Add dns-backups prefix if not already present
 	if prefix != "" && !strings.HasPrefix(prefix, "dns-backups/") {
 		prefix = "dns-backups/" + prefix
@@ -603,15 +612,16 @@ func (bm *BackupManager) UploadToGlacier(snapshot *ZoneSnapshot, format string) 
 
 	return nil
 }
+
 // Expected format: dns-backups/{zone-name}-YYYYMMDD-HHMMSS.{ext}
 // The timestamp is always exactly 8 digits, hyphen, 6 digits
 func extractZoneName(key string) string {
 	// Extract filename from path
 	filename := filepath.Base(key)
-	
+
 	// Remove extension
 	name := strings.TrimSuffix(filename, filepath.Ext(filename))
-	
+
 	// Look for the timestamp pattern: -YYYYMMDD-HHMMSS at the end
 	// This pattern is exactly 16 characters: -8digits-6digits
 	if len(name) > 16 {
@@ -627,13 +637,13 @@ func extractZoneName(key string) string {
 			return name[:len(name)-16]
 		}
 	}
-	
+
 	// Fallback: use the old logic if timestamp pattern not found
 	parts := strings.Split(name, "-")
 	if len(parts) >= 3 {
 		return strings.Join(parts[:len(parts)-2], "-")
 	}
-	
+
 	return name
 }
 
