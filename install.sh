@@ -1,2 +1,2 @@
 make build
-sudo ./deploy.sh ~
+sudo ./deploy.sh
