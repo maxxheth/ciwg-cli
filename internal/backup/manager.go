@@ -107,6 +107,21 @@ type MinioConfig struct {
 	HTTPTimeout time.Duration
 }
 
+// S3Config represents AWS S3 configuration for object storage
+// S3 is MinIO-compatible, so we use the same MinIO client with S3-specific settings
+type S3Config struct {
+	Endpoint  string // S3 endpoint (e.g., "s3.amazonaws.com" or "s3.us-west-2.amazonaws.com")
+	AccessKey string
+	SecretKey string
+	Bucket    string
+	Region    string // S3 region (e.g., "us-east-1", "us-west-2")
+	UseSSL    bool
+	// BucketPath is an optional path prefix within the bucket (e.g., "production/backups")
+	BucketPath string
+	// HTTPTimeout is an optional overall timeout for the HTTP client
+	HTTPTimeout time.Duration
+}
+
 type AWSConfig struct {
 	Vault     string // Glacier uses vaults instead of buckets
 	AccountID string // AWS account ID (can be "-" for current account)
@@ -297,12 +312,14 @@ type BackupManager struct {
 	sshClient   *auth.SSHClient
 	minioClient *minio.Client
 	minioConfig *MinioConfig
+	s3Client    *minio.Client // S3 uses the same MinIO client (S3-compatible)
+	s3Config    *S3Config
 	awsClient   *glacier.Client
 	awsConfig   *AWSConfig
 	verbosity   int // 0=quiet, 1=normal, 2=verbose, 3=debug, 4=trace
 }
 
-// ObjectInfo is a lightweight representation of an object in Minio
+// ObjectInfo is a lightweight representation of an object in storage
 type ObjectInfo struct {
 	Key          string    `json:"key"`
 	Size         int64     `json:"size"`
@@ -317,6 +334,15 @@ func NewBackupManager(sshClient *auth.SSHClient, minioConfig *MinioConfig) *Back
 	}
 }
 
+// NewBackupManagerWithS3 creates a BackupManager with S3 configuration instead of MinIO
+func NewBackupManagerWithS3(sshClient *auth.SSHClient, s3Config *S3Config) *BackupManager {
+	return &BackupManager{
+		sshClient: sshClient,
+		s3Config:  s3Config,
+		verbosity: 1, // Default to normal verbosity
+	}
+}
+
 // NewBackupManagerWithAWS creates a BackupManager with both Minio and AWS configurations
 func NewBackupManagerWithAWS(sshClient *auth.SSHClient, minioConfig *MinioConfig, awsConfig *AWSConfig) *BackupManager {
 	return &BackupManager{
@@ -324,6 +350,16 @@ func NewBackupManagerWithAWS(sshClient *auth.SSHClient, minioConfig *MinioConfig
 		minioConfig: minioConfig,
 		awsConfig:   awsConfig,
 		verbosity:   1, // Default to normal verbosity
+	}
+}
+
+// NewBackupManagerWithS3AndAWS creates a BackupManager with S3 and AWS Glacier configurations
+func NewBackupManagerWithS3AndAWS(sshClient *auth.SSHClient, s3Config *S3Config, awsConfig *AWSConfig) *BackupManager {
+	return &BackupManager{
+		sshClient: sshClient,
+		s3Config:  s3Config,
+		awsConfig: awsConfig,
+		verbosity: 1, // Default to normal verbosity
 	}
 }
 
@@ -355,10 +391,43 @@ func (bm *BackupManager) logTrace(format string, args ...interface{}) {
 
 // GetBucketPath returns the configured bucket path prefix
 func (bm *BackupManager) GetBucketPath() string {
-	if bm.minioConfig == nil {
-		return ""
+	if bm.s3Config != nil {
+		return bm.s3Config.BucketPath
 	}
-	return bm.minioConfig.BucketPath
+	if bm.minioConfig != nil {
+		return bm.minioConfig.BucketPath
+	}
+	return ""
+}
+
+// GetStorageBackend returns a string identifying the active storage backend
+func (bm *BackupManager) GetStorageBackend() string {
+	if bm.s3Config != nil {
+		return "s3"
+	}
+	if bm.minioConfig != nil {
+		return "minio"
+	}
+	return "none"
+}
+
+// getObjectStorageClient returns the active object storage client (MinIO or S3)
+func (bm *BackupManager) getObjectStorageClient() *minio.Client {
+	if bm.s3Client != nil {
+		return bm.s3Client
+	}
+	return bm.minioClient
+}
+
+// getObjectStorageBucket returns the active bucket name
+func (bm *BackupManager) getObjectStorageBucket() string {
+	if bm.s3Config != nil {
+		return bm.s3Config.Bucket
+	}
+	if bm.minioConfig != nil {
+		return bm.minioConfig.Bucket
+	}
+	return ""
 }
 
 // executeCommand runs a shell command either over SSH (when sshClient is present)
@@ -427,6 +496,82 @@ func (bm *BackupManager) initMinioClient() error {
 	return nil
 }
 
+// initS3Client initializes the S3 client if S3 is configured
+func (bm *BackupManager) initS3Client() error {
+	if bm.s3Client != nil {
+		return nil
+	}
+
+	if bm.s3Config == nil {
+		return fmt.Errorf("S3 configuration is not set")
+	}
+
+	// Create custom transport for S3 client
+	dialer := &net.Dialer{
+		Timeout:   60 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   5 * time.Minute,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       5 * time.Minute,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+	}
+	if bm.s3Config.HTTPTimeout > 0 {
+		tr.ResponseHeaderTimeout = bm.s3Config.HTTPTimeout
+	}
+
+	// S3 endpoint format: s3.amazonaws.com or s3.region.amazonaws.com
+	endpoint := bm.s3Config.Endpoint
+	if endpoint == "" {
+		// Default to regional endpoint
+		if bm.s3Config.Region != "" {
+			endpoint = fmt.Sprintf("s3.%s.amazonaws.com", bm.s3Config.Region)
+		} else {
+			endpoint = "s3.amazonaws.com"
+		}
+	}
+
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:     credentials.NewStaticV4(bm.s3Config.AccessKey, bm.s3Config.SecretKey, ""),
+		Secure:    bm.s3Config.UseSSL,
+		Transport: tr,
+		Region:    bm.s3Config.Region,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create S3 client: %w", err)
+	}
+
+	bm.s3Client = client
+
+	// Ensure bucket exists
+	ctx := context.Background()
+	exists, err := bm.s3Client.BucketExists(ctx, bm.s3Config.Bucket)
+	if err != nil {
+		return fmt.Errorf("failed to check if S3 bucket exists: %w", err)
+	}
+
+	if !exists {
+		return fmt.Errorf("S3 bucket %s does not exist", bm.s3Config.Bucket)
+	}
+
+	return nil
+}
+
+// initObjectStorageClient initializes either MinIO or S3 client based on configuration
+func (bm *BackupManager) initObjectStorageClient() error {
+	if bm.s3Config != nil {
+		return bm.initS3Client()
+	}
+	if bm.minioConfig != nil {
+		return bm.initMinioClient()
+	}
+	return fmt.Errorf("no object storage configuration provided (neither MinIO nor S3)")
+}
+
 func (bm *BackupManager) TestMinioConnection() error {
 	if err := bm.initMinioClient(); err != nil {
 		return err
@@ -493,6 +638,77 @@ func (bm *BackupManager) TestMinioConnection() error {
 		return fmt.Errorf("failed to delete test object: %w", err)
 	}
 	fmt.Printf("   ✓ Successfully deleted test object\n")
+
+	return nil
+}
+
+// TestS3Connection tests connectivity to AWS S3
+func (bm *BackupManager) TestS3Connection() error {
+	if err := bm.initS3Client(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	// Step 1: Test bucket existence
+	fmt.Printf("1. Testing S3 bucket existence...\n")
+	exists, err := bm.s3Client.BucketExists(ctx, bm.s3Config.Bucket)
+	if err != nil {
+		return fmt.Errorf("failed to check S3 bucket existence: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("S3 bucket '%s' does not exist", bm.s3Config.Bucket)
+	}
+	fmt.Printf("   ✓ S3 bucket '%s' exists\n\n", bm.s3Config.Bucket)
+
+	// Step 2: Test write operation
+	fmt.Printf("2. Testing S3 write operation...\n")
+	testObjectName := fmt.Sprintf(".connection-test-%d.txt", time.Now().Unix())
+
+	// Apply bucket path prefix if configured
+	if bm.s3Config.BucketPath != "" {
+		testObjectName = filepath.Join(bm.s3Config.BucketPath, testObjectName)
+	}
+
+	testContent := []byte("This is a connection test file created by ciwg-cli")
+
+	info, err := bm.s3Client.PutObject(ctx, bm.s3Config.Bucket, testObjectName,
+		strings.NewReader(string(testContent)), int64(len(testContent)), minio.PutObjectOptions{
+			ContentType: "text/plain",
+		})
+	if err != nil {
+		return fmt.Errorf("failed to write test object to S3: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully wrote test object '%s' to S3 (%d bytes)\n\n", testObjectName, info.Size)
+
+	// Step 3: Test read operation
+	fmt.Printf("3. Testing S3 read operation...\n")
+	object, err := bm.s3Client.GetObject(ctx, bm.s3Config.Bucket, testObjectName, minio.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to read test object from S3: %w", err)
+	}
+	defer object.Close()
+
+	readContent := make([]byte, len(testContent))
+	n, err := object.Read(readContent)
+	if err != nil && err.Error() != "EOF" {
+		return fmt.Errorf("failed to read test object content from S3: %w", err)
+	}
+	if n != len(testContent) {
+		return fmt.Errorf("read size mismatch: expected %d, got %d", len(testContent), n)
+	}
+	if string(readContent) != string(testContent) {
+		return fmt.Errorf("content mismatch: read content doesn't match written content")
+	}
+	fmt.Printf("   ✓ Successfully read test object from S3 and verified content\n\n")
+
+	// Step 4: Test delete operation
+	fmt.Printf("4. Testing S3 delete operation...\n")
+	err = bm.s3Client.RemoveObject(ctx, bm.s3Config.Bucket, testObjectName, minio.RemoveObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to delete test object from S3: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully deleted test object from S3\n")
 
 	return nil
 }
@@ -2293,15 +2509,18 @@ func (bm *BackupManager) readRemoteFile(filePath string) ([]byte, error) {
 	return []byte(output), nil
 }
 
-// ReadBackup downloads or streams a Minio object. If outputPath is empty it writes to stdout.
+// ReadBackup downloads or streams an object from storage. If outputPath is empty it writes to stdout.
 func (bm *BackupManager) ReadBackup(objectName, outputPath string) error {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return err
 	}
 
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
+
 	ctx := context.Background()
 
-	obj, err := bm.minioClient.GetObject(ctx, bm.minioConfig.Bucket, objectName, minio.GetObjectOptions{})
+	obj, err := client.GetObject(ctx, bucket, objectName, minio.GetObjectOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get object '%s': %w", objectName, err)
 	}
@@ -2336,19 +2555,22 @@ func (bm *BackupManager) ReadBackup(objectName, outputPath string) error {
 	return nil
 }
 
-// DownloadBackup downloads a backup object from Minio and returns a reader.
+// DownloadBackup downloads a backup object from storage and returns a reader.
 // The caller is responsible for closing the returned ReadCloser.
 func (bm *BackupManager) DownloadBackup(objectName string) (io.ReadCloser, error) {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return nil, err
 	}
+
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
 
 	bm.logDebug("DownloadBackup called for object: %s", objectName)
 
 	ctx := context.Background()
-	obj, err := bm.minioClient.GetObject(ctx, bm.minioConfig.Bucket, objectName, minio.GetObjectOptions{})
+	obj, err := client.GetObject(ctx, bucket, objectName, minio.GetObjectOptions{})
 	if err != nil {
-		bm.logDebug("Failed to get object from Minio: %v", err)
+		bm.logDebug("Failed to get object from storage: %v", err)
 		return nil, fmt.Errorf("failed to get object '%s': %w", objectName, err)
 	}
 
@@ -2357,11 +2579,14 @@ func (bm *BackupManager) DownloadBackup(objectName string) (io.ReadCloser, error
 }
 
 // ListBackups lists objects in the configured bucket filtered by prefix.
-// It returns up to 'limit' objects ordered by whatever the Minio server yields (client-side sorting is not performed).
+// It returns up to 'limit' objects ordered by whatever the storage server yields (client-side sorting is not performed).
 func (bm *BackupManager) ListBackups(prefix string, limit int) ([]ObjectInfo, error) {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return nil, err
 	}
+
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
 
 	ctx := context.Background()
 	opts := minio.ListObjectsOptions{
@@ -2370,7 +2595,7 @@ func (bm *BackupManager) ListBackups(prefix string, limit int) ([]ObjectInfo, er
 	}
 
 	var results []ObjectInfo
-	ch := bm.minioClient.ListObjects(ctx, bm.minioConfig.Bucket, opts)
+	ch := client.ListObjects(ctx, bucket, opts)
 	for obj := range ch {
 		if obj.Err != nil {
 			return nil, fmt.Errorf("error listing object: %w", obj.Err)
@@ -2409,27 +2634,33 @@ func (bm *BackupManager) GetLatestObject(prefix string) (string, error) {
 	return latest.Key, nil
 }
 
-// DeleteObject removes a single object from the configured Minio bucket.
+// DeleteObject removes a single object from the configured storage bucket.
 func (bm *BackupManager) DeleteObject(objectName string) error {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return err
 	}
 
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
+
 	ctx := context.Background()
-	if err := bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, objectName, minio.RemoveObjectOptions{}); err != nil {
+	if err := client.RemoveObject(ctx, bucket, objectName, minio.RemoveObjectOptions{}); err != nil {
 		return fmt.Errorf("failed to delete object '%s': %w", objectName, err)
 	}
 	return nil
 }
 
-// DeleteObjects removes multiple objects from the configured Minio bucket.
+// DeleteObjects removes multiple objects from the configured storage bucket.
 // It attempts to delete each object and aggregates any errors into a single error.
 func (bm *BackupManager) DeleteObjects(objectNames []string) error {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return err
 	}
 
-	// Use Minio batch RemoveObjects API for performance when deleting many objects.
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
+
+	// Use batch RemoveObjects API for performance when deleting many objects.
 	ctx := context.Background()
 	objectsCh := make(chan minio.ObjectInfo, len(objectNames))
 	go func() {
@@ -2439,7 +2670,7 @@ func (bm *BackupManager) DeleteObjects(objectNames []string) error {
 		}
 	}()
 
-	errCh := bm.minioClient.RemoveObjects(ctx, bm.minioConfig.Bucket, objectsCh, minio.RemoveObjectsOptions{})
+	errCh := client.RemoveObjects(ctx, bucket, objectsCh, minio.RemoveObjectsOptions{})
 
 	var errs []string
 	for e := range errCh {

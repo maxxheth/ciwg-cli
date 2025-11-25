@@ -23,10 +23,20 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 	}
 	serverRange := mustGetStringFlag(cmd, "server-range")
 
-	// Validate Minio configuration
+	// Validate storage configuration (MinIO or S3)
 	minioConfig, err := getMinioConfig(cmd)
 	if err != nil {
 		return err
+	}
+
+	s3Config, err := getS3Config(cmd)
+	if err != nil {
+		return err
+	}
+
+	// Ensure at least one storage backend is configured
+	if minioConfig == nil && s3Config == nil {
+		return fmt.Errorf("either MinIO or S3 must be configured (use --minio-endpoint or --s3-bucket)")
 	}
 
 	// Get AWS configuration (optional)
@@ -36,7 +46,7 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	if serverRange != "" {
-		return processBackupCreateForServerRange(cmd, serverRange, minioConfig, awsConfig)
+		return processBackupCreateForServerRange(cmd, serverRange, minioConfig, s3Config, awsConfig)
 	}
 
 	if len(args) < 1 {
@@ -44,10 +54,10 @@ func runBackupCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	hostname := args[0]
-	return createBackupForHost(cmd, hostname, minioConfig, awsConfig)
+	return createBackupForHost(cmd, hostname, minioConfig, s3Config, awsConfig)
 }
 
-func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, minioConfig *backup.MinioConfig, awsConfig *backup.AWSConfig) error {
+func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, minioConfig *backup.MinioConfig, s3Config *backup.S3Config, awsConfig *backup.AWSConfig) error {
 	pattern, start, end, exclusions, err := parseServerRange(serverRange)
 	if err != nil {
 		return fmt.Errorf("error parsing server range: %w", err)
@@ -60,7 +70,7 @@ func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, m
 		}
 		hostname := fmt.Sprintf(pattern, i)
 		fmt.Printf("--- Processing server: %s ---\n", hostname)
-		err := createBackupForHost(cmd, hostname, minioConfig, awsConfig)
+		err := createBackupForHost(cmd, hostname, minioConfig, s3Config, awsConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", hostname, err)
 		}
@@ -70,7 +80,7 @@ func processBackupCreateForServerRange(cmd *cobra.Command, serverRange string, m
 	return nil
 }
 
-func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backup.MinioConfig, awsConfig *backup.AWSConfig) error {
+func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backup.MinioConfig, s3Config *backup.S3Config, awsConfig *backup.AWSConfig) error {
 
 	// Determine if running locally
 	localMode := mustGetBoolFlag(cmd, "local")
@@ -85,9 +95,13 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		defer sshClient.Close()
 	}
 
-	// Create backup manager with AWS config if available
+	// Create backup manager with appropriate storage backend
 	var backupManager *backup.BackupManager
-	if awsConfig != nil {
+	if s3Config != nil && awsConfig != nil {
+		backupManager = backup.NewBackupManagerWithS3AndAWS(sshClient, s3Config, awsConfig)
+	} else if s3Config != nil {
+		backupManager = backup.NewBackupManagerWithS3(sshClient, s3Config)
+	} else if minioConfig != nil && awsConfig != nil {
 		backupManager = backup.NewBackupManagerWithAWS(sshClient, minioConfig, awsConfig)
 	} else {
 		backupManager = backup.NewBackupManager(sshClient, minioConfig)
