@@ -153,6 +153,26 @@ ciwg backup hostname --config backup-config.yml
 ciwg backup --server-range="wp%d.example.com:0-41"
 ```
 
+### DNS Backup
+
+Strictly manage Cloudflare DNS zone backups with dry-run friendly workflows.
+
+```bash
+# Export DNS records to a JSON snapshot
+ciwg dns-backup export example.com --output=snapshots/example.com.json
+
+# Preview how a snapshot would change the zone (no writes)
+ciwg dns-backup plan example.com \
+	--snapshot snapshots/example.com.json --delete-missing --print-plan
+
+# Apply the snapshot with deletions after reviewing the plan
+ciwg dns-backup apply example.com \
+	--snapshot snapshots/example.com.json --delete-missing --yes
+
+# Validate API token permissions
+ciwg dns-backup test
+```
+
 ### Compose Management
 
 ```bash
@@ -198,6 +218,9 @@ export PROMPRESS_TOKEN="your-secret-token"
 
 # Minio Configuration
 export MINIO_ENDPOINT="minio.example.com:9000"
+
+# Cloudflare DNS Backup
+export CLOUDFLARE_DNS_BACKUP_TOKEN="cf_example_token"
 export MINIO_ACCESS_KEY="access-key"
 export MINIO_SECRET_KEY="secret-key"
 export MINIO_BUCKET="backups"
