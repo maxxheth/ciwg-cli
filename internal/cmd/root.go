@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/viper"
 
 	backupcmd "ciwg-cli/internal/cmd/backup"
+	dnsbackupcmd "ciwg-cli/internal/cmd/dnsbackup"
 )
 
 var (
@@ -36,6 +37,7 @@ func init() {
 
 	// Add backup command from the backup subpackage
 	rootCmd.AddCommand(backupcmd.BackupCmd)
+	rootCmd.AddCommand(dnsbackupcmd.Cmd)
 
 	// Load environment variables from a .env file in the current directory.
 	// If the .env file doesn't exist, that's fine - environment variables can still be set in the shell.
