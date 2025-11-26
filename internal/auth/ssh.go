@@ -22,13 +22,14 @@ type SSHClient struct {
 
 // SSHConfig represents SSH connection configuration
 type SSHConfig struct {
-	Hostname  string
-	Username  string
-	Port      string
-	KeyPath   string
-	UseAgent  bool
-	Timeout   time.Duration
-	KeepAlive time.Duration
+	Hostname           string
+	Username           string
+	Port               string
+	KeyPath            string
+	UseAgent           bool
+	Timeout            time.Duration
+	KeepAlive          time.Duration
+	DisableDefaultKeys bool
 }
 
 // NewSSHClient creates a new SSH client with persistent connection and agent support
@@ -59,17 +60,21 @@ func NewSSHClient(config SSHConfig) (*SSHClient, error) {
 		}
 	}
 
-	// Default key paths to try
-	defaultKeys := []string{
-		filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa"),
-		filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519"),
-		filepath.Join(os.Getenv("HOME"), ".ssh", "id_ecdsa"),
-	}
+	if !config.DisableDefaultKeys {
+		defaultKeys := []string{
+			filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa"),
+			filepath.Join(os.Getenv("HOME"), ".ssh", "id_ed25519"),
+			filepath.Join(os.Getenv("HOME"), ".ssh", "id_ecdsa"),
+		}
 
-	for _, keyPath := range defaultKeys {
-		if _, err := os.Stat(keyPath); err == nil {
-			if keyAuth, err := getPublicKeyAuth(keyPath); err == nil {
-				authMethods = append(authMethods, keyAuth)
+		for _, keyPath := range defaultKeys {
+			if config.KeyPath != "" && filepath.Clean(keyPath) == filepath.Clean(config.KeyPath) {
+				continue // already added explicitly
+			}
+			if _, err := os.Stat(keyPath); err == nil {
+				if keyAuth, err := getPublicKeyAuth(keyPath); err == nil {
+					authMethods = append(authMethods, keyAuth)
+				}
 			}
 		}
 	}
