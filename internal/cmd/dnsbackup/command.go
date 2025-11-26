@@ -18,17 +18,19 @@ Use 'export' to capture DNS records, 'plan' to preview a restore, and 'apply' to
 }
 
 var exportCmd = &cobra.Command{
-	Use:   "export [zone]",
-	Short: "Export DNS records for a zone",
+	Use:   "export [zone|server]",
+	Short: "Export DNS records for a zone (supports --zone-lookup)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE:  runExport,
 }
 
 var createCmd = &cobra.Command{
-	Use:   "create [zone]",
+	Use:   "create [zone|server]",
 	Short: "Create and upload DNS backup for a zone",
 	Long: `Create a DNS backup by exporting records and uploading to Minio storage.
-Optionally also upload to AWS Glacier for long-term archival.`,
+Optionally also upload to AWS Glacier for long-term archival.
+
+When --zone-lookup is enabled, omit the zone argument and supply either --server-range or a single server hostname to discover zone names automatically.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runCreate,
 }
@@ -94,15 +96,15 @@ var connCmd = &cobra.Command{
 }
 
 var planCmd = &cobra.Command{
-	Use:   "plan [zone]",
+	Use:   "plan [zone|server]",
 	Short: "Generate a change plan for a zone and backup snapshot",
 	Args:  cobra.MaximumNArgs(1),
 	RunE:  runPlan,
 }
 
 var applyCmd = &cobra.Command{
-	Use:   "apply [zone]",
-	Short: "Apply a snapshot to a zone (supports dry-run)",
+	Use:   "apply [zone|server]",
+	Short: "Apply a snapshot to a zone (supports --zone-lookup and dry-run)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE:  runApply,
 }
@@ -194,7 +196,7 @@ func initApplyFlags() {
 func initTestFlags() {}
 
 func addZoneLookupFlags(command *cobra.Command) {
-	command.Flags().Bool("zone-lookup", getEnvBoolWithDefault("DNS_ZONE_LOOKUP", false), "Discover zone names from remote servers instead of providing them explicitly (requires --server-range)")
+	command.Flags().Bool("zone-lookup", getEnvBoolWithDefault("DNS_ZONE_LOOKUP", false), "Discover zone names from remote servers instead of providing them explicitly (requires --server-range or a single server hostname)")
 	command.Flags().String("server-range", getEnvWithDefault("SERVER_RANGE", ""), "Server range pattern to use when --zone-lookup is enabled (env: SERVER_RANGE)")
 	addZoneLookupSSHFlags(command)
 }
@@ -205,6 +207,7 @@ func addZoneLookupSSHFlags(command *cobra.Command) {
 	command.Flags().String("lookup-key", getEnvWithDefault("SSH_KEY", ""), "SSH private key path for zone discovery (env: SSH_KEY)")
 	command.Flags().Bool("lookup-agent", getEnvBoolWithDefault("SSH_AGENT", true), "Use SSH agent for zone discovery (env: SSH_AGENT)")
 	command.Flags().Duration("lookup-timeout", getEnvDurationWithDefault("SSH_TIMEOUT", 30*time.Second), "SSH connection timeout for zone discovery (env: SSH_TIMEOUT)")
+	command.Flags().Bool("lookup-disable-default-keys", getEnvBoolWithDefault("DNSBACKUP_LOOKUP_DISABLE_DEFAULT_KEYS", false), "Skip trying default SSH keys during zone discovery (env: DNSBACKUP_LOOKUP_DISABLE_DEFAULT_KEYS)")
 }
 
 func defaultDNSBucket() string {
