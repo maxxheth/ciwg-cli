@@ -10,6 +10,7 @@ import (
 	"time"
 
 	cloudflare "github.com/cloudflare/cloudflare-go"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Client wraps the Cloudflare API client with higher-level helpers tailored for backups.
@@ -88,6 +89,24 @@ func (c *Client) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) error
 		}
 	}
 	return nil
+}
+
+// ResolveZoneName attempts to find the Cloudflare zone that owns the provided host.
+func (c *Client) ResolveZoneName(host string) (string, error) {
+	clean := sanitizeCandidateHost(host)
+	if clean == "" {
+		return "", errors.New("host is required to resolve zone")
+	}
+	candidates := zoneCandidates(clean)
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if _, err := c.api.ZoneIDByName(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("no Cloudflare zone matches host %s", clean)
 }
 
 // VerifyToken checks that the configured token is valid and returns metadata.
@@ -218,4 +237,40 @@ func normalizeData(data interface{}) map[string]any {
 		}
 		return out
 	}
+}
+
+func sanitizeCandidateHost(host string) string {
+	value := strings.TrimSpace(strings.ToLower(host))
+	value = strings.Trim(value, ".")
+	value = strings.TrimPrefix(value, "www.")
+	return value
+}
+
+func zoneCandidates(host string) []string {
+	seen := make(map[string]struct{})
+	var candidates []string
+
+	if etld, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		addZoneCandidate(&candidates, seen, etld)
+	}
+
+	labels := strings.Split(host, ".")
+	for i := 0; i <= len(labels)-2; i++ {
+		candidate := strings.Join(labels[i:], ".")
+		addZoneCandidate(&candidates, seen, candidate)
+	}
+
+	return candidates
+}
+
+func addZoneCandidate(list *[]string, seen map[string]struct{}, candidate string) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return
+	}
+	if _, exists := seen[candidate]; exists {
+		return
+	}
+	seen[candidate] = struct{}{}
+	*list = append(*list, candidate)
 }

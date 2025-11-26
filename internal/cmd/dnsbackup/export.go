@@ -14,7 +14,6 @@ func runExport(cmd *cobra.Command, args []string) error {
 	if err := loadEnvFromFlag(cmd); err != nil {
 		return err
 	}
-	zone := args[0]
 	token, err := requireToken(mustGetStringFlag(cmd, "token"))
 	if err != nil {
 		return err
@@ -23,18 +22,14 @@ func runExport(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(cmd.Context(), mustGetDurationFlag(cmd, "timeout"))
-	defer cancel()
-
-	snapshot, err := client.Export(ctx, zone)
+	zones, err := resolveZones(cmd, args, client)
 	if err != nil {
 		return err
 	}
 
-	if meta, err := parseMetadata(mustGetStringSliceFlag(cmd, "metadata")); err != nil {
+	meta, err := parseMetadata(mustGetStringSliceFlag(cmd, "metadata"))
+	if err != nil {
 		return err
-	} else if len(meta) > 0 {
-		snapshot.Metadata = meta
 	}
 
 	format := strings.ToLower(mustGetStringFlag(cmd, "format"))
@@ -42,24 +37,49 @@ func runExport(cmd *cobra.Command, args []string) error {
 		format = "json"
 	}
 	pretty := mustGetBoolFlag(cmd, "pretty")
-	output := mustGetStringFlag(cmd, "output")
-	if output == "" {
-		payload, err := dnsbackup.EncodeSnapshot(snapshot, format, pretty)
+	outputBase := mustGetStringFlag(cmd, "output")
+	multi := len(zones) > 1
+	timeout := mustGetDurationFlag(cmd, "timeout")
+	defaultPattern := fmt.Sprintf("%%s.%s", formatExtension(format))
+
+	for _, target := range zones {
+		ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+		snapshot, err := client.Export(ctx, target.ZoneName)
+		cancel()
 		if err != nil {
 			return err
 		}
-		if _, err := cmd.OutOrStdout().Write(payload); err != nil {
+		if len(meta) > 0 {
+			snapshot.Metadata = meta
+		}
+
+		path, toStdout, err := resolveZoneFilePath(outputBase, target.ZoneName, defaultPattern, "--output", multi, true)
+		if err != nil {
 			return err
 		}
-		if len(payload) == 0 || payload[len(payload)-1] != '\n' {
-			fmt.Fprintln(cmd.OutOrStdout())
+
+		if toStdout {
+			payload, err := dnsbackup.EncodeSnapshot(snapshot, format, pretty)
+			if err != nil {
+				return err
+			}
+			if _, err := cmd.OutOrStdout().Write(payload); err != nil {
+				return err
+			}
+			if len(payload) == 0 || payload[len(payload)-1] != '\n' {
+				fmt.Fprintln(cmd.OutOrStdout())
+			}
+			continue
 		}
-		return nil
+
+		if err := ensureParentDir(path); err != nil {
+			return fmt.Errorf("prepare output path for %s: %w", target.ZoneName, err)
+		}
+		if err := dnsbackup.SaveSnapshot(snapshot, path, format, pretty); err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "[%s] Snapshot saved to %s\n", target.ZoneName, path)
 	}
 
-	if err := dnsbackup.SaveSnapshot(snapshot, output, format, pretty); err != nil {
-		return err
-	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "Snapshot saved to %s\n", output)
 	return nil
 }
