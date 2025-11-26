@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -46,6 +45,15 @@ func getEnvBoolWithDefault(key string, defaultValue bool) bool {
 func getEnvDurationWithDefault(key string, defaultValue time.Duration) time.Duration {
 	if value := os.Getenv(key); value != "" {
 		if parsed, err := time.ParseDuration(value); err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}
+
+func getEnvFloat64WithDefault(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.ParseFloat(value, 64); err == nil {
 			return parsed
 		}
 	}
@@ -286,11 +294,8 @@ func formatExtension(format string) string {
 }
 
 func currentUsername() string {
-	if usr, err := user.Current(); err == nil && usr.Username != "" {
-		return usr.Username
-	}
-	if envUser := os.Getenv("USER"); envUser != "" {
-		return envUser
+	if fallback := os.Getenv("SSH_DEFAULT_USER"); fallback != "" {
+		return fallback
 	}
 	return "root"
 }

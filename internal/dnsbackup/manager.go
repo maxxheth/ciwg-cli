@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
@@ -43,13 +44,20 @@ type AWSConfig struct {
 	HTTPTimeout time.Duration
 }
 
+const defaultCapacityThreshold = 95.0
+
 // BackupManager handles DNS backup operations with Minio and AWS Glacier
 type BackupManager struct {
 	minioClient *minio.Client
 	minioConfig *MinioConfig
+	adminClient *madmin.AdminClient
 	awsClient   *glacier.Client
 	awsConfig   *AWSConfig
 	verbosity   int // 0=quiet, 1=normal, 2=verbose, 3=debug, 4=trace
+
+	respectCapacity   bool
+	capacityThreshold float64
+	capacityReported  bool
 }
 
 // DNSBackupInfo represents metadata about a DNS backup
@@ -63,23 +71,34 @@ type DNSBackupInfo struct {
 // NewBackupManager creates a new DNS backup manager with Minio configuration
 func NewBackupManager(minioConfig *MinioConfig) *BackupManager {
 	return &BackupManager{
-		minioConfig: minioConfig,
-		verbosity:   1,
+		minioConfig:       minioConfig,
+		verbosity:         1,
+		capacityThreshold: defaultCapacityThreshold,
 	}
 }
 
 // NewBackupManagerWithAWS creates a DNS backup manager with both Minio and AWS configurations
 func NewBackupManagerWithAWS(minioConfig *MinioConfig, awsConfig *AWSConfig) *BackupManager {
 	return &BackupManager{
-		minioConfig: minioConfig,
-		awsConfig:   awsConfig,
-		verbosity:   1,
+		minioConfig:       minioConfig,
+		awsConfig:         awsConfig,
+		verbosity:         1,
+		capacityThreshold: defaultCapacityThreshold,
 	}
 }
 
 // SetVerbosity sets the logging verbosity level
 func (bm *BackupManager) SetVerbosity(level int) {
 	bm.verbosity = level
+}
+
+// SetCapacityGuard configures whether uploads should verify Minio capacity usage first.
+func (bm *BackupManager) SetCapacityGuard(enabled bool, threshold float64) {
+	bm.respectCapacity = enabled
+	if threshold <= 0 {
+		threshold = defaultCapacityThreshold
+	}
+	bm.capacityThreshold = threshold
 }
 
 // logVerbose logs a message if verbosity >= 2
@@ -148,6 +167,60 @@ func (bm *BackupManager) initMinioClient() error {
 		bm.logVerbose("bucket %s created", bm.minioConfig.Bucket)
 	}
 
+	return nil
+}
+
+func (bm *BackupManager) initMinioAdminClient() error {
+	if bm.adminClient != nil {
+		return nil
+	}
+	if bm.minioConfig == nil {
+		return fmt.Errorf("minio configuration is not set")
+	}
+	client, err := madmin.New(bm.minioConfig.Endpoint, bm.minioConfig.AccessKey, bm.minioConfig.SecretKey, bm.minioConfig.UseSSL)
+	if err != nil {
+		return fmt.Errorf("failed to create Minio admin client: %w", err)
+	}
+	bm.adminClient = client
+	return nil
+}
+
+func (bm *BackupManager) ensureCapacity() error {
+	if !bm.respectCapacity {
+		return nil
+	}
+	if bm.minioConfig == nil {
+		return fmt.Errorf("capacity guard enabled but Minio configuration is missing")
+	}
+	threshold := bm.capacityThreshold
+	if threshold <= 0 {
+		threshold = defaultCapacityThreshold
+	}
+	if err := bm.initMinioAdminClient(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	info, err := bm.adminClient.StorageInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to query Minio storage info: %w", err)
+	}
+	var total, used uint64
+	for _, disk := range info.Disks {
+		total += disk.TotalSpace
+		used += disk.UsedSpace
+	}
+	if total == 0 {
+		return fmt.Errorf("Minio storage reported zero total capacity")
+	}
+	usage := (float64(used) / float64(total)) * 100
+	if usage >= threshold {
+		return fmt.Errorf("Minio storage usage %.1f%% exceeds %.1f%% threshold; run 'ciwg-cli dns-backup monitor' to migrate or delete old backups", usage, threshold)
+	}
+	if !bm.capacityReported {
+		fmt.Printf("✓ Minio capacity check: %.1f%% used (threshold %.1f%%)\n", usage, threshold)
+		bm.capacityReported = true
+	}
 	return nil
 }
 
@@ -324,6 +397,9 @@ func (bm *BackupManager) TestAWSConnection() error {
 // UploadSnapshot uploads a DNS snapshot to Minio
 func (bm *BackupManager) UploadSnapshot(snapshot *ZoneSnapshot, format string) (string, error) {
 	if err := bm.initMinioClient(); err != nil {
+		return "", err
+	}
+	if err := bm.ensureCapacity(); err != nil {
 		return "", err
 	}
 

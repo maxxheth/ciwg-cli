@@ -222,6 +222,8 @@ func initCreateFlags() {
 	createCmd.Flags().String("format", "json", "Backup format (json or yaml)")
 	createCmd.Flags().Bool("upload-minio", true, "Upload backup to Minio")
 	createCmd.Flags().Bool("upload-glacier", false, "Also upload backup to AWS Glacier")
+	createCmd.Flags().Bool("respect-capacity-limit", getEnvBoolWithDefault("DNSBACKUP_RESPECT_CAPACITY_LIMIT", false), "Check Minio storage capacity before creating backups (env: DNSBACKUP_RESPECT_CAPACITY_LIMIT)")
+	createCmd.Flags().Float64("capacity-threshold", getEnvFloat64WithDefault("DNSBACKUP_CAPACITY_THRESHOLD", 95.0), "Storage usage threshold percentage that blocks uploads (env: DNSBACKUP_CAPACITY_THRESHOLD)")
 	addZoneLookupFlags(createCmd)
 
 	// Minio flags

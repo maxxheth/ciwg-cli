@@ -45,6 +45,9 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	manager := dnsbackup.NewBackupManager(minioConfig)
+	respectCapacity := mustGetBoolFlag(cmd, "respect-capacity-limit")
+	capacityThreshold := mustGetFloat64Flag(cmd, "capacity-threshold")
+	manager.SetCapacityGuard(respectCapacity, capacityThreshold)
 
 	var glacierManager *dnsbackup.BackupManager
 	if mustGetBoolFlag(cmd, "upload-glacier") {
@@ -53,6 +56,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		glacierManager = dnsbackup.NewBackupManagerWithAWS(minioConfig, awsConfig)
+		glacierManager.SetCapacityGuard(respectCapacity, capacityThreshold)
 	}
 
 	format := strings.ToLower(mustGetStringFlag(cmd, "format"))
