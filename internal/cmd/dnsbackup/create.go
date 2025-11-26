@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	dnsbackup "ciwg-cli/internal/dnsbackup"
 
@@ -15,7 +16,6 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	zone := args[0]
 	token, err := requireToken(mustGetStringFlag(cmd, "token"))
 	if err != nil {
 		return err
@@ -27,51 +27,59 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(cmd.Context(), mustGetDurationFlag(cmd, "timeout"))
-	defer cancel()
-
-	// Export DNS records
-	fmt.Printf("Exporting DNS records for zone '%s'...\n", zone)
-	snapshot, err := client.Export(ctx, zone)
+	zones, err := resolveZones(cmd, args, client)
 	if err != nil {
-		return fmt.Errorf("failed to export DNS records: %w", err)
+		return err
+	}
+	if len(zones) == 0 {
+		return fmt.Errorf("no zones resolved")
 	}
 
-	fmt.Printf("✓ Exported %d DNS records\n", len(snapshot.Records))
+	if !mustGetBoolFlag(cmd, "upload-minio") {
+		fmt.Fprintln(cmd.ErrOrStderr(), "upload-minio flag disabled; nothing to do")
+		return nil
+	}
 
-	// Upload to Minio if configured
-	if mustGetBoolFlag(cmd, "upload-minio") {
-		minioConfig, err := getMinioConfigFromFlags(cmd)
+	minioConfig, err := getMinioConfigFromFlags(cmd)
+	if err != nil {
+		return err
+	}
+	manager := dnsbackup.NewBackupManager(minioConfig)
+
+	var glacierManager *dnsbackup.BackupManager
+	if mustGetBoolFlag(cmd, "upload-glacier") {
+		awsConfig, err := getAWSConfigFromFlags(cmd)
 		if err != nil {
 			return err
 		}
+		glacierManager = dnsbackup.NewBackupManagerWithAWS(minioConfig, awsConfig)
+	}
 
-		manager := dnsbackup.NewBackupManager(minioConfig)
-		format := mustGetStringFlag(cmd, "format")
-		if format == "" {
-			format = "json"
+	format := strings.ToLower(mustGetStringFlag(cmd, "format"))
+	if format == "" {
+		format = "json"
+	}
+	timeout := mustGetDurationFlag(cmd, "timeout")
+
+	for _, target := range zones {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Exporting DNS records for zone '%s'...\n", target.ZoneName)
+		ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+		snapshot, err := client.Export(ctx, target.ZoneName)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("failed to export DNS records for %s: %w", target.ZoneName, err)
 		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "[%s] Exported %d DNS records\n", target.ZoneName, len(snapshot.Records))
 
 		objectKey, err := manager.UploadSnapshot(snapshot, format)
 		if err != nil {
-			return fmt.Errorf("failed to upload to Minio: %w", err)
+			return fmt.Errorf("failed to upload %s to Minio: %w", target.ZoneName, err)
 		}
+		fmt.Fprintf(cmd.OutOrStdout(), "[%s] Uploaded to Minio: %s\n", target.ZoneName, objectKey)
 
-		fmt.Printf("✓ Uploaded to Minio: %s\n", objectKey)
-
-		// Also upload to AWS Glacier if requested
-		if mustGetBoolFlag(cmd, "upload-glacier") {
-			awsConfig, err := getAWSConfigFromFlags(cmd)
-			if err != nil {
-				return err
-			}
-
-			managerWithAWS := dnsbackup.NewBackupManagerWithAWS(minioConfig, awsConfig)
-
-			// Upload directly to Glacier
-			err = managerWithAWS.UploadToGlacier(snapshot, format)
-			if err != nil {
-				return fmt.Errorf("failed to upload to Glacier: %w", err)
+		if glacierManager != nil {
+			if err := glacierManager.UploadToGlacier(snapshot, format); err != nil {
+				return fmt.Errorf("failed to upload %s to Glacier: %w", target.ZoneName, err)
 			}
 		}
 	}

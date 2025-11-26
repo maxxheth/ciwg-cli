@@ -15,52 +15,85 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	if err := loadEnvFromFlag(cmd); err != nil {
 		return err
 	}
-	zone := args[0]
 	snapshotPath := mustGetStringFlag(cmd, "snapshot")
 	if snapshotPath == "" {
 		return errors.New("--snapshot is required")
 	}
 
-	snapshot, err := dnsbackup.LoadSnapshot(snapshotPath, mustGetStringFlag(cmd, "snapshot-format"))
+	token, err := requireToken(mustGetStringFlag(cmd, "token"))
+	if err != nil {
+		return err
+	}
+	client, err := dnsbackup.NewClient(token)
 	if err != nil {
 		return err
 	}
 
-	client, ctx, cancel, err := buildClient(cmd)
+	zones, err := resolveZones(cmd, args, client)
 	if err != nil {
 		return err
 	}
-	defer cancel()
-
-	plan, err := client.Plan(ctx, zone, snapshot, dnsbackup.PlanOptions{
-		DeleteExtraneous: mustGetBoolFlag(cmd, "delete-missing"),
-	})
-	if err != nil {
-		return err
+	if len(zones) == 0 {
+		return errors.New("no zones resolved")
 	}
 
-	fmt.Fprintln(cmd.OutOrStdout(), summarizePlan(plan))
-	if len(plan.Changes) == 0 {
-		return nil
-	}
-
-	format := strings.ToLower(mustGetStringFlag(cmd, "format"))
-	if format == "" {
-		format = "json"
+	snapshotFormat := mustGetStringFlag(cmd, "snapshot-format")
+	snapshotPattern := fmt.Sprintf("%%s.%s", formatExtension(snapshotFormat))
+	deleteMissing := mustGetBoolFlag(cmd, "delete-missing")
+	planFormat := strings.ToLower(mustGetStringFlag(cmd, "format"))
+	if planFormat == "" {
+		planFormat = "json"
 	}
 	pretty := mustGetBoolFlag(cmd, "pretty")
-
-	if mustGetBoolFlag(cmd, "print-plan") {
-		if err := streamPlan(cmd, plan, format, pretty); err != nil {
+	printPlan := mustGetBoolFlag(cmd, "print-plan")
+	outputBase := mustGetStringFlag(cmd, "output")
+	multi := len(zones) > 1
+	timeout := mustGetDurationFlag(cmd, "timeout")
+	for _, target := range zones {
+		resolvedSnapshot, _, err := resolveZoneFilePath(snapshotPath, target.ZoneName, snapshotPattern, "--snapshot", multi, false)
+		if err != nil {
 			return err
 		}
-	}
-
-	if output := mustGetStringFlag(cmd, "output"); output != "" {
-		if err := dnsbackup.SavePlan(plan, output, format, pretty); err != nil {
-			return fmt.Errorf("write plan: %w", err)
+		snapshot, err := dnsbackup.LoadSnapshot(resolvedSnapshot, snapshotFormat)
+		if err != nil {
+			return err
 		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "Plan saved to %s\n", output)
+
+		ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+		plan, err := client.Plan(ctx, target.ZoneName, snapshot, dnsbackup.PlanOptions{
+			DeleteExtraneous: deleteMissing,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		fmt.Fprintf(cmd.OutOrStdout(), "[%s] %s\n", target.ZoneName, summarizePlan(plan))
+		if len(plan.Changes) == 0 {
+			continue
+		}
+
+		if printPlan {
+			fmt.Fprintf(cmd.OutOrStdout(), "-- %s plan --\n", target.ZoneName)
+			if err := streamPlan(cmd, plan, planFormat, pretty); err != nil {
+				return err
+			}
+		}
+
+		if outputBase != "" {
+			defaultPattern := fmt.Sprintf("%%s.%s", formatExtension(planFormat))
+			planPath, _, err := resolveZoneFilePath(outputBase, target.ZoneName, defaultPattern, "--output", multi, true)
+			if err != nil {
+				return err
+			}
+			if err := ensureParentDir(planPath); err != nil {
+				return fmt.Errorf("prepare plan output for %s: %w", target.ZoneName, err)
+			}
+			if err := dnsbackup.SavePlan(plan, planPath, planFormat, pretty); err != nil {
+				return fmt.Errorf("write plan for %s: %w", target.ZoneName, err)
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "[%s] Plan saved to %s\n", target.ZoneName, planPath)
+		}
 	}
 
 	return nil
@@ -70,76 +103,117 @@ func runApply(cmd *cobra.Command, args []string) error {
 	if err := loadEnvFromFlag(cmd); err != nil {
 		return err
 	}
-	zone := args[0]
 	path := mustGetStringFlag(cmd, "snapshot")
 	if path == "" {
 		return errors.New("--snapshot is required")
 	}
 
-	snapshot, err := dnsbackup.LoadSnapshot(path, mustGetStringFlag(cmd, "snapshot-format"))
+	token, err := requireToken(mustGetStringFlag(cmd, "token"))
+	if err != nil {
+		return err
+	}
+	client, err := dnsbackup.NewClient(token)
 	if err != nil {
 		return err
 	}
 
-	client, ctx, cancel, err := buildClient(cmd)
+	zones, err := resolveZones(cmd, args, client)
 	if err != nil {
 		return err
 	}
-	defer cancel()
-
-	plan, err := client.Plan(ctx, zone, snapshot, dnsbackup.PlanOptions{
-		DeleteExtraneous: mustGetBoolFlag(cmd, "delete-missing"),
-	})
-	if err != nil {
-		return err
+	if len(zones) == 0 {
+		return errors.New("no zones resolved")
 	}
 
-	fmt.Fprintln(cmd.OutOrStdout(), summarizePlan(plan))
-	if output := mustGetStringFlag(cmd, "plan-output"); output != "" {
-		format := strings.ToLower(mustGetStringFlag(cmd, "plan-format"))
-		if format == "" {
-			format = "json"
-		}
-		if err := dnsbackup.SavePlan(plan, output, format, mustGetBoolFlag(cmd, "plan-pretty")); err != nil {
-			return fmt.Errorf("write plan: %w", err)
-		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "Plan saved to %s\n", output)
-	}
-
-	if len(plan.Changes) == 0 {
-		return nil
-	}
-
+	snapshotFormat := mustGetStringFlag(cmd, "snapshot-format")
+	snapshotPattern := fmt.Sprintf("%%s.%s", formatExtension(snapshotFormat))
+	deleteMissing := mustGetBoolFlag(cmd, "delete-missing")
 	planFormat := strings.ToLower(mustGetStringFlag(cmd, "plan-format"))
 	if planFormat == "" {
 		planFormat = "json"
 	}
 	planPretty := mustGetBoolFlag(cmd, "plan-pretty")
-	if mustGetBoolFlag(cmd, "print-plan") {
-		if err := streamPlan(cmd, plan, planFormat, planPretty); err != nil {
+	printPlan := mustGetBoolFlag(cmd, "print-plan")
+	planOutputBase := mustGetStringFlag(cmd, "plan-output")
+	multi := len(zones) > 1
+	timeout := mustGetDurationFlag(cmd, "timeout")
+	dryRun := mustGetBoolFlag(cmd, "dry-run")
+	autoApprove := mustGetBoolFlag(cmd, "yes")
+
+	for _, target := range zones {
+		resolvedSnapshot, _, err := resolveZoneFilePath(path, target.ZoneName, snapshotPattern, "--snapshot", multi, false)
+		if err != nil {
 			return err
 		}
+		snapshot, err := dnsbackup.LoadSnapshot(resolvedSnapshot, snapshotFormat)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+		plan, err := client.Plan(ctx, target.ZoneName, snapshot, dnsbackup.PlanOptions{
+			DeleteExtraneous: deleteMissing,
+		})
+		if err != nil {
+			cancel()
+			return err
+		}
+
+		fmt.Fprintf(cmd.OutOrStdout(), "[%s] %s\n", target.ZoneName, summarizePlan(plan))
+		if planOutputBase != "" {
+			defaultPattern := fmt.Sprintf("%%s.%s", formatExtension(planFormat))
+			planPath, _, err := resolveZoneFilePath(planOutputBase, target.ZoneName, defaultPattern, "--plan-output", multi, true)
+			if err != nil {
+				cancel()
+				return err
+			}
+			if err := ensureParentDir(planPath); err != nil {
+				cancel()
+				return fmt.Errorf("prepare plan output for %s: %w", target.ZoneName, err)
+			}
+			if err := dnsbackup.SavePlan(plan, planPath, planFormat, planPretty); err != nil {
+				cancel()
+				return fmt.Errorf("write plan for %s: %w", target.ZoneName, err)
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(), "[%s] Plan saved to %s\n", target.ZoneName, planPath)
+		}
+
+		if len(plan.Changes) == 0 {
+			cancel()
+			continue
+		}
+
+		if printPlan {
+			fmt.Fprintf(cmd.OutOrStdout(), "-- %s plan --\n", target.ZoneName)
+			if err := streamPlan(cmd, plan, planFormat, planPretty); err != nil {
+				cancel()
+				return err
+			}
+		}
+
+		if dryRun {
+			fmt.Fprintf(cmd.ErrOrStderr(), "[%s] Dry run enabled; no changes applied\n", target.ZoneName)
+			cancel()
+			continue
+		}
+
+		if !autoApprove {
+			cancel()
+			return fmt.Errorf("refusing to apply changes to %s without --yes; rerun with --dry-run to preview", target.ZoneName)
+		}
+
+		for _, change := range plan.Changes {
+			fmt.Fprintf(cmd.ErrOrStderr(), "[%s] Applying %s\n", target.ZoneName, describeChange(change))
+		}
+
+		if err := client.Apply(ctx, plan, dnsbackup.ApplyOptions{}); err != nil {
+			cancel()
+			return err
+		}
+		cancel()
+		fmt.Fprintf(cmd.ErrOrStderr(), "[%s] DNS records updated successfully\n", target.ZoneName)
 	}
 
-	dryRun := mustGetBoolFlag(cmd, "dry-run")
-	if dryRun {
-		fmt.Fprintln(cmd.ErrOrStderr(), "Dry run enabled; no changes applied")
-		return nil
-	}
-
-	if !mustGetBoolFlag(cmd, "yes") {
-		return errors.New("refusing to apply without --yes; rerun with --dry-run to preview")
-	}
-
-	for _, change := range plan.Changes {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Applying %s\n", describeChange(change))
-	}
-
-	if err := client.Apply(ctx, plan, dnsbackup.ApplyOptions{}); err != nil {
-		return err
-	}
-
-	fmt.Fprintln(cmd.ErrOrStderr(), "DNS records updated successfully")
 	return nil
 }
 

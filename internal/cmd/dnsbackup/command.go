@@ -20,7 +20,7 @@ Use 'export' to capture DNS records, 'plan' to preview a restore, and 'apply' to
 var exportCmd = &cobra.Command{
 	Use:   "export [zone]",
 	Short: "Export DNS records for a zone",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runExport,
 }
 
@@ -29,7 +29,7 @@ var createCmd = &cobra.Command{
 	Short: "Create and upload DNS backup for a zone",
 	Long: `Create a DNS backup by exporting records and uploading to Minio storage.
 Optionally also upload to AWS Glacier for long-term archival.`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: runCreate,
 }
 
@@ -96,14 +96,14 @@ var connCmd = &cobra.Command{
 var planCmd = &cobra.Command{
 	Use:   "plan [zone]",
 	Short: "Generate a change plan for a zone and backup snapshot",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runPlan,
 }
 
 var applyCmd = &cobra.Command{
 	Use:   "apply [zone]",
 	Short: "Apply a snapshot to a zone (supports dry-run)",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runApply,
 }
 
@@ -164,6 +164,7 @@ func initExportFlags() {
 	exportCmd.Flags().String("format", "json", "Snapshot format: json or yaml")
 	exportCmd.Flags().Bool("pretty", true, "Pretty-print JSON/YAML output")
 	exportCmd.Flags().StringSlice("metadata", nil, "Optional metadata key=value pairs to include in snapshot")
+	addZoneLookupFlags(exportCmd)
 }
 
 func initPlanFlags() {
@@ -174,6 +175,7 @@ func initPlanFlags() {
 	planCmd.Flags().String("format", "json", "Plan output format (json|yaml)")
 	planCmd.Flags().Bool("pretty", true, "Pretty-print the plan output")
 	planCmd.Flags().Bool("print-plan", false, "Write the full plan to stdout")
+	addZoneLookupFlags(planCmd)
 }
 
 func initApplyFlags() {
@@ -186,9 +188,24 @@ func initApplyFlags() {
 	applyCmd.Flags().String("plan-format", "json", "Plan serialization format (json|yaml)")
 	applyCmd.Flags().Bool("plan-pretty", true, "Pretty-print plan output")
 	applyCmd.Flags().Bool("yes", false, "Apply changes without prompting (required when not using --dry-run)")
+	addZoneLookupFlags(applyCmd)
 }
 
 func initTestFlags() {}
+
+func addZoneLookupFlags(command *cobra.Command) {
+	command.Flags().Bool("zone-lookup", getEnvBoolWithDefault("DNS_ZONE_LOOKUP", false), "Discover zone names from remote servers instead of providing them explicitly (requires --server-range)")
+	command.Flags().String("server-range", getEnvWithDefault("SERVER_RANGE", ""), "Server range pattern to use when --zone-lookup is enabled (env: SERVER_RANGE)")
+	addZoneLookupSSHFlags(command)
+}
+
+func addZoneLookupSSHFlags(command *cobra.Command) {
+	command.Flags().String("lookup-user", getEnvWithDefault("SSH_USER", ""), "SSH username for zone discovery (env: SSH_USER)")
+	command.Flags().String("lookup-port", getEnvWithDefault("SSH_PORT", "22"), "SSH port for zone discovery (env: SSH_PORT)")
+	command.Flags().String("lookup-key", getEnvWithDefault("SSH_KEY", ""), "SSH private key path for zone discovery (env: SSH_KEY)")
+	command.Flags().Bool("lookup-agent", getEnvBoolWithDefault("SSH_AGENT", true), "Use SSH agent for zone discovery (env: SSH_AGENT)")
+	command.Flags().Duration("lookup-timeout", getEnvDurationWithDefault("SSH_TIMEOUT", 30*time.Second), "SSH connection timeout for zone discovery (env: SSH_TIMEOUT)")
+}
 
 func defaultDNSBucket() string {
 	bucket := os.Getenv("MINIO_DNS_BUCKET")
@@ -202,6 +219,7 @@ func initCreateFlags() {
 	createCmd.Flags().String("format", "json", "Backup format (json or yaml)")
 	createCmd.Flags().Bool("upload-minio", true, "Upload backup to Minio")
 	createCmd.Flags().Bool("upload-glacier", false, "Also upload backup to AWS Glacier")
+	addZoneLookupFlags(createCmd)
 
 	// Minio flags
 	createCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")

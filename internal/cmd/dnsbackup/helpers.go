@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +39,15 @@ func getEnvWithDefault(key, defaultValue string) string {
 func getEnvBoolWithDefault(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		return strings.ToLower(value) == "true" || value == "1"
+	}
+	return defaultValue
+}
+
+func getEnvDurationWithDefault(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := time.ParseDuration(value); err == nil {
+			return parsed
+		}
 	}
 	return defaultValue
 }
@@ -117,6 +129,170 @@ func loadEnvFromFlag(cmd *cobra.Command) error {
 		return fmt.Errorf("load env file: %w", err)
 	}
 	return nil
+}
+
+func parseServerRange(pattern string) (string, int, int, map[int]bool, error) {
+	parts := strings.Split(pattern, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return "", 0, 0, nil, fmt.Errorf("invalid server range format, expected 'pattern:start-end' or 'pattern:start-end:!exclusions'")
+	}
+
+	rangeParts := strings.Split(parts[1], "-")
+	if len(rangeParts) != 2 {
+		return "", 0, 0, nil, fmt.Errorf("invalid range format, expected 'start-end'")
+	}
+
+	start, err := strconv.Atoi(rangeParts[0])
+	if err != nil {
+		return "", 0, 0, nil, fmt.Errorf("invalid start number: %w", err)
+	}
+
+	end, err := strconv.Atoi(rangeParts[1])
+	if err != nil {
+		return "", 0, 0, nil, fmt.Errorf("invalid end number: %w", err)
+	}
+
+	if start > end {
+		return "", 0, 0, nil, fmt.Errorf("start of range cannot be greater than end")
+	}
+
+	exclusions := make(map[int]bool)
+	if len(parts) == 3 {
+		exclusionStr := parts[2]
+		if !strings.HasPrefix(exclusionStr, "!") {
+			return "", 0, 0, nil, fmt.Errorf("exclusions part must start with '!'")
+		}
+		exclusionStr = strings.TrimPrefix(exclusionStr, "!")
+
+		for _, segment := range strings.Split(exclusionStr, ",") {
+			segment = strings.TrimSpace(segment)
+			if segment == "" {
+				continue
+			}
+			if strings.Contains(segment, "-") {
+				sub := strings.Split(segment, "-")
+				if len(sub) != 2 {
+					return "", 0, 0, nil, fmt.Errorf("invalid exclusion range format: %s", segment)
+				}
+				subStart, err := strconv.Atoi(sub[0])
+				if err != nil {
+					return "", 0, 0, nil, fmt.Errorf("invalid exclusion start number in '%s': %w", segment, err)
+				}
+				subEnd, err := strconv.Atoi(sub[1])
+				if err != nil {
+					return "", 0, 0, nil, fmt.Errorf("invalid exclusion end number in '%s': %w", segment, err)
+				}
+				if subStart > subEnd {
+					return "", 0, 0, nil, fmt.Errorf("invalid exclusion range: start > end in %s", segment)
+				}
+				for i := subStart; i <= subEnd; i++ {
+					exclusions[i] = true
+				}
+			} else {
+				exNum, err := strconv.Atoi(segment)
+				if err != nil {
+					return "", 0, 0, nil, fmt.Errorf("invalid exclusion number '%s': %w", segment, err)
+				}
+				exclusions[exNum] = true
+			}
+		}
+	}
+
+	return parts[0], start, end, exclusions, nil
+}
+
+func sanitizeZoneForFilename(zone string) string {
+	zone = strings.ToLower(strings.TrimSpace(zone))
+	if zone == "" {
+		return "zone"
+	}
+	var b strings.Builder
+	for _, r := range zone {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	clean := strings.Trim(b.String(), "-")
+	if clean == "" {
+		return "zone"
+	}
+	return clean
+}
+
+func resolveZoneFilePath(base, zone, defaultPattern, flagName string, multi bool, allowEmpty bool) (string, bool, error) {
+	sanitized := sanitizeZoneForFilename(zone)
+	sanitizedPattern := defaultPattern
+	if strings.Contains(defaultPattern, "%s") {
+		sanitizedPattern = fmt.Sprintf(defaultPattern, sanitized)
+	}
+	if !multi {
+		switch {
+		case base == "" && allowEmpty:
+			return "", true, nil
+		case strings.Contains(base, "%s"):
+			return fmt.Sprintf(base, sanitized), false, nil
+		default:
+			return base, false, nil
+		}
+	}
+	if base == "" {
+		if !allowEmpty {
+			return "", false, fmt.Errorf("%s must be provided when multiple zones are discovered; include '%%s' placeholder or point to a directory", flagName)
+		}
+		if defaultPattern == "" {
+			return "", false, fmt.Errorf("no default pattern available for %s", flagName)
+		}
+		return sanitizedPattern, false, nil
+	}
+	if strings.Contains(base, "%s") {
+		return fmt.Sprintf(base, sanitized), false, nil
+	}
+	if info, err := os.Stat(base); err == nil && info.IsDir() {
+		if defaultPattern == "" {
+			return "", false, fmt.Errorf("when multiple zones are discovered, %s must include '%%s' placeholder", flagName)
+		}
+		return filepath.Join(base, sanitizedPattern), false, nil
+	}
+	if strings.HasSuffix(base, string(os.PathSeparator)) {
+		if defaultPattern == "" {
+			return "", false, fmt.Errorf("when multiple zones are discovered, %s must include '%%s' placeholder", flagName)
+		}
+		dir := strings.TrimRight(base, string(os.PathSeparator))
+		if dir == "" {
+			dir = "."
+		}
+		return filepath.Join(dir, sanitizedPattern), false, nil
+	}
+	return "", false, fmt.Errorf("when --zone-lookup yields multiple zones, %s must include '%%s' placeholder or point to a directory", flagName)
+}
+
+func ensureParentDir(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o755)
+}
+
+func formatExtension(format string) string {
+	switch strings.ToLower(format) {
+	case "yaml", "yml":
+		return "yaml"
+	default:
+		return "json"
+	}
+}
+
+func currentUsername() string {
+	if usr, err := user.Current(); err == nil && usr.Username != "" {
+		return usr.Username
+	}
+	if envUser := os.Getenv("USER"); envUser != "" {
+		return envUser
+	}
+	return "root"
 }
 
 func summarizePlan(plan *dnsbackup.Plan) string {
