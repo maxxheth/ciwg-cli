@@ -118,7 +118,7 @@ func init() {
 	inventoryGenerateCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "inventory.json", "Output file for inventory")
 	inventoryGenerateCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
 	inventoryGenerateCmd.Flags().BoolVar(&inventoryLocal, "local", false, "Run locally without SSH")
-	inventoryGenerateCmd.Flags().StringVar(&inventoryFormat, "format", "json", "Export format (json or csv) [DEPRECATED: use file extension in --output instead]")
+	inventoryGenerateCmd.Flags().StringVar(&inventoryFormat, "format", "json", "Export format [DEPRECATED: use file extension in --output instead]")
 	inventoryGenerateCmd.Flags().MarkDeprecated("format", "use file extension in --output flag instead (e.g., --output=file.csv)")
 	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterSite, "filter-by-site", "", "Filter by site list (file path, pipe-delimited string, or stdin)")
 	inventoryGenerateCmd.Flags().StringVar(&inventoryFilterServer, "filter-by-server", "", "Filter by server list (file path, pipe-delimited string, or stdin)")
@@ -134,7 +134,7 @@ func init() {
 	// Search command flags
 	inventorySearchCmd.Flags().StringVar(&inventoryServerRange, "server-range", "", "Server range pattern (e.g., 'wp%d.ciwgserver.com:0-41')")
 	inventorySearchCmd.Flags().StringVarP(&inventoryOutputFile, "output", "o", "", "Output file for search results")
-	inventorySearchCmd.Flags().StringVar(&inventoryFormat, "format", "text", "Output format (text, json, csv) [DEPRECATED: use file extension in --output instead]")
+	inventorySearchCmd.Flags().StringVar(&inventoryFormat, "format", "text", "Output format [DEPRECATED: use file extension in --output instead]")
 	inventorySearchCmd.Flags().MarkDeprecated("format", "use file extension in --output flag instead (e.g., --output=file.csv)")
 	inventorySearchCmd.Flags().StringVar(&searchAction, "action", "", "Action to perform on matches: list-containers, show-compose, backup")
 	inventorySearchCmd.Flags().StringVar(&searchExec, "exec", "", "Custom command to execute on matched servers")
@@ -310,7 +310,7 @@ func runInventoryGenerate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("error writing CSV output: %w", err)
 		}
 	default:
-		return fmt.Errorf("unsupported format: %s. Please use 'json' or 'csv'", inventoryFormat)
+		return fmt.Errorf("unsupported format: %s. Please use 'json' or 'csv'", format)
 	}
 
 	fmt.Printf("Inventory written to %s\n", inventoryOutputFile)
