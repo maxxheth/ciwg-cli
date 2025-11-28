@@ -3,6 +3,9 @@ package backup
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -17,6 +20,9 @@ type BackupConfig struct {
 
 	// List of containers to back up
 	Containers []ContainerConfig `yaml:"containers"`
+
+	// Retention policy rulesets for backup lifecycle management
+	Rulesets map[string]RetentionRuleset `yaml:"rulesets,omitempty"`
 }
 
 // ConfigDefaults contains default settings for all containers
@@ -197,4 +203,165 @@ func (c *BackupConfig) ApplyDefaults(container *ContainerConfig) {
 			container.Env[k] = v
 		}
 	}
+}
+
+// RetentionRuleset defines a single retention policy rule
+type RetentionRuleset struct {
+	// OlderThan specifies the age threshold (e.g., "7 days", "6 months", "1 year")
+	OlderThan string `yaml:"older_than"`
+
+	// Exclude specifies days to exclude from this rule (e.g., "Sunday", "every 7 days", "last day of month")
+	Exclude string `yaml:"exclude,omitempty"`
+
+	// Action specifies what to do with matching backups: "delete", "migrate_to_glacier", "keep"
+	Action string `yaml:"action,omitempty"`
+
+	// TargetStorage specifies the storage backend this rule applies to: "s3", "minio", "both"
+	TargetStorage string `yaml:"target_storage,omitempty"`
+}
+
+// LoadRetentionPolicyFromFile loads retention policy from a YAML file
+func LoadRetentionPolicyFromFile(path string) (map[string]RetentionRuleset, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read retention policy file: %w", err)
+	}
+
+	var config struct {
+		Rulesets map[string]RetentionRuleset `yaml:"rulesets"`
+	}
+
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse retention policy YAML: %w", err)
+	}
+
+	// Validate rulesets
+	if err := ValidateRetentionRulesets(config.Rulesets); err != nil {
+		return nil, fmt.Errorf("invalid retention policy: %w", err)
+	}
+
+	return config.Rulesets, nil
+}
+
+// ValidateRetentionRulesets validates retention policy rulesets
+func ValidateRetentionRulesets(rulesets map[string]RetentionRuleset) error {
+	for name, ruleset := range rulesets {
+		if ruleset.OlderThan == "" {
+			return fmt.Errorf("ruleset '%s': older_than is required", name)
+		}
+
+		// Parse the older_than to ensure it's valid
+		if _, err := ParseHumanDuration(ruleset.OlderThan); err != nil {
+			return fmt.Errorf("ruleset '%s': invalid older_than value: %w", name, err)
+		}
+
+		// Validate action if specified
+		if ruleset.Action != "" {
+			validActions := map[string]bool{"delete": true, "migrate_to_glacier": true, "keep": true}
+			if !validActions[ruleset.Action] {
+				return fmt.Errorf("ruleset '%s': invalid action '%s' (must be 'delete', 'migrate_to_glacier', or 'keep')", name, ruleset.Action)
+			}
+		}
+
+		// Validate target_storage if specified
+		if ruleset.TargetStorage != "" {
+			validTargets := map[string]bool{"s3": true, "minio": true, "both": true}
+			if !validTargets[ruleset.TargetStorage] {
+				return fmt.Errorf("ruleset '%s': invalid target_storage '%s' (must be 's3', 'minio', or 'both')", name, ruleset.TargetStorage)
+			}
+		}
+	}
+
+	return nil
+}
+
+// ParseHumanDuration parses human-readable duration strings like "7 days", "6 months", "1 year"
+// Similar to Carbon PHP library functionality
+func ParseHumanDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+
+	// Split into number and unit
+	parts := strings.Fields(s)
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid duration format: expected 'number unit' (e.g., '7 days')")
+	}
+
+	value, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, fmt.Errorf("invalid number in duration: %w", err)
+	}
+
+	unit := parts[1]
+	// Handle both singular and plural forms
+	switch unit {
+	case "day", "days":
+		return time.Duration(value) * 24 * time.Hour, nil
+	case "week", "weeks":
+		return time.Duration(value) * 7 * 24 * time.Hour, nil
+	case "month", "months":
+		// Approximate: 30 days per month
+		return time.Duration(value) * 30 * 24 * time.Hour, nil
+	case "year", "years":
+		// Approximate: 365 days per year
+		return time.Duration(value) * 365 * 24 * time.Hour, nil
+	case "hour", "hours":
+		return time.Duration(value) * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("unsupported time unit: %s (supported: days, weeks, months, years, hours)", unit)
+	}
+}
+
+// EvaluateExclusion checks if a given time should be excluded based on the exclusion rule
+// Supports patterns like "Sunday", "every 7 days", "last day of month"
+func EvaluateExclusion(t time.Time, exclude string) bool {
+	if exclude == "" {
+		return false
+	}
+
+	exclude = strings.TrimSpace(strings.ToLower(exclude))
+
+	// Check for day of week (e.g., "sunday", "monday")
+	weekdays := map[string]time.Weekday{
+		"sunday":    time.Sunday,
+		"monday":    time.Monday,
+		"tuesday":   time.Tuesday,
+		"wednesday": time.Wednesday,
+		"thursday":  time.Thursday,
+		"friday":    time.Friday,
+		"saturday":  time.Saturday,
+	}
+
+	if weekday, ok := weekdays[exclude]; ok {
+		return t.Weekday() == weekday
+	}
+
+	// Check for "every X days" pattern
+	if strings.HasPrefix(exclude, "every ") && strings.HasSuffix(exclude, " days") {
+		numStr := strings.TrimPrefix(exclude, "every ")
+		numStr = strings.TrimSuffix(numStr, " days")
+		numStr = strings.TrimSpace(numStr)
+
+		if num, err := strconv.Atoi(numStr); err == nil && num > 0 {
+			// Calculate if this is a multiple of num days from epoch
+			daysSinceEpoch := int(t.Unix() / (24 * 3600))
+			return daysSinceEpoch%num == 0
+		}
+	}
+
+	// Check for "last day of month" pattern
+	if exclude == "last day of month" || exclude == "last day of the month" {
+		// Check if tomorrow is a new month
+		tomorrow := t.AddDate(0, 0, 1)
+		return tomorrow.Month() != t.Month()
+	}
+
+	// Check for specific day of month (e.g., "1st", "15th", "day 1", "day 15")
+	if strings.HasPrefix(exclude, "day ") {
+		dayStr := strings.TrimPrefix(exclude, "day ")
+		if day, err := strconv.Atoi(dayStr); err == nil {
+			return t.Day() == day
+		}
+	}
+
+	return false
 }

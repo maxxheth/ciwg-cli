@@ -17,13 +17,29 @@ func runBackupDelete(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Validate Minio configuration
+	// Get storage configuration
 	minioConfig, err := getMinioConfig(cmd)
 	if err != nil {
 		return err
 	}
 
-	bm := backup.NewBackupManager(nil, minioConfig)
+	s3Config, err := getS3Config(cmd)
+	if err != nil {
+		return err
+	}
+
+	// Ensure at least one storage backend is configured
+	if minioConfig == nil && s3Config == nil {
+		return fmt.Errorf("either MinIO or S3 must be configured (use --minio-endpoint or --s3-bucket)")
+	}
+
+	// Create backup manager
+	var bm *backup.BackupManager
+	if s3Config != nil {
+		bm = backup.NewBackupManagerWithS3(nil, s3Config)
+	} else {
+		bm = backup.NewBackupManager(nil, minioConfig)
+	}
 
 	var objectName string
 	if len(args) > 0 {

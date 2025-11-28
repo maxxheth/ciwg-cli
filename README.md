@@ -142,15 +142,118 @@ ciwg cron show hostname
 
 ### Backup Operations
 
+Create, manage, and maintain backups of WordPress containers with support for MinIO and AWS S3 storage backends, intelligent retention policies, and automatic migration to AWS Glacier.
+
+#### Storage Backends
+
+The CLI supports two object storage backends:
+- **MinIO**: Self-hosted S3-compatible storage (default)
+- **AWS S3**: Amazon S3 cloud storage (alternative)
+
+Both backends support the same feature set and can be configured via flags or environment variables.
+
 ```bash
-# Backup WordPress site to Minio
-ciwg backup hostname --container wp_site
+# Backup to MinIO (traditional)
+ciwg backup create hostname \
+  --minio-endpoint minio.example.com:9000 \
+  --minio-bucket backups
+
+# Backup to AWS S3 (new!)
+ciwg backup create hostname \
+  --s3-bucket my-backups \
+  --s3-region us-west-2 \
+  --s3-access-key $AWS_ACCESS_KEY_ID \
+  --s3-secret-key $AWS_SECRET_ACCESS_KEY
 
 # Backup with custom config
-ciwg backup hostname --config backup-config.yml
+ciwg backup create hostname --config-file backup-config.yml
 
 # Backup server range
-ciwg backup --server-range="wp%d.example.com:0-41"
+ciwg backup create --server-range="wp%d.example.com:0-41"
+```
+
+#### Smart Retention Policies
+
+Configure intelligent retention policies using a YAML file to automatically:
+- Keep daily backups for a specified period
+- Preserve weekly backups (e.g., every Sunday)
+- Preserve monthly backups (e.g., last day of each month)
+- Automatically migrate old backups to AWS Glacier for long-term cold storage
+- Delete backups that don't meet any retention criteria
+
+Example retention policy (`retention-policy.yml`):
+```yaml
+rulesets:
+  # Keep weekly backups (Sundays) and migrate to Glacier after 7 days
+  weekly_to_glacier:
+    older_than: "7 days"
+    exclude: "Sunday"
+    action: "migrate_to_glacier"
+    target_storage: "both"
+  
+  # Delete daily backups after 7 days
+  daily_cleanup:
+    older_than: "7 days"
+    exclude: ""
+    action: "delete"
+    target_storage: "both"
+  
+  # Keep monthly backups (last day of month) and migrate to Glacier after 6 months
+  monthly_to_glacier:
+    older_than: "6 months"
+    exclude: "last day of month"
+    action: "migrate_to_glacier"
+    target_storage: "both"
+  
+  # Delete non-monthly backups after 6 months
+  old_cleanup:
+    older_than: "6 months"
+    exclude: ""
+    action: "delete"
+    target_storage: "both"
+```
+
+Usage:
+```bash
+# Create backup with smart retention policy
+ciwg backup create hostname \
+  --prune \
+  --retention-policy retention-policy.yml
+
+# Works with server ranges
+ciwg backup create --server-range="wp%d.example.com:0-41" \
+  --prune \
+  --retention-policy retention-policy.yml
+
+# Works with S3
+ciwg backup create hostname \
+  --s3-bucket my-backups \
+  --prune \
+  --retention-policy retention-policy.yml
+```
+
+See `examples/retention-policy.yml` for a complete example with detailed comments.
+
+#### Basic Backup Commands
+
+```bash
+# Create backup
+ciwg backup create hostname
+
+# List backups (MinIO)
+ciwg backup list --minio-endpoint minio.example.com:9000
+
+# List backups (S3)
+ciwg backup list --s3-bucket my-backups --s3-region us-west-2
+
+# Read/download a backup
+ciwg backup read backups/site-20240101-120000.tgz --output backup.tgz
+
+# Delete backups
+ciwg backup delete backups/site-20240101-120000.tgz
+
+# Test connections
+ciwg backup conn
 ```
 
 ### DNS Backup

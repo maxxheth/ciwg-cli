@@ -17,13 +17,29 @@ func runBackupList(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to load env file '%s': %w", envPath, err)
 		}
 	}
-	// Validate Minio configuration
+	// Get storage configuration
 	minioConfig, err := getMinioConfig(cmd)
 	if err != nil {
 		return err
 	}
 
-	backupManager := backup.NewBackupManager(nil, minioConfig)
+	s3Config, err := getS3Config(cmd)
+	if err != nil {
+		return err
+	}
+
+	// Ensure at least one storage backend is configured
+	if minioConfig == nil && s3Config == nil {
+		return fmt.Errorf("either MinIO or S3 must be configured (use --minio-endpoint or --s3-bucket)")
+	}
+
+	// Create backup manager
+	var backupManager *backup.BackupManager
+	if s3Config != nil {
+		backupManager = backup.NewBackupManagerWithS3(nil, s3Config)
+	} else {
+		backupManager = backup.NewBackupManager(nil, minioConfig)
+	}
 
 	prefix := mustGetStringFlag(cmd, "prefix")
 	limit := mustGetIntFlag(cmd, "limit")
