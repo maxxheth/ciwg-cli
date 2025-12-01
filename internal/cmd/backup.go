@@ -341,6 +341,7 @@ func init() {
 
 	// Custom container / config file flags
 	backupCreateCmd.Flags().String("config-file", "", "Path to YAML configuration file for custom backup configurations")
+	backupCreateCmd.Flags().String("config-dir", getEnvWithDefault("BACKUP_CONFIG_DIR", ""), "Directory containing YAML config files for custom apps (env: BACKUP_CONFIG_DIR)")
 	backupCreateCmd.Flags().String("database-type", "", "Database type for custom containers (postgres, mysql, mongodb)")
 	backupCreateCmd.Flags().String("database-export-dir", "", "Directory where database exports should be saved")
 	backupCreateCmd.Flags().String("custom-app-dir", "", "Application directory for custom containers (if different from working dir)")
@@ -704,6 +705,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		Local:                localMode,
 		ParentDir:            mustGetStringFlag(cmd, "container-parent-dir"),
 		ConfigFile:           mustGetStringFlag(cmd, "config-file"),
+		ConfigDir:            mustGetStringFlag(cmd, "config-dir"),
 		DatabaseType:         mustGetStringFlag(cmd, "database-type"),
 		DatabaseExportDir:    mustGetStringFlag(cmd, "database-export-dir"),
 		CustomAppDir:         mustGetStringFlag(cmd, "custom-app-dir"),
