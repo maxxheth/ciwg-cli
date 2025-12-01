@@ -146,6 +146,8 @@ type BackupOptions struct {
 	ParentDir string
 	// ConfigFile is the path to a YAML config file for custom backup configurations
 	ConfigFile string
+	// ConfigDir points to a directory containing one or more YAML configs
+	ConfigDir string
 	// DatabaseType specifies the database type for custom containers (postgres, mysql, etc.)
 	DatabaseType string
 	// DatabaseExportDir is where database exports should be saved before backup
@@ -1059,21 +1061,65 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 		return fmt.Errorf("failed to seek temporary file for upload: %w", err)
 	}
 
-	fmt.Printf("      [AWS] Initiating upload to Glacier vault '%s'...\n", bm.awsConfig.Vault)
-	fmt.Printf("      [AWS] Archive: %s\n", archiveDescription)
-	fmt.Printf("      [AWS] Size: %.2f MB\n", float64(fileSize)/(1024*1024))
+	uploadResult, _, err := bm.uploadTempFileToAWS(ctx, tmpFile, archiveDescription, treeHash, linearHashHex, fileSize, accountID, "      ")
+	if err != nil {
+		return err
+	}
+
+	// Upload success - remove the temp buffer file immediately
+	bm.logTrace("Attempting to remove temp file: %s", tmpFile.Name())
+	if err := os.Remove(tmpFile.Name()); err == nil {
+		fmt.Printf("      [AWS] Removed temporary buffer file %s\n", tmpFile.Name())
+		bm.logDebug("Successfully removed temp file")
+	} else {
+		fmt.Printf("      [AWS] Warning: failed to delete temp file %s: %v\n", tmpFile.Name(), err)
+		bm.logDebug("Failed to remove temp file: %v", err)
+	}
+	if uploadResult != nil && uploadResult.ArchiveId != nil {
+		bm.logVerbose("Full Archive ID: %s", *uploadResult.ArchiveId)
+	}
+
+	bm.logDebug("UploadToAWS completed successfully")
+	return nil
+}
+
+// uploadTempFileToAWS centralizes the Glacier UploadArchive call with consistent
+// logging, middleware, and payload hash handling. The caller must ensure the
+// temporary file already contains the data to upload.
+func (bm *BackupManager) uploadTempFileToAWS(
+	ctx context.Context,
+	tmpFile *os.File,
+	archiveDescription string,
+	treeHash string,
+	linearHashHex string,
+	fileSize int64,
+	accountID string,
+	logPrefix string,
+) (*glacier.UploadArchiveOutput, time.Duration, error) {
+	if logPrefix == "" {
+		logPrefix = "      "
+	}
+
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return nil, 0, fmt.Errorf("failed to seek temporary file for upload: %w", err)
+	}
+
+	fmt.Printf("%s[AWS] Initiating upload to Glacier vault '%s'...\n", logPrefix, bm.awsConfig.Vault)
+	fmt.Printf("%s[AWS] Archive: %s\n", logPrefix, archiveDescription)
+	fmt.Printf("%s[AWS] Size: %.2f MB\n", logPrefix, float64(fileSize)/(1024*1024))
 	bm.logVerbose("Vault: %s, Region: %s, Account: %s", bm.awsConfig.Vault, bm.awsConfig.Region, accountID)
+	bm.logDebug("Glacier tree hash: %s", treeHash)
+	bm.logDebug("Glacier linear hash: %s", linearHashHex)
+	bm.logDebug("Glacier content length: %d", fileSize)
 
 	// Set the payload hash in the context for the AWS signer to use in signature calculation
 	bm.logTrace("Setting payload hash in context")
 	ctx = v4.SetPayloadHash(ctx, linearHashHex)
 
-	// Capture values for closure to avoid variable capture issues
 	contentHash := linearHashHex
 	contentLength := fileSize
+	bm.logTrace("Prepared upload context with content length %d", contentLength)
 
-	// Upload with explicitly calculated checksums
-	// We need to add the x-amz-content-sha256 header explicitly via middleware
 	uploadStartTime := time.Now()
 	bm.logTrace("Calling UploadArchive API")
 	bm.logDebug("UploadArchive parameters: vault=%s, account=%s, description=%s, checksum=%s, size=%d",
@@ -1085,9 +1131,6 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 		Body:               tmpFile,
 		Checksum:           aws.String(treeHash),
 	}, func(o *glacier.Options) {
-		// Add middleware to set x-amz-content-sha256 header and Content-Length
-		// This is required by Glacier and must match the hash used in signature calculation
-		bm.logTrace("Configuring Glacier upload options with middleware")
 		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
 			return stack.Build.Add(middleware.BuildMiddlewareFunc(
 				"AddContentSHA256Header",
@@ -1110,31 +1153,21 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	uploadDuration := uploadEndTime.Sub(uploadStartTime)
 	bm.logDebug("UploadArchive API completed: duration=%s, err=%v", uploadDuration, err)
 	if err != nil {
-		fmt.Printf("      [AWS] Upload failed after %s: %v\n", uploadDuration, err)
+		fmt.Printf("%s[AWS] Upload failed after %s: %v\n", logPrefix, uploadDuration, err)
 		bm.logVerbose("Full error: %+v", err)
-		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
+		return nil, uploadDuration, fmt.Errorf("failed to upload to AWS Glacier: %w", err)
 	}
 
-	// Upload success - remove the temp buffer file immediately
-	bm.logTrace("Attempting to remove temp file: %s", tmpFile.Name())
-	if err := os.Remove(tmpFile.Name()); err == nil {
-		fmt.Printf("      [AWS] Removed temporary buffer file %s\n", tmpFile.Name())
-		bm.logDebug("Successfully removed temp file")
-	} else {
-		fmt.Printf("      [AWS] Warning: failed to delete temp file %s: %v\n", tmpFile.Name(), err)
-		bm.logDebug("Failed to remove temp file: %v", err)
+	uploadMBps := 0.0
+	if uploadDuration > 0 {
+		uploadMBps = float64(fileSize) / (1024 * 1024) / uploadDuration.Seconds()
 	}
-	uploadMBps := float64(fileSize) / (1024 * 1024) / uploadDuration.Seconds()
-	fmt.Printf("      [AWS] Upload completed in %s (%.2f MB/s)\n", uploadDuration, uploadMBps)
+	fmt.Printf("%s[AWS] Upload completed in %s (%.2f MB/s)\n", logPrefix, uploadDuration, uploadMBps)
 	if uploadResult.ArchiveId != nil {
-		fmt.Printf("      [AWS] Archive ID: %s...\n", (*uploadResult.ArchiveId)[:40])
-		bm.logVerbose("Full Archive ID: %s", *uploadResult.ArchiveId)
-	} else {
-		bm.logDebug("Warning: ArchiveId is nil in upload result")
+		fmt.Printf("%s[AWS] Archive ID: %s...\n", logPrefix, (*uploadResult.ArchiveId)[:40])
 	}
 
-	bm.logDebug("UploadToAWS completed successfully")
-	return nil
+	return uploadResult, uploadDuration, nil
 }
 
 // ListAWSBackups lists archives in the AWS Glacier vault
@@ -1399,6 +1432,10 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 	// Migrate each backup
 	migratedCount := 0
 	var totalFreed int64
+	accountID := "-"
+	if bm.awsConfig != nil && bm.awsConfig.AccountID != "" && bm.awsConfig.AccountID != "-" {
+		accountID = bm.awsConfig.AccountID
+	}
 
 	for i := 0; i < numToMigrate; i++ {
 		backup := backups[i]
@@ -1443,17 +1480,33 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 			object.Close()
 			continue
 		}
-		// Ensure we close and remove the temp file when done
 		defer os.Remove(tmpFile.Name())
 		defer tmpFile.Close()
 
 		// Copy data from Minio stream to the temporary file
-		if _, err := io.Copy(tmpFile, object); err != nil {
+		bufferStart := time.Now()
+		written, err := io.Copy(tmpFile, object)
+		bufferDuration := time.Since(bufferStart)
+		if err != nil {
 			fmt.Printf("  ⚠ Failed to buffer data to temporary file: %v\n", err)
 			object.Close()
 			continue
 		}
 		object.Close() // Done with the Minio stream
+		transferRate := 0.0
+		if bufferDuration > 0 {
+			transferRate = float64(written) / (1024 * 1024) / bufferDuration.Seconds()
+		}
+		fmt.Printf("  ℹ️  Buffered %d bytes (%.2f MB) in %s (%.2f MB/s)\n",
+			written,
+			float64(written)/(1024*1024),
+			bufferDuration,
+			transferRate)
+
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			fmt.Printf("  ⚠ Failed to rewind temporary file: %v\n", err)
+			continue
+		}
 
 		fmt.Printf("  ℹ️  Calculating checksums for %s...\n", backup.Name)
 		treeHash, linearHashHex, fileSize, err := computeHashesFromFile(tmpFile)
@@ -1469,51 +1522,13 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 			continue
 		}
 
-		accountID := bm.awsConfig.AccountID
-		if accountID == "" || accountID == "-" {
-			accountID = "-"
-		}
-
-		// Set the payload hash in the context for the AWS signer to use in signature calculation
-		ctx = v4.SetPayloadHash(ctx, linearHashHex)
-
-		// Capture values for closure to avoid variable capture issues
-		contentHash := linearHashHex
-		contentLength := fileSize
-
-		// Upload with explicitly calculated checksums
-		// We need to add the x-amz-content-sha256 header explicitly via middleware
-		uploadResult, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
-			VaultName:          aws.String(bm.awsConfig.Vault),
-			AccountId:          aws.String(accountID),
-			ArchiveDescription: aws.String(fmt.Sprintf("Migrated from Minio: %s", backup.Name)),
-			Body:               tmpFile,
-			Checksum:           aws.String(treeHash),
-		}, func(o *glacier.Options) {
-			// Add middleware to set x-amz-content-sha256 header and Content-Length
-			// This is required by Glacier and must match the hash used in signature calculation
-			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-				return stack.Build.Add(middleware.BuildMiddlewareFunc(
-					"AddContentSHA256Header",
-					func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
-						middleware.BuildOutput, middleware.Metadata, error,
-					) {
-						req, ok := in.Request.(*smithyhttp.Request)
-						if ok {
-							req.Header.Set("x-amz-content-sha256", contentHash)
-							req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
-						}
-						return next.HandleBuild(ctx, in)
-					},
-				), middleware.Before)
-			})
-		})
+		archiveDescription := fmt.Sprintf("Migrated from Minio: %s", backup.Name)
+		_, _, err = bm.uploadTempFileToAWS(ctx, tmpFile, archiveDescription, treeHash, linearHashHex, fileSize, accountID, "  ")
 		if err != nil {
 			fmt.Printf("  ⚠ Failed to upload %s to Glacier: %v\n", backup.Name, err)
 			continue
 		}
-
-		fmt.Printf("  ✓ Uploaded to Glacier (Archive ID: %s...)\n", (*uploadResult.ArchiveId)[:40])
+		fmt.Printf("  ✓ Uploaded to Glacier\n")
 
 		// Delete from Minio
 		err = bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, backup.Name, minio.RemoveObjectOptions{})
@@ -1811,10 +1826,29 @@ func (bm *BackupManager) GetContainersFromOptions(options *BackupOptions) ([]Con
 
 func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo, error) {
 	var containerInputs []string
+	var containers []ContainerInfo
+	loadedFromConfig := false
 
-	// If config file is provided, load it and return containers from config
 	if options.ConfigFile != "" {
-		return bm.getContainersFromConfig(options.ConfigFile)
+		cfgContainers, err := bm.getContainersFromConfig(options.ConfigFile)
+		if err != nil {
+			return nil, err
+		}
+		containers = append(containers, cfgContainers...)
+		loadedFromConfig = true
+	}
+
+	if options.ConfigDir != "" {
+		dirContainers, err := bm.getContainersFromConfigDir(options.ConfigDir)
+		if err != nil {
+			return nil, err
+		}
+		containers = append(containers, dirContainers...)
+		loadedFromConfig = true
+	}
+
+	if loadedFromConfig {
+		return containers, nil
 	}
 
 	// Read from file if specified
@@ -1864,7 +1898,6 @@ func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo,
 	}
 
 	// Process inputs
-	var containers []ContainerInfo
 	for _, input := range containerInputs {
 		container, err := bm.resolveContainer(input)
 		if err != nil {
@@ -3020,6 +3053,37 @@ func (bm *BackupManager) getContainersFromConfig(configPath string) ([]Container
 			Type:       containerCfg.Type,
 			Config:     &containerCfg,
 		})
+	}
+
+	return containers, nil
+}
+
+func (bm *BackupManager) getContainersFromConfigDir(dir string) ([]ContainerInfo, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config directory %s: %w", dir, err)
+	}
+
+	var containers []ContainerInfo
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		if ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		cfgPath := filepath.Join(dir, name)
+		cfgContainers, cfgErr := bm.getContainersFromConfig(cfgPath)
+		if cfgErr != nil {
+			return nil, cfgErr
+		}
+		containers = append(containers, cfgContainers...)
+	}
+
+	if len(containers) == 0 {
+		return nil, fmt.Errorf("no YAML configs found in %s", dir)
 	}
 
 	return containers, nil
