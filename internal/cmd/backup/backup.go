@@ -348,6 +348,7 @@ func initCreateFlags() {
 
 	// Custom container / config file flags
 	backupCreateCmd.Flags().String("config-file", "", "Path to YAML configuration file for custom backup configurations")
+	backupCreateCmd.Flags().String("config-dir", getEnvWithDefault("BACKUP_CONFIG_DIR", ""), "Directory containing YAML config files for custom apps (env: BACKUP_CONFIG_DIR)")
 	backupCreateCmd.Flags().String("database-type", "", "Database type for custom containers (postgres, mysql, mongodb)")
 	backupCreateCmd.Flags().String("database-export-dir", "", "Directory where database exports should be saved")
 	backupCreateCmd.Flags().String("custom-app-dir", "", "Application directory for custom containers (if different from working dir)")
@@ -417,7 +418,7 @@ func initReadFlags() {
 	backupReadCmd.Flags().Bool("save", false, "Save backup object to current working directory (same as --output <basename>)")
 	backupReadCmd.Flags().String("prefix", "", "Prefix to search for when using --latest (e.g. backups/site-)")
 	backupReadCmd.Flags().Bool("latest", false, "If set, resolve the most recent object matching --prefix when object argument is omitted")
-	
+
 	// MinIO flags
 	backupReadCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
 	backupReadCmd.Flags().String("minio-access-key", "", "Minio access key (env: MINIO_ACCESS_KEY)")
@@ -425,7 +426,7 @@ func initReadFlags() {
 	backupReadCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupReadCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
 	backupReadCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
-	
+
 	// S3 flags (alternative to MinIO)
 	backupReadCmd.Flags().String("s3-endpoint", getEnvWithDefault("S3_ENDPOINT", ""), "S3 endpoint (env: S3_ENDPOINT)")
 	backupReadCmd.Flags().String("s3-access-key", "", "S3 access key (env: S3_ACCESS_KEY or AWS_ACCESS_KEY_ID)")
@@ -440,7 +441,7 @@ func initListFlags() {
 	backupListCmd.Flags().String("prefix", "", "Prefix to filter listed objects (e.g. backups/site-)")
 	backupListCmd.Flags().Int("limit", 100, "Maximum number of objects to list")
 	backupListCmd.Flags().Bool("json", false, "Output JSON")
-	
+
 	// MinIO flags
 	backupListCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
 	backupListCmd.Flags().String("minio-access-key", "", "Minio access key (env: MINIO_ACCESS_KEY)")
@@ -448,7 +449,7 @@ func initListFlags() {
 	backupListCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupListCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
 	backupListCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
-	
+
 	// S3 flags (alternative to MinIO)
 	backupListCmd.Flags().String("s3-endpoint", getEnvWithDefault("S3_ENDPOINT", ""), "S3 endpoint (env: S3_ENDPOINT)")
 	backupListCmd.Flags().String("s3-access-key", "", "S3 access key (env: S3_ACCESS_KEY or AWS_ACCESS_KEY_ID)")
@@ -468,7 +469,7 @@ func initDeleteFlags() {
 	backupDeleteCmd.Flags().String("delete-range", "", "Delete backups by numeric range (e.g., '1-10' for 1st through 10th most recent)")
 	backupDeleteCmd.Flags().String("delete-range-by-date", "", "Delete backups by date range (YYYYMMDD-YYYYMMDD or YYYYMMDD:HHMMSS-YYYYMMDD:HHMMSS)")
 	backupDeleteCmd.Flags().Bool("skip-confirmation", false, "Skip interactive confirmation prompt")
-	
+
 	// MinIO flags
 	backupDeleteCmd.Flags().String("minio-endpoint", getEnvWithDefault("MINIO_ENDPOINT", ""), "Minio endpoint (env: MINIO_ENDPOINT)")
 	backupDeleteCmd.Flags().String("minio-access-key", "", "Minio access key (env: MINIO_ACCESS_KEY)")
@@ -476,7 +477,7 @@ func initDeleteFlags() {
 	backupDeleteCmd.Flags().String("minio-bucket", getEnvWithDefault("MINIO_BUCKET", "backups"), "Minio bucket name (env: MINIO_BUCKET)")
 	backupDeleteCmd.Flags().Bool("minio-ssl", getEnvBoolWithDefault("MINIO_SSL", true), "Use SSL for Minio connection (env: MINIO_SSL)")
 	backupDeleteCmd.Flags().Duration("minio-http-timeout", getEnvDurationWithDefault("MINIO_HTTP_TIMEOUT", 0), "Minio HTTP client timeout (e.g., 0s for no timeout) (env: MINIO_HTTP_TIMEOUT)")
-	
+
 	// S3 flags (alternative to MinIO)
 	backupDeleteCmd.Flags().String("s3-endpoint", getEnvWithDefault("S3_ENDPOINT", ""), "S3 endpoint (env: S3_ENDPOINT)")
 	backupDeleteCmd.Flags().String("s3-access-key", "", "S3 access key (env: S3_ACCESS_KEY or AWS_ACCESS_KEY_ID)")
