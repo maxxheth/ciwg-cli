@@ -158,6 +158,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 		Local:                localMode,
 		ParentDir:            mustGetStringFlag(cmd, "container-parent-dir"),
 		ConfigFile:           mustGetStringFlag(cmd, "config-file"),
+		ConfigDir:            mustGetStringFlag(cmd, "config-dir"),
 		DatabaseType:         mustGetStringFlag(cmd, "database-type"),
 		DatabaseExportDir:    mustGetStringFlag(cmd, "database-export-dir"),
 		CustomAppDir:         mustGetStringFlag(cmd, "custom-app-dir"),
@@ -192,7 +193,7 @@ func createBackupForHost(cmd *cobra.Command, hostname string, minioConfig *backu
 			if err != nil {
 				return fmt.Errorf("failed to load retention policy: %w", err)
 			}
-			
+
 			fmt.Printf("Loaded %d ruleset(s)\n", len(rulesets))
 			return applyRetentionPolicy(backupManager, rulesets, options, cleanAWS)
 		}
