@@ -1104,6 +1104,20 @@ func (bm *BackupManager) uploadTempFileToAWS(
 		return nil, 0, fmt.Errorf("failed to seek temporary file for upload: %w", err)
 	}
 
+	if stat, err := tmpFile.Stat(); err == nil {
+		fmt.Printf("%s[AWS] Temp file %s on disk: %d bytes (%.2f MB)\n",
+			logPrefix,
+			filepath.Base(tmpFile.Name()),
+			stat.Size(),
+			float64(stat.Size())/(1024*1024))
+		if stat.Size() != fileSize {
+			fmt.Printf("%s[AWS] ⚠ Size mismatch detected: stat size %d bytes vs computed size %d bytes\n",
+				logPrefix, stat.Size(), fileSize)
+		}
+	} else {
+		fmt.Printf("%s[AWS] Warning: failed to stat temp file: %v\n", logPrefix, err)
+	}
+
 	fmt.Printf("%s[AWS] Initiating upload to Glacier vault '%s'...\n", logPrefix, bm.awsConfig.Vault)
 	fmt.Printf("%s[AWS] Archive: %s\n", logPrefix, archiveDescription)
 	fmt.Printf("%s[AWS] Size: %.2f MB\n", logPrefix, float64(fileSize)/(1024*1024))
@@ -1118,6 +1132,7 @@ func (bm *BackupManager) uploadTempFileToAWS(
 
 	contentHash := linearHashHex
 	contentLength := fileSize
+	fmt.Printf("%s[AWS] Content-Length header will be set to: %d bytes\n", logPrefix, contentLength)
 	bm.logTrace("Prepared upload context with content length %d", contentLength)
 
 	uploadStartTime := time.Now()
@@ -1154,6 +1169,13 @@ func (bm *BackupManager) uploadTempFileToAWS(
 	bm.logDebug("UploadArchive API completed: duration=%s, err=%v", uploadDuration, err)
 	if err != nil {
 		fmt.Printf("%s[AWS] Upload failed after %s: %v\n", logPrefix, uploadDuration, err)
+		var respErr *smithyhttp.ResponseError
+		if errors.As(err, &respErr) && respErr.Response != nil {
+			fmt.Printf("%s[AWS] Response status: %s\n", logPrefix, respErr.Response.Status)
+			if bm.verbosity >= 3 {
+				fmt.Printf("%s[AWS] Response headers: %v\n", logPrefix, respErr.Response.Header)
+			}
+		}
 		bm.logVerbose("Full error: %+v", err)
 		return nil, uploadDuration, fmt.Errorf("failed to upload to AWS Glacier: %w", err)
 	}
@@ -1480,19 +1502,26 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 			object.Close()
 			continue
 		}
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
+		tmpFilePath := tmpFile.Name()
+		cleanupTmp := func(reason string) {
+			if err := tmpFile.Close(); err != nil {
+				fmt.Printf("  ⚠ Warning: failed to close temp file %s (%s): %v\n", tmpFilePath, reason, err)
+			}
+			if err := os.Remove(tmpFilePath); err != nil {
+				fmt.Printf("  ⚠ Warning: failed to remove temp file %s (%s): %v\n", tmpFilePath, reason, err)
+			}
+		}
 
 		// Copy data from Minio stream to the temporary file
 		bufferStart := time.Now()
 		written, err := io.Copy(tmpFile, object)
 		bufferDuration := time.Since(bufferStart)
+		object.Close() // Done with the Minio stream regardless of copy outcome
 		if err != nil {
 			fmt.Printf("  ⚠ Failed to buffer data to temporary file: %v\n", err)
-			object.Close()
+			cleanupTmp("copy-error")
 			continue
 		}
-		object.Close() // Done with the Minio stream
 		transferRate := 0.0
 		if bufferDuration > 0 {
 			transferRate = float64(written) / (1024 * 1024) / bufferDuration.Seconds()
@@ -1503,15 +1532,20 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 			bufferDuration,
 			transferRate)
 
-		if _, err := tmpFile.Seek(0, 0); err != nil {
-			fmt.Printf("  ⚠ Failed to rewind temporary file: %v\n", err)
-			continue
+		if stat, statErr := os.Stat(tmpFilePath); statErr == nil {
+			fmt.Printf("  ℹ️  Temp file %s size on disk: %d bytes (%.2f MB)\n",
+				filepath.Base(tmpFilePath),
+				stat.Size(),
+				float64(stat.Size())/(1024*1024))
+		} else {
+			fmt.Printf("  ⚠ Warning: failed to stat temp file %s: %v\n", tmpFilePath, statErr)
 		}
 
 		fmt.Printf("  ℹ️  Calculating checksums for %s...\n", backup.Name)
 		treeHash, linearHashHex, fileSize, err := computeHashesFromFile(tmpFile)
 		if err != nil {
 			fmt.Printf("  ⚠ Failed to calculate checksums: %v\n", err)
+			cleanupTmp("checksum-error")
 			continue
 		}
 		fmt.Printf("  ℹ️  File size: %d bytes (%.2f MB)\n", fileSize, float64(fileSize)/(1024*1024))
@@ -1519,6 +1553,7 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 		// Skip empty files
 		if fileSize == 0 {
 			fmt.Printf("  ⚠ Skipping empty file: %s\n", backup.Name)
+			cleanupTmp("empty-file")
 			continue
 		}
 
@@ -1526,9 +1561,11 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 		_, _, err = bm.uploadTempFileToAWS(ctx, tmpFile, archiveDescription, treeHash, linearHashHex, fileSize, accountID, "  ")
 		if err != nil {
 			fmt.Printf("  ⚠ Failed to upload %s to Glacier: %v\n", backup.Name, err)
+			cleanupTmp("upload-error")
 			continue
 		}
 		fmt.Printf("  ✓ Uploaded to Glacier\n")
+		cleanupTmp("upload-complete")
 
 		// Delete from Minio
 		err = bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, backup.Name, minio.RemoveObjectOptions{})
@@ -1688,6 +1725,24 @@ func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold
 
 		fmt.Printf("\n⚠ Storage usage (%.1f%%) exceeds threshold (%.1f%%)\n",
 			capacity.UsedPercent, threshold)
+		if forceDelete {
+			if dryRun {
+				fmt.Printf("  🗑️  --force-delete enabled: would delete %.1f%% oldest backups from Minio (no AWS migration).\n", migratePercent)
+			} else {
+				fmt.Printf("  🗑️  --force-delete enabled: deleting %.1f%% oldest backups from Minio (AWS bypassed).\n", migratePercent)
+			}
+			if err := bm.DeleteOldestBackups(migratePercent, dryRun); err != nil {
+				return fmt.Errorf("force delete failed: %w", err)
+			}
+			if dryRun {
+				fmt.Println("\nℹ️  Dry run complete. Only one iteration performed for preview.")
+				return nil
+			}
+			// Give the filesystem a moment to update before re-checking usage
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
 		if dryRun {
 			fmt.Printf("  Would start migration of %.1f%% oldest backups to AWS Glacier...\n", migratePercent)
 		} else {
@@ -1697,23 +1752,6 @@ func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold
 		err = bm.MigrateOldestBackupsToGlacier(migratePercent, dryRun)
 		if err != nil {
 			fmt.Printf("  ❌ Migration attempt failed: %v\n", err)
-			if forceDelete {
-				if dryRun {
-					fmt.Println("  🗑️  --force-delete enabled (dry run): would delete oldest backups instead of migrating.")
-				} else {
-					fmt.Println("  🗑️  --force-delete enabled: deleting oldest backups to maintain capacity...")
-				}
-				if delErr := bm.DeleteOldestBackups(migratePercent, dryRun); delErr != nil {
-					return fmt.Errorf("migration failed (%v) and force delete failed: %w", err, delErr)
-				}
-				if dryRun {
-					fmt.Println("\nℹ️  Dry run complete. Only one iteration performed for preview.")
-					return nil
-				}
-				// Give the filesystem a moment to update before re-checking usage
-				time.Sleep(2 * time.Second)
-				continue
-			}
 			fmt.Println("  Hint: re-run with --force-delete to bypass AWS when Glacier uploads fail.")
 			return fmt.Errorf("migration failed: %w", err)
 		}
