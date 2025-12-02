@@ -107,6 +107,21 @@ type MinioConfig struct {
 	HTTPTimeout time.Duration
 }
 
+// S3Config represents AWS S3 configuration for object storage
+// S3 is MinIO-compatible, so we use the same MinIO client with S3-specific settings
+type S3Config struct {
+	Endpoint  string // S3 endpoint (e.g., "s3.amazonaws.com" or "s3.us-west-2.amazonaws.com")
+	AccessKey string
+	SecretKey string
+	Bucket    string
+	Region    string // S3 region (e.g., "us-east-1", "us-west-2")
+	UseSSL    bool
+	// BucketPath is an optional path prefix within the bucket (e.g., "production/backups")
+	BucketPath string
+	// HTTPTimeout is an optional overall timeout for the HTTP client
+	HTTPTimeout time.Duration
+}
+
 type AWSConfig struct {
 	Vault     string // Glacier uses vaults instead of buckets
 	AccountID string // AWS account ID (can be "-" for current account)
@@ -131,6 +146,8 @@ type BackupOptions struct {
 	ParentDir string
 	// ConfigFile is the path to a YAML config file for custom backup configurations
 	ConfigFile string
+	// ConfigDir points to a directory containing one or more YAML configs
+	ConfigDir string
 	// DatabaseType specifies the database type for custom containers (postgres, mysql, etc.)
 	DatabaseType string
 	// DatabaseExportDir is where database exports should be saved before backup
@@ -297,12 +314,14 @@ type BackupManager struct {
 	sshClient   *auth.SSHClient
 	minioClient *minio.Client
 	minioConfig *MinioConfig
+	s3Client    *minio.Client // S3 uses the same MinIO client (S3-compatible)
+	s3Config    *S3Config
 	awsClient   *glacier.Client
 	awsConfig   *AWSConfig
 	verbosity   int // 0=quiet, 1=normal, 2=verbose, 3=debug, 4=trace
 }
 
-// ObjectInfo is a lightweight representation of an object in Minio
+// ObjectInfo is a lightweight representation of an object in storage
 type ObjectInfo struct {
 	Key          string    `json:"key"`
 	Size         int64     `json:"size"`
@@ -317,6 +336,15 @@ func NewBackupManager(sshClient *auth.SSHClient, minioConfig *MinioConfig) *Back
 	}
 }
 
+// NewBackupManagerWithS3 creates a BackupManager with S3 configuration instead of MinIO
+func NewBackupManagerWithS3(sshClient *auth.SSHClient, s3Config *S3Config) *BackupManager {
+	return &BackupManager{
+		sshClient: sshClient,
+		s3Config:  s3Config,
+		verbosity: 1, // Default to normal verbosity
+	}
+}
+
 // NewBackupManagerWithAWS creates a BackupManager with both Minio and AWS configurations
 func NewBackupManagerWithAWS(sshClient *auth.SSHClient, minioConfig *MinioConfig, awsConfig *AWSConfig) *BackupManager {
 	return &BackupManager{
@@ -324,6 +352,16 @@ func NewBackupManagerWithAWS(sshClient *auth.SSHClient, minioConfig *MinioConfig
 		minioConfig: minioConfig,
 		awsConfig:   awsConfig,
 		verbosity:   1, // Default to normal verbosity
+	}
+}
+
+// NewBackupManagerWithS3AndAWS creates a BackupManager with S3 and AWS Glacier configurations
+func NewBackupManagerWithS3AndAWS(sshClient *auth.SSHClient, s3Config *S3Config, awsConfig *AWSConfig) *BackupManager {
+	return &BackupManager{
+		sshClient: sshClient,
+		s3Config:  s3Config,
+		awsConfig: awsConfig,
+		verbosity: 1, // Default to normal verbosity
 	}
 }
 
@@ -355,10 +393,43 @@ func (bm *BackupManager) logTrace(format string, args ...interface{}) {
 
 // GetBucketPath returns the configured bucket path prefix
 func (bm *BackupManager) GetBucketPath() string {
-	if bm.minioConfig == nil {
-		return ""
+	if bm.s3Config != nil {
+		return bm.s3Config.BucketPath
 	}
-	return bm.minioConfig.BucketPath
+	if bm.minioConfig != nil {
+		return bm.minioConfig.BucketPath
+	}
+	return ""
+}
+
+// GetStorageBackend returns a string identifying the active storage backend
+func (bm *BackupManager) GetStorageBackend() string {
+	if bm.s3Config != nil {
+		return "s3"
+	}
+	if bm.minioConfig != nil {
+		return "minio"
+	}
+	return "none"
+}
+
+// getObjectStorageClient returns the active object storage client (MinIO or S3)
+func (bm *BackupManager) getObjectStorageClient() *minio.Client {
+	if bm.s3Client != nil {
+		return bm.s3Client
+	}
+	return bm.minioClient
+}
+
+// getObjectStorageBucket returns the active bucket name
+func (bm *BackupManager) getObjectStorageBucket() string {
+	if bm.s3Config != nil {
+		return bm.s3Config.Bucket
+	}
+	if bm.minioConfig != nil {
+		return bm.minioConfig.Bucket
+	}
+	return ""
 }
 
 // executeCommand runs a shell command either over SSH (when sshClient is present)
@@ -427,6 +498,82 @@ func (bm *BackupManager) initMinioClient() error {
 	return nil
 }
 
+// initS3Client initializes the S3 client if S3 is configured
+func (bm *BackupManager) initS3Client() error {
+	if bm.s3Client != nil {
+		return nil
+	}
+
+	if bm.s3Config == nil {
+		return fmt.Errorf("S3 configuration is not set")
+	}
+
+	// Create custom transport for S3 client
+	dialer := &net.Dialer{
+		Timeout:   60 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   5 * time.Minute,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       5 * time.Minute,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+	}
+	if bm.s3Config.HTTPTimeout > 0 {
+		tr.ResponseHeaderTimeout = bm.s3Config.HTTPTimeout
+	}
+
+	// S3 endpoint format: s3.amazonaws.com or s3.region.amazonaws.com
+	endpoint := bm.s3Config.Endpoint
+	if endpoint == "" {
+		// Default to regional endpoint
+		if bm.s3Config.Region != "" {
+			endpoint = fmt.Sprintf("s3.%s.amazonaws.com", bm.s3Config.Region)
+		} else {
+			endpoint = "s3.amazonaws.com"
+		}
+	}
+
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:     credentials.NewStaticV4(bm.s3Config.AccessKey, bm.s3Config.SecretKey, ""),
+		Secure:    bm.s3Config.UseSSL,
+		Transport: tr,
+		Region:    bm.s3Config.Region,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create S3 client: %w", err)
+	}
+
+	bm.s3Client = client
+
+	// Ensure bucket exists
+	ctx := context.Background()
+	exists, err := bm.s3Client.BucketExists(ctx, bm.s3Config.Bucket)
+	if err != nil {
+		return fmt.Errorf("failed to check if S3 bucket exists: %w", err)
+	}
+
+	if !exists {
+		return fmt.Errorf("S3 bucket %s does not exist", bm.s3Config.Bucket)
+	}
+
+	return nil
+}
+
+// initObjectStorageClient initializes either MinIO or S3 client based on configuration
+func (bm *BackupManager) initObjectStorageClient() error {
+	if bm.s3Config != nil {
+		return bm.initS3Client()
+	}
+	if bm.minioConfig != nil {
+		return bm.initMinioClient()
+	}
+	return fmt.Errorf("no object storage configuration provided (neither MinIO nor S3)")
+}
+
 func (bm *BackupManager) TestMinioConnection() error {
 	if err := bm.initMinioClient(); err != nil {
 		return err
@@ -493,6 +640,77 @@ func (bm *BackupManager) TestMinioConnection() error {
 		return fmt.Errorf("failed to delete test object: %w", err)
 	}
 	fmt.Printf("   ✓ Successfully deleted test object\n")
+
+	return nil
+}
+
+// TestS3Connection tests connectivity to AWS S3
+func (bm *BackupManager) TestS3Connection() error {
+	if err := bm.initS3Client(); err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+
+	// Step 1: Test bucket existence
+	fmt.Printf("1. Testing S3 bucket existence...\n")
+	exists, err := bm.s3Client.BucketExists(ctx, bm.s3Config.Bucket)
+	if err != nil {
+		return fmt.Errorf("failed to check S3 bucket existence: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("S3 bucket '%s' does not exist", bm.s3Config.Bucket)
+	}
+	fmt.Printf("   ✓ S3 bucket '%s' exists\n\n", bm.s3Config.Bucket)
+
+	// Step 2: Test write operation
+	fmt.Printf("2. Testing S3 write operation...\n")
+	testObjectName := fmt.Sprintf(".connection-test-%d.txt", time.Now().Unix())
+
+	// Apply bucket path prefix if configured
+	if bm.s3Config.BucketPath != "" {
+		testObjectName = filepath.Join(bm.s3Config.BucketPath, testObjectName)
+	}
+
+	testContent := []byte("This is a connection test file created by ciwg-cli")
+
+	info, err := bm.s3Client.PutObject(ctx, bm.s3Config.Bucket, testObjectName,
+		strings.NewReader(string(testContent)), int64(len(testContent)), minio.PutObjectOptions{
+			ContentType: "text/plain",
+		})
+	if err != nil {
+		return fmt.Errorf("failed to write test object to S3: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully wrote test object '%s' to S3 (%d bytes)\n\n", testObjectName, info.Size)
+
+	// Step 3: Test read operation
+	fmt.Printf("3. Testing S3 read operation...\n")
+	object, err := bm.s3Client.GetObject(ctx, bm.s3Config.Bucket, testObjectName, minio.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to read test object from S3: %w", err)
+	}
+	defer object.Close()
+
+	readContent := make([]byte, len(testContent))
+	n, err := object.Read(readContent)
+	if err != nil && err.Error() != "EOF" {
+		return fmt.Errorf("failed to read test object content from S3: %w", err)
+	}
+	if n != len(testContent) {
+		return fmt.Errorf("read size mismatch: expected %d, got %d", len(testContent), n)
+	}
+	if string(readContent) != string(testContent) {
+		return fmt.Errorf("content mismatch: read content doesn't match written content")
+	}
+	fmt.Printf("   ✓ Successfully read test object from S3 and verified content\n\n")
+
+	// Step 4: Test delete operation
+	fmt.Printf("4. Testing S3 delete operation...\n")
+	err = bm.s3Client.RemoveObject(ctx, bm.s3Config.Bucket, testObjectName, minio.RemoveObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to delete test object from S3: %w", err)
+	}
+	fmt.Printf("   ✓ Successfully deleted test object from S3\n")
 
 	return nil
 }
@@ -843,21 +1061,80 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 		return fmt.Errorf("failed to seek temporary file for upload: %w", err)
 	}
 
-	fmt.Printf("      [AWS] Initiating upload to Glacier vault '%s'...\n", bm.awsConfig.Vault)
-	fmt.Printf("      [AWS] Archive: %s\n", archiveDescription)
-	fmt.Printf("      [AWS] Size: %.2f MB\n", float64(fileSize)/(1024*1024))
+	uploadResult, _, err := bm.uploadTempFileToAWS(ctx, tmpFile, archiveDescription, treeHash, linearHashHex, fileSize, accountID, "      ")
+	if err != nil {
+		return err
+	}
+
+	// Upload success - remove the temp buffer file immediately
+	bm.logTrace("Attempting to remove temp file: %s", tmpFile.Name())
+	if err := os.Remove(tmpFile.Name()); err == nil {
+		fmt.Printf("      [AWS] Removed temporary buffer file %s\n", tmpFile.Name())
+		bm.logDebug("Successfully removed temp file")
+	} else {
+		fmt.Printf("      [AWS] Warning: failed to delete temp file %s: %v\n", tmpFile.Name(), err)
+		bm.logDebug("Failed to remove temp file: %v", err)
+	}
+	if uploadResult != nil && uploadResult.ArchiveId != nil {
+		bm.logVerbose("Full Archive ID: %s", *uploadResult.ArchiveId)
+	}
+
+	bm.logDebug("UploadToAWS completed successfully")
+	return nil
+}
+
+// uploadTempFileToAWS centralizes the Glacier UploadArchive call with consistent
+// logging, middleware, and payload hash handling. The caller must ensure the
+// temporary file already contains the data to upload.
+func (bm *BackupManager) uploadTempFileToAWS(
+	ctx context.Context,
+	tmpFile *os.File,
+	archiveDescription string,
+	treeHash string,
+	linearHashHex string,
+	fileSize int64,
+	accountID string,
+	logPrefix string,
+) (*glacier.UploadArchiveOutput, time.Duration, error) {
+	if logPrefix == "" {
+		logPrefix = "      "
+	}
+
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return nil, 0, fmt.Errorf("failed to seek temporary file for upload: %w", err)
+	}
+
+	if stat, err := tmpFile.Stat(); err == nil {
+		fmt.Printf("%s[AWS] Temp file %s on disk: %d bytes (%.2f MB)\n",
+			logPrefix,
+			filepath.Base(tmpFile.Name()),
+			stat.Size(),
+			float64(stat.Size())/(1024*1024))
+		if stat.Size() != fileSize {
+			fmt.Printf("%s[AWS] ⚠ Size mismatch detected: stat size %d bytes vs computed size %d bytes\n",
+				logPrefix, stat.Size(), fileSize)
+		}
+	} else {
+		fmt.Printf("%s[AWS] Warning: failed to stat temp file: %v\n", logPrefix, err)
+	}
+
+	fmt.Printf("%s[AWS] Initiating upload to Glacier vault '%s'...\n", logPrefix, bm.awsConfig.Vault)
+	fmt.Printf("%s[AWS] Archive: %s\n", logPrefix, archiveDescription)
+	fmt.Printf("%s[AWS] Size: %.2f MB\n", logPrefix, float64(fileSize)/(1024*1024))
 	bm.logVerbose("Vault: %s, Region: %s, Account: %s", bm.awsConfig.Vault, bm.awsConfig.Region, accountID)
+	bm.logDebug("Glacier tree hash: %s", treeHash)
+	bm.logDebug("Glacier linear hash: %s", linearHashHex)
+	bm.logDebug("Glacier content length: %d", fileSize)
 
 	// Set the payload hash in the context for the AWS signer to use in signature calculation
 	bm.logTrace("Setting payload hash in context")
 	ctx = v4.SetPayloadHash(ctx, linearHashHex)
 
-	// Capture values for closure to avoid variable capture issues
 	contentHash := linearHashHex
 	contentLength := fileSize
+	fmt.Printf("%s[AWS] Content-Length header will be set to: %d bytes\n", logPrefix, contentLength)
+	bm.logTrace("Prepared upload context with content length %d", contentLength)
 
-	// Upload with explicitly calculated checksums
-	// We need to add the x-amz-content-sha256 header explicitly via middleware
 	uploadStartTime := time.Now()
 	bm.logTrace("Calling UploadArchive API")
 	bm.logDebug("UploadArchive parameters: vault=%s, account=%s, description=%s, checksum=%s, size=%d",
@@ -869,9 +1146,6 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 		Body:               tmpFile,
 		Checksum:           aws.String(treeHash),
 	}, func(o *glacier.Options) {
-		// Add middleware to set x-amz-content-sha256 header and Content-Length
-		// This is required by Glacier and must match the hash used in signature calculation
-		bm.logTrace("Configuring Glacier upload options with middleware")
 		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
 			return stack.Build.Add(middleware.BuildMiddlewareFunc(
 				"AddContentSHA256Header",
@@ -894,31 +1168,28 @@ func (bm *BackupManager) UploadToAWS(objectName string, reader io.Reader, size i
 	uploadDuration := uploadEndTime.Sub(uploadStartTime)
 	bm.logDebug("UploadArchive API completed: duration=%s, err=%v", uploadDuration, err)
 	if err != nil {
-		fmt.Printf("      [AWS] Upload failed after %s: %v\n", uploadDuration, err)
+		fmt.Printf("%s[AWS] Upload failed after %s: %v\n", logPrefix, uploadDuration, err)
+		var respErr *smithyhttp.ResponseError
+		if errors.As(err, &respErr) && respErr.Response != nil {
+			fmt.Printf("%s[AWS] Response status: %s\n", logPrefix, respErr.Response.Status)
+			if bm.verbosity >= 3 {
+				fmt.Printf("%s[AWS] Response headers: %v\n", logPrefix, respErr.Response.Header)
+			}
+		}
 		bm.logVerbose("Full error: %+v", err)
-		return fmt.Errorf("failed to upload to AWS Glacier: %w", err)
+		return nil, uploadDuration, fmt.Errorf("failed to upload to AWS Glacier: %w", err)
 	}
 
-	// Upload success - remove the temp buffer file immediately
-	bm.logTrace("Attempting to remove temp file: %s", tmpFile.Name())
-	if err := os.Remove(tmpFile.Name()); err == nil {
-		fmt.Printf("      [AWS] Removed temporary buffer file %s\n", tmpFile.Name())
-		bm.logDebug("Successfully removed temp file")
-	} else {
-		fmt.Printf("      [AWS] Warning: failed to delete temp file %s: %v\n", tmpFile.Name(), err)
-		bm.logDebug("Failed to remove temp file: %v", err)
+	uploadMBps := 0.0
+	if uploadDuration > 0 {
+		uploadMBps = float64(fileSize) / (1024 * 1024) / uploadDuration.Seconds()
 	}
-	uploadMBps := float64(fileSize) / (1024 * 1024) / uploadDuration.Seconds()
-	fmt.Printf("      [AWS] Upload completed in %s (%.2f MB/s)\n", uploadDuration, uploadMBps)
+	fmt.Printf("%s[AWS] Upload completed in %s (%.2f MB/s)\n", logPrefix, uploadDuration, uploadMBps)
 	if uploadResult.ArchiveId != nil {
-		fmt.Printf("      [AWS] Archive ID: %s...\n", (*uploadResult.ArchiveId)[:40])
-		bm.logVerbose("Full Archive ID: %s", *uploadResult.ArchiveId)
-	} else {
-		bm.logDebug("Warning: ArchiveId is nil in upload result")
+		fmt.Printf("%s[AWS] Archive ID: %s...\n", logPrefix, (*uploadResult.ArchiveId)[:40])
 	}
 
-	bm.logDebug("UploadToAWS completed successfully")
-	return nil
+	return uploadResult, uploadDuration, nil
 }
 
 // ListAWSBackups lists archives in the AWS Glacier vault
@@ -1183,6 +1454,10 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 	// Migrate each backup
 	migratedCount := 0
 	var totalFreed int64
+	accountID := "-"
+	if bm.awsConfig != nil && bm.awsConfig.AccountID != "" && bm.awsConfig.AccountID != "-" {
+		accountID = bm.awsConfig.AccountID
+	}
 
 	for i := 0; i < numToMigrate; i++ {
 		backup := backups[i]
@@ -1227,22 +1502,50 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 			object.Close()
 			continue
 		}
-		// Ensure we close and remove the temp file when done
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
+		tmpFilePath := tmpFile.Name()
+		cleanupTmp := func(reason string) {
+			if err := tmpFile.Close(); err != nil {
+				fmt.Printf("  ⚠ Warning: failed to close temp file %s (%s): %v\n", tmpFilePath, reason, err)
+			}
+			if err := os.Remove(tmpFilePath); err != nil {
+				fmt.Printf("  ⚠ Warning: failed to remove temp file %s (%s): %v\n", tmpFilePath, reason, err)
+			}
+		}
 
 		// Copy data from Minio stream to the temporary file
-		if _, err := io.Copy(tmpFile, object); err != nil {
+		bufferStart := time.Now()
+		written, err := io.Copy(tmpFile, object)
+		bufferDuration := time.Since(bufferStart)
+		object.Close() // Done with the Minio stream regardless of copy outcome
+		if err != nil {
 			fmt.Printf("  ⚠ Failed to buffer data to temporary file: %v\n", err)
-			object.Close()
+			cleanupTmp("copy-error")
 			continue
 		}
-		object.Close() // Done with the Minio stream
+		transferRate := 0.0
+		if bufferDuration > 0 {
+			transferRate = float64(written) / (1024 * 1024) / bufferDuration.Seconds()
+		}
+		fmt.Printf("  ℹ️  Buffered %d bytes (%.2f MB) in %s (%.2f MB/s)\n",
+			written,
+			float64(written)/(1024*1024),
+			bufferDuration,
+			transferRate)
+
+		if stat, statErr := os.Stat(tmpFilePath); statErr == nil {
+			fmt.Printf("  ℹ️  Temp file %s size on disk: %d bytes (%.2f MB)\n",
+				filepath.Base(tmpFilePath),
+				stat.Size(),
+				float64(stat.Size())/(1024*1024))
+		} else {
+			fmt.Printf("  ⚠ Warning: failed to stat temp file %s: %v\n", tmpFilePath, statErr)
+		}
 
 		fmt.Printf("  ℹ️  Calculating checksums for %s...\n", backup.Name)
 		treeHash, linearHashHex, fileSize, err := computeHashesFromFile(tmpFile)
 		if err != nil {
 			fmt.Printf("  ⚠ Failed to calculate checksums: %v\n", err)
+			cleanupTmp("checksum-error")
 			continue
 		}
 		fmt.Printf("  ℹ️  File size: %d bytes (%.2f MB)\n", fileSize, float64(fileSize)/(1024*1024))
@@ -1250,54 +1553,19 @@ func (bm *BackupManager) MigrateOldestBackupsToGlacier(percent float64, dryRun b
 		// Skip empty files
 		if fileSize == 0 {
 			fmt.Printf("  ⚠ Skipping empty file: %s\n", backup.Name)
+			cleanupTmp("empty-file")
 			continue
 		}
 
-		accountID := bm.awsConfig.AccountID
-		if accountID == "" || accountID == "-" {
-			accountID = "-"
-		}
-
-		// Set the payload hash in the context for the AWS signer to use in signature calculation
-		ctx = v4.SetPayloadHash(ctx, linearHashHex)
-
-		// Capture values for closure to avoid variable capture issues
-		contentHash := linearHashHex
-		contentLength := fileSize
-
-		// Upload with explicitly calculated checksums
-		// We need to add the x-amz-content-sha256 header explicitly via middleware
-		uploadResult, err := bm.awsClient.UploadArchive(ctx, &glacier.UploadArchiveInput{
-			VaultName:          aws.String(bm.awsConfig.Vault),
-			AccountId:          aws.String(accountID),
-			ArchiveDescription: aws.String(fmt.Sprintf("Migrated from Minio: %s", backup.Name)),
-			Body:               tmpFile,
-			Checksum:           aws.String(treeHash),
-		}, func(o *glacier.Options) {
-			// Add middleware to set x-amz-content-sha256 header and Content-Length
-			// This is required by Glacier and must match the hash used in signature calculation
-			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-				return stack.Build.Add(middleware.BuildMiddlewareFunc(
-					"AddContentSHA256Header",
-					func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
-						middleware.BuildOutput, middleware.Metadata, error,
-					) {
-						req, ok := in.Request.(*smithyhttp.Request)
-						if ok {
-							req.Header.Set("x-amz-content-sha256", contentHash)
-							req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
-						}
-						return next.HandleBuild(ctx, in)
-					},
-				), middleware.Before)
-			})
-		})
+		archiveDescription := fmt.Sprintf("Migrated from Minio: %s", backup.Name)
+		_, _, err = bm.uploadTempFileToAWS(ctx, tmpFile, archiveDescription, treeHash, linearHashHex, fileSize, accountID, "  ")
 		if err != nil {
 			fmt.Printf("  ⚠ Failed to upload %s to Glacier: %v\n", backup.Name, err)
+			cleanupTmp("upload-error")
 			continue
 		}
-
-		fmt.Printf("  ✓ Uploaded to Glacier (Archive ID: %s...)\n", (*uploadResult.ArchiveId)[:40])
+		fmt.Printf("  ✓ Uploaded to Glacier\n")
+		cleanupTmp("upload-complete")
 
 		// Delete from Minio
 		err = bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, backup.Name, minio.RemoveObjectOptions{})
@@ -1396,6 +1664,8 @@ func (bm *BackupManager) DeleteOldestBackups(percent float64, dryRun bool) error
 		fmt.Printf("      Modified: %s\n", backup.LastModified.Format(time.RFC3339))
 
 		if dryRun {
+			deleted++
+			totalFreed += backup.Size
 			continue
 		}
 
@@ -1457,6 +1727,24 @@ func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold
 
 		fmt.Printf("\n⚠ Storage usage (%.1f%%) exceeds threshold (%.1f%%)\n",
 			capacity.UsedPercent, threshold)
+		if forceDelete {
+			if dryRun {
+				fmt.Printf("  🗑️  --force-delete enabled: would delete %.1f%% oldest backups from Minio (no AWS migration).\n", migratePercent)
+			} else {
+				fmt.Printf("  🗑️  --force-delete enabled: deleting %.1f%% oldest backups from Minio (AWS bypassed).\n", migratePercent)
+			}
+			if err := bm.DeleteOldestBackups(migratePercent, dryRun); err != nil {
+				return fmt.Errorf("force delete failed: %w", err)
+			}
+			if dryRun {
+				fmt.Println("\nℹ️  Dry run complete. Only one iteration performed for preview.")
+				return nil
+			}
+			// Give the filesystem a moment to update before re-checking usage
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
 		if dryRun {
 			fmt.Printf("  Would start migration of %.1f%% oldest backups to AWS Glacier...\n", migratePercent)
 		} else {
@@ -1466,23 +1754,6 @@ func (bm *BackupManager) MonitorAndMigrateIfNeeded(storagePath string, threshold
 		err = bm.MigrateOldestBackupsToGlacier(migratePercent, dryRun)
 		if err != nil {
 			fmt.Printf("  ❌ Migration attempt failed: %v\n", err)
-			if forceDelete {
-				if dryRun {
-					fmt.Println("  🗑️  --force-delete enabled (dry run): would delete oldest backups instead of migrating.")
-				} else {
-					fmt.Println("  🗑️  --force-delete enabled: deleting oldest backups to maintain capacity...")
-				}
-				if delErr := bm.DeleteOldestBackups(migratePercent, dryRun); delErr != nil {
-					return fmt.Errorf("migration failed (%v) and force delete failed: %w", err, delErr)
-				}
-				if dryRun {
-					fmt.Println("\nℹ️  Dry run complete. Only one iteration performed for preview.")
-					return nil
-				}
-				// Give the filesystem a moment to update before re-checking usage
-				time.Sleep(2 * time.Second)
-				continue
-			}
 			fmt.Println("  Hint: re-run with --force-delete to bypass AWS when Glacier uploads fail.")
 			return fmt.Errorf("migration failed: %w", err)
 		}
@@ -1595,10 +1866,29 @@ func (bm *BackupManager) GetContainersFromOptions(options *BackupOptions) ([]Con
 
 func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo, error) {
 	var containerInputs []string
+	var containers []ContainerInfo
+	loadedFromConfig := false
 
-	// If config file is provided, load it and return containers from config
 	if options.ConfigFile != "" {
-		return bm.getContainersFromConfig(options.ConfigFile)
+		cfgContainers, err := bm.getContainersFromConfig(options.ConfigFile)
+		if err != nil {
+			return nil, err
+		}
+		containers = append(containers, cfgContainers...)
+		loadedFromConfig = true
+	}
+
+	if options.ConfigDir != "" {
+		dirContainers, err := bm.getContainersFromConfigDir(options.ConfigDir)
+		if err != nil {
+			return nil, err
+		}
+		containers = append(containers, dirContainers...)
+		loadedFromConfig = true
+	}
+
+	if loadedFromConfig {
+		return containers, nil
 	}
 
 	// Read from file if specified
@@ -1648,7 +1938,6 @@ func (bm *BackupManager) getContainers(options *BackupOptions) ([]ContainerInfo,
 	}
 
 	// Process inputs
-	var containers []ContainerInfo
 	for _, input := range containerInputs {
 		container, err := bm.resolveContainer(input)
 		if err != nil {
@@ -2293,15 +2582,18 @@ func (bm *BackupManager) readRemoteFile(filePath string) ([]byte, error) {
 	return []byte(output), nil
 }
 
-// ReadBackup downloads or streams a Minio object. If outputPath is empty it writes to stdout.
+// ReadBackup downloads or streams an object from storage. If outputPath is empty it writes to stdout.
 func (bm *BackupManager) ReadBackup(objectName, outputPath string) error {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return err
 	}
 
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
+
 	ctx := context.Background()
 
-	obj, err := bm.minioClient.GetObject(ctx, bm.minioConfig.Bucket, objectName, minio.GetObjectOptions{})
+	obj, err := client.GetObject(ctx, bucket, objectName, minio.GetObjectOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get object '%s': %w", objectName, err)
 	}
@@ -2336,19 +2628,22 @@ func (bm *BackupManager) ReadBackup(objectName, outputPath string) error {
 	return nil
 }
 
-// DownloadBackup downloads a backup object from Minio and returns a reader.
+// DownloadBackup downloads a backup object from storage and returns a reader.
 // The caller is responsible for closing the returned ReadCloser.
 func (bm *BackupManager) DownloadBackup(objectName string) (io.ReadCloser, error) {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return nil, err
 	}
+
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
 
 	bm.logDebug("DownloadBackup called for object: %s", objectName)
 
 	ctx := context.Background()
-	obj, err := bm.minioClient.GetObject(ctx, bm.minioConfig.Bucket, objectName, minio.GetObjectOptions{})
+	obj, err := client.GetObject(ctx, bucket, objectName, minio.GetObjectOptions{})
 	if err != nil {
-		bm.logDebug("Failed to get object from Minio: %v", err)
+		bm.logDebug("Failed to get object from storage: %v", err)
 		return nil, fmt.Errorf("failed to get object '%s': %w", objectName, err)
 	}
 
@@ -2357,11 +2652,14 @@ func (bm *BackupManager) DownloadBackup(objectName string) (io.ReadCloser, error
 }
 
 // ListBackups lists objects in the configured bucket filtered by prefix.
-// It returns up to 'limit' objects ordered by whatever the Minio server yields (client-side sorting is not performed).
+// It returns up to 'limit' objects ordered by whatever the storage server yields (client-side sorting is not performed).
 func (bm *BackupManager) ListBackups(prefix string, limit int) ([]ObjectInfo, error) {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return nil, err
 	}
+
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
 
 	ctx := context.Background()
 	opts := minio.ListObjectsOptions{
@@ -2370,7 +2668,7 @@ func (bm *BackupManager) ListBackups(prefix string, limit int) ([]ObjectInfo, er
 	}
 
 	var results []ObjectInfo
-	ch := bm.minioClient.ListObjects(ctx, bm.minioConfig.Bucket, opts)
+	ch := client.ListObjects(ctx, bucket, opts)
 	for obj := range ch {
 		if obj.Err != nil {
 			return nil, fmt.Errorf("error listing object: %w", obj.Err)
@@ -2409,27 +2707,33 @@ func (bm *BackupManager) GetLatestObject(prefix string) (string, error) {
 	return latest.Key, nil
 }
 
-// DeleteObject removes a single object from the configured Minio bucket.
+// DeleteObject removes a single object from the configured storage bucket.
 func (bm *BackupManager) DeleteObject(objectName string) error {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return err
 	}
 
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
+
 	ctx := context.Background()
-	if err := bm.minioClient.RemoveObject(ctx, bm.minioConfig.Bucket, objectName, minio.RemoveObjectOptions{}); err != nil {
+	if err := client.RemoveObject(ctx, bucket, objectName, minio.RemoveObjectOptions{}); err != nil {
 		return fmt.Errorf("failed to delete object '%s': %w", objectName, err)
 	}
 	return nil
 }
 
-// DeleteObjects removes multiple objects from the configured Minio bucket.
+// DeleteObjects removes multiple objects from the configured storage bucket.
 // It attempts to delete each object and aggregates any errors into a single error.
 func (bm *BackupManager) DeleteObjects(objectNames []string) error {
-	if err := bm.initMinioClient(); err != nil {
+	if err := bm.initObjectStorageClient(); err != nil {
 		return err
 	}
 
-	// Use Minio batch RemoveObjects API for performance when deleting many objects.
+	client := bm.getObjectStorageClient()
+	bucket := bm.getObjectStorageBucket()
+
+	// Use batch RemoveObjects API for performance when deleting many objects.
 	ctx := context.Background()
 	objectsCh := make(chan minio.ObjectInfo, len(objectNames))
 	go func() {
@@ -2439,7 +2743,7 @@ func (bm *BackupManager) DeleteObjects(objectNames []string) error {
 		}
 	}()
 
-	errCh := bm.minioClient.RemoveObjects(ctx, bm.minioConfig.Bucket, objectsCh, minio.RemoveObjectsOptions{})
+	errCh := client.RemoveObjects(ctx, bucket, objectsCh, minio.RemoveObjectsOptions{})
 
 	var errs []string
 	for e := range errCh {
@@ -2671,6 +2975,85 @@ func (bm *BackupManager) SelectObjectsWithSmartRetention(objs []ObjectInfo, poli
 	return toDelete
 }
 
+// ApplyRetentionPolicy evaluates retention policy rulesets and returns actions to take for each backup
+// Returns maps of backups to delete and backups to migrate to Glacier
+func (bm *BackupManager) ApplyRetentionPolicy(objs []ObjectInfo, rulesets map[string]RetentionRuleset) (toDelete, toMigrate []ObjectInfo) {
+	now := time.Now()
+	storageBackend := bm.GetStorageBackend()
+
+	// Track which objects have been matched by rules
+	matched := make(map[string]bool)
+	var deleteList []ObjectInfo
+	var migrateList []ObjectInfo
+
+	// Process each ruleset in order (implementation depends on YAML ordering)
+	for _, ruleset := range rulesets {
+		// Skip if this ruleset doesn't apply to current storage backend
+		if ruleset.TargetStorage != "" && ruleset.TargetStorage != "both" {
+			if storageBackend != ruleset.TargetStorage {
+				continue
+			}
+		}
+
+		// Parse the age threshold
+		duration, err := ParseHumanDuration(ruleset.OlderThan)
+		if err != nil {
+			bm.logDebug("Invalid duration in ruleset: %v", err)
+			continue
+		}
+
+		threshold := now.Add(-duration)
+
+		// Evaluate each backup against this ruleset
+		for _, obj := range objs {
+			// Skip if already matched by a previous rule
+			if matched[obj.Key] {
+				continue
+			}
+
+			// Check if backup is old enough for this rule
+			if !obj.LastModified.Before(threshold) {
+				continue // Not old enough
+			}
+
+			// Check if backup should be excluded
+			if ruleset.Exclude != "" {
+				if EvaluateExclusion(obj.LastModified, ruleset.Exclude) {
+					// This backup matches exclusion criteria, so it's kept
+					matched[obj.Key] = true
+					bm.logTrace("Backup %s excluded from rule due to exclusion: %s", obj.Key, ruleset.Exclude)
+					continue
+				}
+			}
+
+			// Apply the action
+			action := ruleset.Action
+			if action == "" {
+				action = "delete" // Default action
+			}
+
+			matched[obj.Key] = true
+
+			switch action {
+			case "delete":
+				deleteList = append(deleteList, obj)
+				bm.logTrace("Backup %s marked for deletion (rule: older than %s)", obj.Key, ruleset.OlderThan)
+			case "migrate_to_glacier":
+				migrateList = append(migrateList, obj)
+				bm.logTrace("Backup %s marked for migration to Glacier (rule: older than %s)", obj.Key, ruleset.OlderThan)
+			case "keep":
+				// Explicitly keep, do nothing
+				bm.logTrace("Backup %s kept by explicit keep rule", obj.Key)
+			}
+		}
+	}
+
+	bm.logVerbose("Retention policy evaluation: %d to delete, %d to migrate, %d unmatched",
+		len(deleteList), len(migrateList), len(objs)-len(matched))
+
+	return deleteList, migrateList
+}
+
 // getContainersFromConfig loads containers from a YAML config file
 func (bm *BackupManager) getContainersFromConfig(configPath string) ([]ContainerInfo, error) {
 	config, err := LoadConfigFromFile(configPath)
@@ -2710,6 +3093,37 @@ func (bm *BackupManager) getContainersFromConfig(configPath string) ([]Container
 			Type:       containerCfg.Type,
 			Config:     &containerCfg,
 		})
+	}
+
+	return containers, nil
+}
+
+func (bm *BackupManager) getContainersFromConfigDir(dir string) ([]ContainerInfo, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config directory %s: %w", dir, err)
+	}
+
+	var containers []ContainerInfo
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		if ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		cfgPath := filepath.Join(dir, name)
+		cfgContainers, cfgErr := bm.getContainersFromConfig(cfgPath)
+		if cfgErr != nil {
+			return nil, cfgErr
+		}
+		containers = append(containers, cfgContainers...)
+	}
+
+	if len(containers) == 0 {
+		return nil, fmt.Errorf("no YAML configs found in %s", dir)
 	}
 
 	return containers, nil

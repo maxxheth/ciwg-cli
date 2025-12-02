@@ -72,15 +72,20 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	minioConfig := *minioConfigPtr
 
 	// Get AWS configuration (skip if dry-run for validation purposes)
-	awsConfig, err := getAWSConfig(cmd)
-	if err != nil && !dryRun {
-		return err
-	}
-	if err != nil && dryRun {
-		// Allow dry-run without full AWS config for preview purposes
-		awsConfig = &backup.AWSConfig{
-			Vault:     mustGetStringFlag(cmd, "aws-vault"),
-			AccountID: mustGetStringFlag(cmd, "aws-account-id"),
+	var awsConfig *backup.AWSConfig
+	if forceDelete {
+		fmt.Println("ℹ️  --force-delete enabled: skipping AWS Glacier configuration (deletions only mode)")
+	} else {
+		awsConfig, err = getAWSConfig(cmd)
+		if err != nil && !dryRun {
+			return err
+		}
+		if err != nil && dryRun {
+			// Allow dry-run without full AWS config for preview purposes
+			awsConfig = &backup.AWSConfig{
+				Vault:     mustGetStringFlag(cmd, "aws-vault"),
+				AccountID: mustGetStringFlag(cmd, "aws-account-id"),
+			}
 		}
 	}
 
@@ -94,20 +99,30 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	if minioConfig.SecretKey == "" {
 		return fmt.Errorf("minio-secret-key is required")
 	}
-	if awsConfig.Vault == "" {
-		return fmt.Errorf("aws-vault is required for migration")
-	}
-	if !dryRun {
-		if awsConfig.AccessKey == "" {
-			return fmt.Errorf("aws-access-key is required for migration")
+	if !forceDelete {
+		if awsConfig == nil {
+			return fmt.Errorf("aws configuration is required when not using --force-delete")
 		}
-		if awsConfig.SecretKey == "" {
-			return fmt.Errorf("aws-secret-access-key is required for migration")
+		if awsConfig.Vault == "" {
+			return fmt.Errorf("aws-vault is required for migration")
+		}
+		if !dryRun {
+			if awsConfig.AccessKey == "" {
+				return fmt.Errorf("aws-access-key is required for migration")
+			}
+			if awsConfig.SecretKey == "" {
+				return fmt.Errorf("aws-secret-access-key is required for migration")
+			}
 		}
 	}
 
 	// Create backup manager with SSH client for remote storage capacity checking
-	manager := backup.NewBackupManagerWithAWS(sshClient, &minioConfig, awsConfig)
+	var manager *backup.BackupManager
+	if forceDelete {
+		manager = backup.NewBackupManager(sshClient, &minioConfig)
+	} else {
+		manager = backup.NewBackupManagerWithAWS(sshClient, &minioConfig, awsConfig)
+	}
 
 	// Set verbosity level
 	logLevel, _ := cmd.Flags().GetInt("log-level")
@@ -133,7 +148,11 @@ func runBackupMonitor(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Migrate Percent:   %.1f%%\n", migratePercent)
 	fmt.Printf("Force Delete:      %v\n", forceDelete)
 	fmt.Printf("Minio Bucket:      %s\n", minioConfig.Bucket)
-	fmt.Printf("AWS Glacier Vault: %s\n", awsConfig.Vault)
+	if forceDelete {
+		fmt.Println("AWS Glacier Vault: (skipped - force delete mode)")
+	} else {
+		fmt.Printf("AWS Glacier Vault: %s\n", awsConfig.Vault)
+	}
 	fmt.Println("===========================================")
 
 	return manager.MonitorAndMigrateIfNeeded(storagePath, threshold, migratePercent, dryRun, forceDelete)

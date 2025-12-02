@@ -1,0 +1,78 @@
+# CIWG CLI Retention Policy Example
+# This file demonstrates how to configure intelligent retention policies for backups
+# stored in S3 or MinIO with automatic migration to AWS Glacier.
+#
+# The retention policy allows you to define multiple rulesets that are evaluated
+# sequentially. Each ruleset specifies:
+# - older_than: Age threshold (e.g., "7 days", "6 months", "1 year")
+# - exclude: Days or patterns to exclude from the rule (e.g., "Sunday", "last day of month")
+# - action: What to do with matching backups ("delete", "migrate_to_glacier", "keep")
+# - target_storage: Which storage backend this rule applies to ("s3", "minio", "both")
+#
+# REQUIREMENTS FROM ISSUE:
+# - Daily backups every week to S3
+# - Anything older than 7 days (except Sunday) gets deleted on S3 and pipes weekly backup to Glacier
+# - Anything older than 6 months gets deleted except for backups on the very last day of each month
+# - Monthly backups get migrated to Glacier
+
+rulesets:
+  # Rule 1: Weekly backups (Sundays) older than 7 days get migrated to Glacier
+  # This preserves Sunday backups and moves them to cold storage
+  weekly_to_glacier:
+    older_than: "7 days"
+    exclude: "Sunday"  # Only apply to Sunday backups
+    action: "migrate_to_glacier"
+    target_storage: "both"  # Apply to both S3 and MinIO
+
+  # Rule 2: Daily backups (non-Sunday) older than 7 days get deleted
+  # This cleans up daily backups but preserves weekly ones
+  daily_cleanup:
+    older_than: "7 days"
+    exclude: ""  # No exclusions - applies to all days
+    action: "delete"
+    target_storage: "both"
+
+  # Rule 3: Monthly backups (last day of each month) older than 6 months get migrated to Glacier
+  # This preserves long-term monthly snapshots in cold storage
+  monthly_to_glacier:
+    older_than: "6 months"
+    exclude: "last day of month"  # Only apply to last day of month backups
+    action: "migrate_to_glacier"
+    target_storage: "both"
+
+  # Rule 4: Non-monthly backups older than 6 months get deleted
+  # This cleans up backups that are too old and not monthly snapshots
+  old_cleanup:
+    older_than: "6 months"
+    exclude: ""  # No exclusions
+    action: "delete"
+    target_storage: "both"
+
+# Alternative configuration with different patterns:
+# 
+# rulesets:
+#   # Keep hourly backups for 24 hours
+#   hourly_cleanup:
+#     older_than: "24 hours"
+#     exclude: ""
+#     action: "delete"
+#     target_storage: "s3"
+# 
+#   # Keep weekly backups for 3 months (migrate to Glacier)
+#   weekly_migration:
+#     older_than: "7 days"
+#     exclude: "every 7 days"  # Backups every 7 days
+#     action: "migrate_to_glacier"
+#     target_storage: "s3"
+# 
+#   # Keep first day of month backups indefinitely
+#   monthly_keep:
+#     older_than: "1 year"
+#     exclude: "day 1"  # First day of each month
+#     action: "keep"
+#     target_storage: "both"
+
+# Usage:
+# ciwg-cli backup create hostname --prune --retention-policy retention-policy.yml
+# ciwg-cli backup create hostname --config-file backup-config.yml --prune --retention-policy retention-policy.yml
+# ciwg-cli backup create --server-range 'wp%d.example.com:0-5' --prune --retention-policy retention-policy.yml

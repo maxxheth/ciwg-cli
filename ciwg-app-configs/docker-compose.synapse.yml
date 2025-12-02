@@ -1,0 +1,23 @@
+networks:
+  web:
+    name: web
+    external: true
+
+services:
+  synapse:
+    container_name: synapse
+    image: ghcr.io/ciwebgroup/synapse:${VERSION_TAG:-latest}
+    env_file: .env
+    volumes:
+      - ./config.js:/usr/share/nginx/html/config.js
+    networks:
+      - web
+    expose:
+      - 80
+    labels:
+      - "ci.groups=website,tool"
+      - "traefik.enable=true"
+      - "traefik.http.routers.synapse.rule=Host(`synapse.ciwebgroup.com`)"
+      - "traefik.http.routers.synapse.tls=true"
+      - "traefik.http.routers.synapse.tls.certresolver=lets-encrypt"
+      - "traefik.http.services.synapse.loadbalancer.server.port=80"

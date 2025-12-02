@@ -1,0 +1,65 @@
+version: "1"
+
+defaults:
+  database_export_dir: /tmp/db-exports
+  env:
+    TZ: "UTC"
+
+containers:
+  - name: n8n
+    label: n8n-app
+    bucket_path: backups/n8n/app
+    type: custom
+    database:
+      type: postgres
+      container: postgres
+      name: n8n
+      user: n8n
+      port: 5432
+      export_path: /tmp/db-exports/n8n.sql
+    paths:
+      working_dir: /var/opt/n8n
+      include:
+        - data
+        - n8n
+        - docker-compose.yml
+        - n8n-health-check.sh
+      excludes:
+        - "*.sql"
+        - "*.log"
+
+  - name: synapse
+    label: synapse-app
+    bucket_path: backups/synapse/app
+    type: custom
+    paths:
+      working_dir: /var/opt/synapse
+      include:
+        - config.js
+        - docker-compose.yml
+        - update.sh
+
+  - name: web-services
+    label: web-services-app
+    bucket_path: backups/web-services/app
+    type: custom
+    database:
+      type: postgres
+      container: webservices-db
+      name: webservices
+      user: postgres
+      port: 5432
+      export_path: /tmp/db-exports/webservices.sql
+    paths:
+      working_dir: /var/opt/web-services
+      include:
+        - config
+        - data
+        - keys
+        - migrations
+        - docker-compose.yml
+        - update-web-services.sh
+      excludes:
+        - backups
+        - logs
+        - "*.log"
