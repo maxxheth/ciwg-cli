@@ -1664,6 +1664,8 @@ func (bm *BackupManager) DeleteOldestBackups(percent float64, dryRun bool) error
 		fmt.Printf("      Modified: %s\n", backup.LastModified.Format(time.RFC3339))
 
 		if dryRun {
+			deleted++
+			totalFreed += backup.Size
 			continue
 		}
 
