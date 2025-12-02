@@ -1,0 +1,108 @@
+networks:
+  postgres:
+    name: postgres
+    external: true
+  web:
+    name: web
+    external: true
+  redis:
+    name: redis
+    external: true
+  ssh-tunnel:
+    name: ssh-tunnel
+    external: true
+
+volumes:
+  postgres_web_services: {}
+  redis_data: {}
+
+services:
+  web-services:
+    image: ghcr.io/ciwebgroup/web-services:latest
+    container_name: web-services
+    networks:
+      - web
+      - postgres
+      - redis
+    expose:
+      - 3000
+    env_file: ./.env
+    labels:
+      - "ci.groups=website,tool"
+      - "traefik.http.routers.web-services.middlewares=block-sql-files"
+      - "traefik.http.routers.web-services.rule=Host(`api.ciwgserver.com`) || Host(`api.ciwebgroup.com`)"
+      - "traefik.http.routers.web-services.tls=true"
+      - "traefik.http.routers.web-services.tls.certresolver=lets-encrypt"
+      - "traefik.http.services.web-services.loadbalancer.server.port=3000"
+
+  webservices-db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: webservices-db
+    env_file: .env
+    restart: always
+    expose:
+      - "5432"
+    volumes:
+      - postgres_web_services:/var/lib/postgresql/data
+#      - ./config:/etc/postgresql/conf.d
+#      - ./webservices-db/config/pg_hba.conf:/var/lib/postgresql/data/pg_hba.conf
+#      - ./webservices-db/config/postgres.conf:/var/lib/postgresql/data/postgres.conf
+#      - ./scripts:/docker-entrypoint-initdb.d
+#      - ./keys:/var/lib/postgresql/keys:ro
+    networks:
+      - postgres
+      - ssh-tunnel
+    labels:
+      - "traefik.enable=false"
+    environment:
+      - POSTGRES_INITDB_ARGS=--auth-host=md5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: 
+      - "postgres"
+      - "-c"
+      - "log_statement=ddl"
+      - "-c"
+      - "log_min_duration_statement=500"
+      - "-c"
+      - "log_min_messages=warning"
+  redis:
+    image: redis:7
+    container_name: redis
+    expose:
+      - 6379
+    volumes:
+      - redis_data:/data
+    networks:
+      - redis
+    env_file:
+      - .env.redis
+    labels:
+      - "traefik.enable=false"
+
+  redis-commander:
+    container_name: redis-commander
+    env_file:
+      - .env.redis
+    hostname: redis-commander
+    image: ghcr.io/joeferner/redis-commander:latest
+    restart: always
+    environment:
+      - REDIS_HOSTS=redis
+    expose:
+      - 8081
+    networks:
+      - web
+      - redis
+    labels:
+      - "ci.groups=website,tool"
+      - "traefik.http.routers.redis-commander.middlewares=block-sql-files"
+      - "traefik.http.routers.redis-commander.rule=Host(`redis.ciwgserver.com`)"
+      - "traefik.http.routers.redis-commander.tls=true"
+      - "traefik.http.routers.redis-commander.tls.certresolver=lets-encrypt"
+      - "traefik.http.services.redis-commander.loadbalancer.server.port=8081"
